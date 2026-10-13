@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "audio")]
 use rodio::{Decoder, MixerDeviceSink, Player, Source as _};
 
+#[cfg(all(feature = "audio", feature = "nofft"))]
+use std::num::NonZero;
+
 use crate::error::{CoreError, Result};
 use crate::library::Library;
 use crate::model::{Track, TrackId};
@@ -150,6 +153,32 @@ impl AudioBackend for RodioBackend {
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
+        // Files from the vendored No_FFT codecs are not something symphonia
+        // (and therefore `Decoder`) can read, so decode them ourselves and feed
+        // the samples to rodio as an in-memory buffer.
+        #[cfg(feature = "nofft")]
+        if crate::metadata::is_codec(path) {
+            let pcm = nova_codec::decode(path)
+                .map_err(|e| CoreError::Audio(format!("cannot decode {}: {e}", path.display())))?;
+            let channels = NonZero::new(pcm.channels).ok_or_else(|| {
+                CoreError::Audio(format!("{} reports no channels", path.display()))
+            })?;
+            let sample_rate = NonZero::new(pcm.sample_rate).ok_or_else(|| {
+                CoreError::Audio(format!("{} reports no sample rate", path.display()))
+            })?;
+
+            self.duration = Some(pcm.duration());
+            let source = rodio::buffer::SamplesBuffer::new(channels, sample_rate, pcm.samples);
+            // `clear` also pauses, so we always resume explicitly below.
+            self.player.clear();
+            self.player.append(source);
+            self.player.set_volume(self.volume);
+            self.player.play();
+            self.paused = false;
+            self.clock.start(Duration::ZERO);
+            return Ok(());
+        }
+
         let file = std::fs::File::open(path)?;
         let decoder = Decoder::try_from(file)
             .map_err(|e| CoreError::Audio(format!("cannot decode {}: {e}", path.display())))?;

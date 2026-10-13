@@ -11,6 +11,6 @@ name = "nova-cli"
 path = "src/main.rs"
 
 [dependencies]
-nova-core = { workspace = true }
+nova-core = { workspace = true, features = ["nofft"] }
 log = { workspace = true }
 env_logger = { workspace = true }

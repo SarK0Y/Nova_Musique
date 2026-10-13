@@ -1,4 +1,4 @@
-# Nova
+# Nova Musique
 
 A local music library player for the desktop, built in Rust with an
 [egui](https://github.com/emilk/egui) interface. Nova indexes a folder tree of
@@ -33,16 +33,23 @@ but for music you already own on disk.
 - **Drag and drop** — drop files to play them (indexed on the spot from their
   tags) or a folder to scan it; files can also be passed on the command line as
   a path or `file://` URL.
+- **No_FFT codecs** — `.no_fft` (polynomial fit) and `.nadc` (NFA1–NFA4 DPCM /
+  basket) files are indexed and played in-process through the vendored upstream
+  codecs. See [Codecs](#codecs).
 
 ## Repository layout
 
-Nova is a Cargo workspace with three crates:
+Nova is a Cargo workspace with four crates:
 
 | Crate | What it is |
 | --- | --- |
-| `crates/nova-core` | The library and playback engine. UI-agnostic, fully unit-tested. |
-| `crates/nova-cli`  | A tiny headless CLI used to verify scanning and playback. |
-| `crates/nova-app`  | The egui/eframe desktop application (binary: `nova`). |
+| `crates/nova-core`  | The library and playback engine. UI-agnostic, fully unit-tested. |
+| `crates/nova-codec` | `unsafe` FFI bindings to the vendored No_FFT C++ codecs. |
+| `crates/nova-cli`   | A tiny headless CLI used to verify scanning and playback. |
+| `crates/nova-app`   | The egui/eframe desktop application (binary: `nova`). |
+
+`third_party/no_fft/` holds a pristine copy of the upstream No_FFT codec
+sources; `scripts/sync-nofft.sh` refreshes it from `main`/trunk.
 
 ### `nova-core`
 
@@ -78,6 +85,9 @@ follow.
 
 - **Rust 1.92+.** The GUI stack pins this: `eframe`/`egui` 0.35 require
   rustc 1.92 (0.36 already requires 1.95).
+- **A C++ compiler** (g++/clang++), for the vendored No_FFT codecs. The codec
+  support is the `nofft` feature, which the app and CLI enable by default;
+  `nova-core` alone still builds without a C++ toolchain.
 - **Linux**: ALSA for audio, plus the usual X11/Wayland + OpenGL bits that
   `eframe` needs. The folder picker uses the XDG desktop portal; if no portal is
   available you can simply paste a path into the folder field and press **Scan**.
@@ -154,6 +164,63 @@ nova-cli play   <dir> [--index N] [--volume V] [--null] [--seconds S]
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> | Previous track |
 | <kbd>Ctrl</kbd>+<kbd>→</kbd> | Next track |
 
+## Codecs
+
+Nova plays the [No_FFT](https://github.com/SarK0Y/No_FFT_v0) family natively,
+alongside the usual MP3/FLAC/etc.:
+
+| Extension | Family | Magic |
+| --- | --- | --- |
+| `.no_fft` | Variable-degree polynomial fit | `NOFF` |
+| `.nadc`   | DPCM / basket (NFA1–NFA4) | `NFA1`..`NFA4` |
+
+Files are detected by their **magic bytes**, not the extension, so a renamed
+file still decodes. During a scan the stream properties (sample rate, channels,
+duration) come straight from the codec header — no full decode — and playback
+decodes to PCM in-process and hands it to `rodio`. There are no external tools
+and no temporary files at runtime.
+
+### Layout
+
+| Path | Role |
+| --- | --- |
+| `third_party/no_fft/` | Pristine, unmodified copy of the upstream `main` sources. |
+| `crates/nova-codec/` | The C ABI shim (`shim/nova_nofft_shim.cpp`), `build.rs`, and safe Rust wrappers. |
+| `scripts/sync-nofft.sh` | Re-vendors the sources from upstream `main`/trunk. |
+
+The C++ sources are compiled into a static library by `nova-codec`'s
+`build.rs` (via the [`cc`](https://crates.io/crates/cc) crate) and linked into
+whatever binary uses the `nofft` feature. `crates/nova-core` exposes that as the
+`nofft` feature; `nova-app` and `nova-cli` turn it on by default.
+
+### Refreshing from main/trunk
+
+```sh
+scripts/sync-nofft.sh                 # fetch branch main
+scripts/sync-nofft.sh --branch main   # explicit
+scripts/sync-nofft.sh --remote <url>  # alternative fork
+```
+
+The script clones the requested branch, copies the codec sources into
+`third_party/no_fft/`, and records the exact branch/commit in
+`third_party/no_fft/UPSTREAM.md`. `NOVA_BRANCH` / `NOVA_REPO_URL` are accepted
+as environment overrides too.
+
+To build against a live checkout instead of the vendored copy, point
+`NOVA_NOFFT_DIR` at it:
+
+```sh
+NOVA_NOFFT_DIR=/path/to/No_FFT_v0 cargo build -p nova-app
+```
+
+### Feature gates
+
+```sh
+cargo build -p nova-core                          # no codecs (no C++ needed)
+cargo build -p nova-core --features nofft         # codecs, no audio backend
+cargo build -p nova-app                           # codecs + audio (default)
+```
+
 ## Files Nova writes
 
 | Path | Contents |
@@ -170,6 +237,8 @@ The test suite needs no audio hardware and no external tools:
 
 - Unit tests in `nova-core` cover the model, tag parsing, grouping/sorting,
   search, queue semantics (shuffle/repeat/insert) and engine advance/pause/seek.
+- `crates/nova-codec` tests round-trip a generated signal through the polynomial
+  codec and all four NFA variants, so no binary fixtures are needed.
 - `crates/nova-core/tests/library_integration.rs` synthesises WAV files into a
   temporary directory and exercises the real scan → cache → play loop.
 

@@ -14,15 +14,32 @@ pub const AUDIO_EXTENSIONS: &[&str] = &[
     "aifc", "wv", "ape", "mpc", "mka", "mkv", "alac", "caf",
 ];
 
+/// Whether a path looks like a file the vendored No_FFT codecs can decode.
+///
+/// Detection is by extension here; the decoder itself works from the file's
+/// magic bytes, so a mislabelled file still plays once indexed.
+#[cfg(feature = "nofft")]
+pub fn is_codec(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|ext| nova_codec::CODEC_EXTENSIONS.contains(&ext.as_str()))
+}
+
 /// Whether a path looks like an audio file we can index.
 pub fn is_supported(path: &Path) -> bool {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => {
-            let ext = ext.to_ascii_lowercase();
-            AUDIO_EXTENSIONS.contains(&ext.as_str())
-        }
-        None => false,
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let ext = ext.to_ascii_lowercase();
+    if AUDIO_EXTENSIONS.contains(&ext.as_str()) {
+        return true;
     }
+    #[cfg(feature = "nofft")]
+    if nova_codec::CODEC_EXTENSIONS.contains(&ext.as_str()) {
+        return true;
+    }
+    false
 }
 
 /// Cover art extracted from a file's tags.
@@ -37,6 +54,11 @@ pub struct CoverArt {
 /// Missing tags never fail: the title falls back to the file stem and artists
 /// fall back to `"Unknown Artist"`.
 pub fn read_track(path: &Path) -> Result<Track> {
+    #[cfg(feature = "nofft")]
+    if is_codec(path) {
+        return read_codec_track(path);
+    }
+
     let tagged = lofty::read_from_path(path).map_err(|e| CoreError::metadata(path, e))?;
 
     let props = tagged.properties();
@@ -96,6 +118,33 @@ pub fn read_track(path: &Path) -> Result<Track> {
     })
 }
 
+/// Builds a track from a No_FFT codec header.
+///
+/// These containers carry no tags, so the title falls back to the file stem and
+/// the artist is left empty, exactly as for an untagged MP3. Stream properties
+/// come from the codec header rather than a tag reader.
+#[cfg(feature = "nofft")]
+fn read_codec_track(path: &Path) -> Result<Track> {
+    let info = nova_codec::info(path).map_err(|e| CoreError::metadata(path, e))?;
+    let duration = info.duration();
+    Ok(Track {
+        id: track_id(path),
+        path: path.to_path_buf(),
+        title: fallback_title(path),
+        artist: String::new(),
+        album_artist: String::new(),
+        album: String::new(),
+        genre: None,
+        year: None,
+        track_no: None,
+        disc_no: None,
+        duration: (duration > std::time::Duration::ZERO).then(|| duration.as_secs_f64()),
+        sample_rate: (info.sample_rate > 0).then_some(info.sample_rate),
+        channels: u8::try_from(info.channels).ok().filter(|&c| c > 0),
+        has_cover: false,
+    })
+}
+
 /// Read the first embedded picture of a file, if any.
 ///
 /// Prefers a front cover, then falls back to any other picture.
@@ -150,5 +199,54 @@ mod tests {
         assert!(is_supported(Path::new("/a/b/track.flac")));
         assert!(!is_supported(Path::new("/a/b/cover.jpg")));
         assert!(!is_supported(Path::new("/a/b/README")));
+    }
+
+    #[cfg(feature = "nofft")]
+    #[test]
+    fn codec_extensions_are_indexed_but_not_confused_with_audio() {
+        assert!(is_supported(Path::new("/a/b/Song.no_fft")));
+        assert!(is_supported(Path::new("/a/b/Song.NADC")));
+        assert!(is_codec(Path::new("/a/b/Song.poly.no_fft")));
+        assert!(is_codec(Path::new("/a/b/Song.nfa2.nadc")));
+        assert!(!is_codec(Path::new("/a/b/Song.mp3")));
+    }
+
+    #[cfg(feature = "nofft")]
+    #[test]
+    fn codec_files_report_stream_properties_from_their_header() {
+        let dir = std::env::temp_dir().join(format!("nova-codec-meta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // Encode a known signal, then drop the intermediate WAV so only the two
+        // codec files remain to be scanned.
+        let wav = dir.join("signal.wav");
+        nova_codec::generate_wav(&wav, 0.5, 2, 44_100).expect("generate wav");
+        nova_codec::encode_nofft(&wav, &dir.join("song.poly.no_fft"), 256, 8).expect("encode poly");
+        nova_codec::encode_nadc(
+            &wav,
+            &dir.join("song.nfa1.nadc"),
+            6,
+            nova_codec::NadcVariant::Nfa1,
+        )
+        .expect("encode nadc");
+        std::fs::remove_file(&wav).expect("remove wav");
+
+        let (library, report) = crate::Library::scan(&dir, &mut |_| {}).expect("scan");
+        assert_eq!(report.indexed, 2, "both codec files are indexed");
+        assert_eq!(report.failed, 0);
+
+        for track in library.tracks() {
+            assert_eq!(track.sample_rate, Some(44_100), "{}", track.title);
+            assert_eq!(track.channels, Some(2), "{}", track.title);
+            let duration = track.duration.expect("header carries a duration");
+            assert!(
+                (duration - 0.5).abs() < 0.02,
+                "{}: expected ~0.5s, got {duration}s",
+                track.title
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
