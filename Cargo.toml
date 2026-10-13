@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nova-core",
+    "crates/nova-cli",
+    "crates/nova-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# Driven by the GUI stack: eframe/egui 0.35 require rustc 1.92.
+rust-version = "1.92"
+license = "free"
+authors = ["SarK0Y"]
+description = "Be capable t use innovative media codecs, Dear User 😉"
+repository = "https://github.com/SarK0Y/Nova_Musique.git"
+
+[workspace.dependencies]
+nova-core = { path = "crates/nova-core" }
+
+# Shared
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+log = "0.4"
+walkdir = "2.5"
+env_logger = "0.11"
+
+# Metadata
+lofty = "0.25"
+
+# Audio
+rodio = { version = "0.23", default-features = false, features = ["playback", "symphonia-all"] }
+
+# GUI
+# 0.36 requires rustc 1.95; 0.35 is the newest release that builds on 1.92+.
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

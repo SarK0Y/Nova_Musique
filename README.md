@@ -1,0 +1,195 @@
+# Nova
+
+A local music library player for the desktop, built in Rust with an
+[egui](https://github.com/emilk/egui) interface. Nova indexes a folder tree of
+audio files, reads their tags and cover art, and plays them through a small
+queue with shuffle and repeat — in the spirit of [Apollo](https://github.com/ClassicOldSong/Apollo)
+but for music you already own on disk.
+
+> Status: **first pass**. The playback core and the GUI are working end to end
+> (scan → browse → play), on a deliberately small feature set. See
+> [Roadmap](#roadmap) for what is intentionally not there yet.
+
+---
+
+## Features
+
+- **Library scan** — walks a folder tree, recognises common audio extensions,
+  and reads title/artist/album/album-artist/genre/year/track/disc tags plus
+  duration, sample rate and channel count.
+- **Cover art** — embedded pictures are extracted (preferring "front cover")
+  and decoded lazily into GPU textures.
+- **Browsing** — Songs, Albums and Artists views, plus a global search across
+  title, artist and album.
+- **Queue** — click any track to replace the queue with the current list and
+  start there; shuffle (every item exactly once) and repeat-off/all/one.
+- **Transport** — play/pause, previous/next, a seek bar, and volume.
+- **Resilient audio** — playback goes through rust-`rodio`; if no output device
+  can be opened, Nova transparently falls back to a silent backend so the rest
+  of the app (and the test suite) keeps working.
+- **Background scanning** — scanning runs on a worker thread and reports
+  progress into the UI; the result is cached as JSON so the next launch is
+  instant.
+- **Drag and drop** — drop files to play them (indexed on the spot from their
+  tags) or a folder to scan it; files can also be passed on the command line as
+  a path or `file://` URL.
+
+## Repository layout
+
+Nova is a Cargo workspace with three crates:
+
+| Crate | What it is |
+| --- | --- |
+| `crates/nova-core` | The library and playback engine. UI-agnostic, fully unit-tested. |
+| `crates/nova-cli`  | A tiny headless CLI used to verify scanning and playback. |
+| `crates/nova-app`  | The egui/eframe desktop application (binary: `nova`). |
+
+### `nova-core`
+
+| Module | Responsibility |
+| --- | --- |
+| `model`      | `Track`, `Album`, `Artist`, `AlbumKey`, and the stable `track_id`. |
+| `metadata`   | Tag/cover reading via `lofty`; the set of supported extensions. |
+| `library`    | Directory scanning, indexing, grouping, search and JSON caching. |
+| `queue`      | The playback queue: cursor, shuffle, repeat, insert/remove. |
+| `playback`   | `PlaybackEngine` and the `AudioBackend` abstraction. |
+| `error`      | `CoreError` / `Result`. |
+
+The key design point is that `PlaybackEngine` is **driver-agnostic**: it exposes
+`tick(&Library)`, which the host calls periodically. That is what the egui app's
+frame loop calls, what the CLI's loop calls, and what the tests call.
+
+Audio sits behind a small `AudioBackend` trait with two implementations:
+
+- `RodioBackend` — real output through `rodio`.
+- `NullBackend` — a fake clock, used for tests and as a fallback when no device
+  exists. Tests use `NullBackend::with_track_duration(..)` to run queue logic
+  without waiting on real time.
+
+### `nova-app`
+
+A single-window egui app: a top bar (folder + scan + search), a left sidebar
+(library sections and *now playing*), a content pane (the current view), and a
+bottom transport bar. UI intent is collected as `Action`s during the frame and
+applied afterwards, which keeps borrows simple and the state changes easy to
+follow.
+
+## Requirements
+
+- **Rust 1.92+.** The GUI stack pins this: `eframe`/`egui` 0.35 require
+  rustc 1.92 (0.36 already requires 1.95).
+- **Linux**: ALSA for audio, plus the usual X11/Wayland + OpenGL bits that
+  `eframe` needs. The folder picker uses the XDG desktop portal; if no portal is
+  available you can simply paste a path into the folder field and press **Scan**.
+
+## Build & run
+
+```sh
+# Desktop app (binary is named `nova`)
+cargo run -p nova-app
+
+# Point it at a folder, or straight at a file to start playing it
+cargo run -p nova-app -- /path/to/music
+cargo run -p nova-app -- "/path/to/music/Album/10. What's It Gonna Be.mp3"
+cargo run -p nova-app -- "file:///path/to/music/Album/10. What's It Gonna Be.mp3"
+
+# Headless CLI
+cargo run -p nova-cli -- scan   /path/to/music
+cargo run -p nova-cli -- search /path/to/music "album name"
+cargo run -p nova-cli -- play   /path/to/music --index 3 --volume 0.6
+cargo run -p nova-cli -- play   /path/to/music --null   # silent, 3s per track
+
+# Everything
+cargo test --workspace
+cargo build --release
+```
+
+Passing an argument to the GUI is optional:
+
+- a **file** (plain path or `file://` URL) → Nova indexes its folder and starts
+  playing that track right away, queueing the rest of its album;
+- a **folder** → scanned and opened, nothing auto-plays.
+
+Without an argument, Nova reopens the last folder (instantly, from cache).
+
+
+### CLI usage
+
+```text
+nova-cli scan   <dir>
+nova-cli search <dir> <query>
+nova-cli play   <dir> [--index N] [--volume V] [--null] [--seconds S]
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--index N`   | First track to play (default `0`). |
+| `--volume V`  | Output volume `0.0..=1.5` (default `0.8`). |
+| `--null`      | Use the silent backend; each track lasts 3 seconds. |
+| `--seconds S` | Stop after `S` seconds of wall-clock time (default `30`). |
+
+## Using the app
+
+1. Enter a music folder (or use **Browse…**) and press **Scan**. Progress shows
+   in the top bar; the result is cached.
+2. Pick a view in the sidebar: **Songs**, **Albums**, **Artists** or **Queue**.
+3. Click a track to play it. Right-click a track for *Play now* / *Play next*,
+   or *Remove from queue* in the Queue view.
+4. Use the transport bar for play/pause, previous/next, seek, volume, shuffle
+   and repeat.
+
+### Drag and drop
+
+- Drop **audio files** onto the window to queue and play them immediately. Files
+  the library hasn't indexed yet are read straight from their tags, so no rescan
+  is needed.
+- Drop a **folder** to scan and open it.
+- While dragging, an overlay shows how many items are in flight.
+
+### Keyboard
+
+| Shortcut | Action |
+| --- | --- |
+| <kbd>Space</kbd> | Play / pause |
+| <kbd>Ctrl</kbd>+<kbd>←</kbd> | Previous track |
+| <kbd>Ctrl</kbd>+<kbd>→</kbd> | Next track |
+
+## Files Nova writes
+
+| Path | Contents |
+| --- | --- |
+| `~/.config/nova/config.json` | Last music folder and volume. |
+| `~/.cache/nova/library.json`  | Cached library index for the last folder. |
+
+Both honour `XDG_CONFIG_HOME` / `XDG_CACHE_HOME`. The cache is only used when it
+was built from the currently configured folder.
+
+## Testing
+
+The test suite needs no audio hardware and no external tools:
+
+- Unit tests in `nova-core` cover the model, tag parsing, grouping/sorting,
+  search, queue semantics (shuffle/repeat/insert) and engine advance/pause/seek.
+- `crates/nova-core/tests/library_integration.rs` synthesises WAV files into a
+  temporary directory and exercises the real scan → cache → play loop.
+
+```sh
+cargo test --workspace
+```
+
+## Roadmap
+
+Deliberately out of scope for this first pass — the natural next steps:
+
+- Playlists (create, edit, persist) and import/export.
+- MPRIS integration so desktop media keys and shell widgets work.
+- Gapless/crossfade, ReplayGain, an equaliser.
+- File-watching so the library updates as folders change.
+- Virtualised lists for very large libraries (views currently rebuild their row
+  list each frame).
+- Richer now-playing (waveform/visualiser, lyrics).
+- Drag-and-drop import and reordering of the queue.
+
+## Project has been assisted by awesome OpenCode 🙂
+
+## my the Best Wishes to You, Dear User 🙃
