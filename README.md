@@ -173,6 +173,8 @@ alongside the usual MP3/FLAC/etc.:
 | --- | --- | --- |
 | `.no_fft` | Variable-degree polynomial fit | `NOFF` |
 | `.nadc`   | DPCM / basket (NFA1–NFA4) | `NFA1`..`NFA4` |
+| `.nadc`   | Multiplicative log-domain (NFA5) | `NFA5` |
+| `.nadc`   | Blocked NFA5 (NFA6) | `NFA6` |
 
 Files are detected by their **magic bytes**, not the extension, so a renamed
 file still decodes. During a scan the stream properties (sample rate, channels,

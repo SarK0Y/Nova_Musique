@@ -688,41 +688,114 @@ Err wav_write_stream(FILE* out, const pcm_buf* p)
     return ERR_OK;
 }
 
-Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_t degree,
-                 nofft_coeff_format cf, nofft_fit fit)
-{
-    double f32_sig = 0.0, f32_err = 0.0, f16_sig = 0.0, f16_err = 0.0;
-    double* stage_coefs = NULL;
-    double* stage_round = NULL;
-    FILE* f;
-    uint64_t total_frames;
-    uint32_t n_frames, last_len;
-    uint64_t fi;
-    uint8_t hdr[NOFFT_HEADER_SIZE];
-    Err rc = ERR_OK;
-    uint16_t ch = p->channels;
+/* ---- byte sink ----
+   The encoder's wire format is emitted through one of these so the file and
+   in-memory encoders run the exact same code and cannot drift apart. */
+typedef struct {
+    FILE*    f;    /* non-NULL: a stdio file sink */
+    uint8_t* mem;  /* a file sink keeps this NULL; a memory sink owns it */
+    size_t   len;  /* bytes written so far */
+    size_t   cap;  /* allocated size of mem */
+    int      oom;  /* sticky flag, only meaningful for a memory sink */
+} byte_sink;
 
-    if (p->samples == NULL || ch == 0 || frame_len == 0 || degree == 0)
+static void sink_init_file(byte_sink* s, FILE* f)
+{
+    s->f = f;
+    s->mem = NULL;
+    s->len = 0;
+    s->cap = 0;
+    s->oom = 0;
+}
+
+static void sink_init_mem(byte_sink* s)
+{
+    s->f = NULL;
+    s->mem = NULL;
+    s->len = 0;
+    s->cap = 0;
+    s->oom = 0;
+}
+
+static Err sink_write(byte_sink* s, const void* data, size_t n)
+{
+    if (s->f != NULL)
+        return (fwrite(data, 1, n, s->f) == n) ? ERR_OK : ERR_IO;
+
+    /* double-capacity growth; starting at 256 keeps small writes from
+       reallocating on every call */
+    if (n > SIZE_MAX - s->len) {
+        s->oom = 1;
+        return ERR_NO_MEMORY;
+    }
+    if (s->len + n > s->cap) {
+        size_t want = s->len + n;
+        size_t ncap = (s->cap < 256u) ? 256u : s->cap;
+        uint8_t* p;
+
+        while (ncap < want) {
+            if (ncap > SIZE_MAX / 2u) {
+                ncap = want;
+                break;
+            }
+            ncap *= 2u;
+        }
+        p = (uint8_t*)realloc(s->mem, ncap);
+        if (p == NULL) {
+            s->oom = 1;
+            return ERR_NO_MEMORY;
+        }
+        s->mem = p;
+        s->cap = ncap;
+    }
+    memcpy(s->mem + s->len, data, n);
+    s->len += n;
+    return ERR_OK;
+}
+
+/* Validates everything nofft_encode / nofft_encode_buf need before any output
+   happens, so a rejected call never creates or truncates a file. */
+static Err encode_setup(const pcm_buf* p, uint32_t frame_len, uint16_t degree,
+                        nofft_coeff_format cf, nofft_fit fit,
+                        uint64_t* total_frames, uint32_t* n_frames, uint32_t* last_len)
+{
+    uint16_t ch;
+
+    if (p == NULL || p->samples == NULL)
+        return ERR_BAD_ARGS;
+    ch = p->channels;
+    if (ch == 0 || frame_len == 0 || degree == 0)
         return ERR_BAD_ARGS;
     if (cf != NOFFT_COEF_F32 && cf != NOFFT_COEF_F16)
         return ERR_BAD_ARGS;
     if (fit != NOFFT_FIT_INTERP && fit != NOFFT_FIT_LEAST_SQ)
         return ERR_BAD_ARGS;
 
-    total_frames = (uint64_t)(p->count / ch);
-    if (total_frames == 0)
+    *total_frames = (uint64_t)(p->count / ch);
+    if (*total_frames == 0)
         return ERR_BAD_ARGS;
 
-    n_frames = (uint32_t)((total_frames + frame_len - 1) / frame_len);
-    last_len = (uint32_t)(total_frames - (uint64_t)(n_frames - 1) * frame_len);
+    *n_frames = (uint32_t)((*total_frames + frame_len - 1) / frame_len);
+    *last_len = (uint32_t)(*total_frames - (uint64_t)(*n_frames - 1) * frame_len);
 
     if (nofft_effective_degree(degree, frame_len) > 63 ||
-        nofft_effective_degree(degree, last_len) > 63)
+        nofft_effective_degree(degree, *last_len) > 63)
         return ERR_BAD_ARGS;
 
-    f = fopen(path, "wb");
-    if (f == NULL)
-        return ERR_OPEN;
+    return ERR_OK;
+}
+
+static Err encode_impl(byte_sink* sink, const pcm_buf* p, uint32_t frame_len, uint16_t degree,
+                       nofft_coeff_format cf, nofft_fit fit,
+                       uint64_t total_frames, uint32_t n_frames, uint32_t last_len)
+{
+    double f32_sig = 0.0, f32_err = 0.0, f16_sig = 0.0, f16_err = 0.0;
+    double* stage_coefs = NULL;
+    double* stage_round = NULL;
+    uint64_t fi;
+    uint8_t hdr[NOFFT_HEADER_SIZE];
+    Err rc = ERR_OK;
+    uint16_t ch = p->channels;
 
     memset(hdr, 0, sizeof(hdr));
     memcpy(hdr, NOFFT_MAGIC, 4);
@@ -742,11 +815,9 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
             memcpy(hdr + 29, &fitv, 1);
         }
     }
-    if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
-        fclose(f);
-        rc = ERR_IO;
+    rc = sink_write(sink, hdr, sizeof(hdr));
+    if (rc != ERR_OK)
         goto done;
-    }
 
     for (fi = 0; fi < total_frames; fi += frame_len) {
         uint32_t len = (uint32_t)((total_frames - fi < frame_len)
@@ -767,7 +838,6 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
             if (stage_coefs == NULL || stage_round == NULL) {
                 free(stage_coefs); free(stage_round);
                 stage_coefs = NULL; stage_round = NULL;
-                fclose(f);
                 rc = ERR_NO_MEMORY;
                 goto done;
             }
@@ -780,7 +850,6 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
             if (A == NULL || ys_heap == NULL) {
                 free(A);
                 free(ys_heap);
-                fclose(f);
                 rc = ERR_NO_MEMORY;
                 goto done;
             }
@@ -812,7 +881,6 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
             }
             if (e != ERR_OK) {
                 free(A); free(ys_heap);
-                fclose(f);
                 rc = e;
                 goto done;
             }
@@ -827,7 +895,6 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
                         double c = coefs[j];
                         if (c > 65504.0 || c < -65504.0) {
                             free(A); free(ys_heap);
-                            fclose(f);
                             rc = ERR_RANGE;
                             goto done;
                         }
@@ -862,10 +929,9 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
                 }
                 qb[0] = nofft_bound_to_byte(bmin);
                 qb[1] = nofft_bound_to_byte(bmax);
-                if (fwrite(qb, 1, 2, f) != 2) {
+                rc = sink_write(sink, qb, 2);
+                if (rc != ERR_OK) {
                     free(A); free(ys_heap);
-                    fclose(f);
-                    rc = ERR_IO;
                     goto done;
                 }
             }
@@ -879,7 +945,6 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
                 uint8_t tmp[128];
                 if ((size_t)n * 2u > sizeof(tmp)) {
                     free(A); free(ys_heap);
-                    fclose(f);
                     rc = ERR_RANGE;
                     goto done;
                 }
@@ -888,17 +953,15 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
                     tmp[j * 2 + 0] = (uint8_t)(h & 0xFFu);
                     tmp[j * 2 + 1] = (uint8_t)((h >> 8) & 0xFFu);
                 }
-                if (fwrite(tmp, 1, (size_t)n * 2u, f) != (size_t)n * 2u) {
+                rc = sink_write(sink, tmp, (size_t)n * 2u);
+                if (rc != ERR_OK) {
                     free(A); free(ys_heap);
-                    fclose(f);
-                    rc = ERR_IO;
                     goto done;
                 }
             } else {
                 uint8_t tmp[256];
                 if ((size_t)n * 4u > sizeof(tmp)) {
                     free(A); free(ys_heap);
-                    fclose(f);
                     rc = ERR_RANGE;
                     goto done;
                 }
@@ -906,10 +969,9 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
                     float v = (float)rounded[j];
                     memcpy(tmp + j * 4, &v, 4);
                 }
-                if (fwrite(tmp, 1, (size_t)n * 4u, f) != (size_t)n * 4u) {
+                rc = sink_write(sink, tmp, (size_t)n * 4u);
+                if (rc != ERR_OK) {
                     free(A); free(ys_heap);
-                    fclose(f);
-                    rc = ERR_IO;
                     goto done;
                 }
             }
@@ -939,8 +1001,6 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
     stage_coefs = NULL;
     stage_round = NULL;
 
-    fclose(f);
-
     if (cf == NOFFT_COEF_F16 && f16_sig > 0.0) {
         double s32 = (f32_err > 0.0) ? 10.0 * log10(f32_sig / f32_err) : 1.0e9;
         double s16 = (f16_err > 0.0) ? 10.0 * log10(f16_sig / f16_err) : 1.0e9;
@@ -955,32 +1015,84 @@ Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_
 done:
     free(stage_coefs);
     free(stage_round);
+    return rc;
+}
+
+Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_t degree,
+                 nofft_coeff_format cf, nofft_fit fit)
+{
+    byte_sink sink;
+    FILE* f;
+    Err rc;
+    uint64_t total_frames;
+    uint32_t n_frames, last_len;
+
+    rc = encode_setup(p, frame_len, degree, cf, fit, &total_frames, &n_frames, &last_len);
+    if (rc != ERR_OK)
+        return rc;
+
+    f = fopen(path, "wb");
+    if (f == NULL)
+        return ERR_OPEN;
+
+    sink_init_file(&sink, f);
+    rc = encode_impl(&sink, p, frame_len, degree, cf, fit, total_frames, n_frames, last_len);
+    fclose(f);
+
+    /* never leave a half-written container behind */
     if (rc != ERR_OK)
         remove(path);
     return rc;
 }
 
-/* Parses just the header: magic, version and the version-dependent
-   coefficient-format / fit bytes. */
-static Err read_header(const char* path, uint8_t hdr[NOFFT_HEADER_SIZE],
-                       uint32_t* version, nofft_coeff_format* cf, nofft_fit* fit)
+Err nofft_encode_buf(uint8_t** out, size_t* out_len, const pcm_buf* p,
+                     uint32_t frame_len, uint16_t degree,
+                     nofft_coeff_format cf, nofft_fit fit)
 {
-    FILE* f;
+    byte_sink sink;
+    Err rc;
+    uint64_t total_frames;
+    uint32_t n_frames, last_len;
+
+    if (out == NULL || out_len == NULL)
+        return ERR_BAD_ARGS;
+    *out = NULL;
+    *out_len = 0;
+
+    rc = encode_setup(p, frame_len, degree, cf, fit, &total_frames, &n_frames, &last_len);
+    if (rc != ERR_OK)
+        return rc;
+
+    sink_init_mem(&sink);
+    rc = encode_impl(&sink, p, frame_len, degree, cf, fit, total_frames, n_frames, last_len);
+    if (rc != ERR_OK) {
+        free(sink.mem);
+        return rc;
+    }
+
+    *out = sink.mem;
+    *out_len = sink.len;
+    return ERR_OK;
+}
+
+void nofft_buf_free(void* p)
+{
+    free(p);
+}
+
+/* Parses just the header: magic, version and the version-dependent
+   coefficient-format / fit bytes.  Shared by the file reader and the memory
+   reader below so both accept exactly the same containers. */
+static Err parse_header(const uint8_t hdr[NOFFT_HEADER_SIZE], uint32_t* version,
+                        nofft_coeff_format* cf, nofft_fit* fit)
+{
     uint8_t vbuf[4];
     uint32_t ver;
     nofft_coeff_format c = NOFFT_COEF_F32;
     nofft_fit fi = NOFFT_FIT_INTERP;
 
-    f = fopen(path, "rb");
-    if (f == NULL)
-        return ERR_OPEN;
-
-    if (fread(hdr, 1, NOFFT_HEADER_SIZE, f) != NOFFT_HEADER_SIZE ||
-        memcmp(hdr, NOFFT_MAGIC, 4) != 0) {
-        fclose(f);
+    if (memcmp(hdr, NOFFT_MAGIC, 4) != 0)
         return ERR_BAD_NOFFT;
-    }
-    fclose(f);
 
     memcpy(vbuf, hdr + 4, 4);
     memcpy(&ver, vbuf, 4);
@@ -1013,6 +1125,24 @@ static Err read_header(const char* path, uint8_t hdr[NOFFT_HEADER_SIZE],
     return ERR_OK;
 }
 
+static Err read_header(const char* path, uint8_t hdr[NOFFT_HEADER_SIZE],
+                       uint32_t* version, nofft_coeff_format* cf, nofft_fit* fit)
+{
+    FILE* f;
+
+    f = fopen(path, "rb");
+    if (f == NULL)
+        return ERR_OPEN;
+
+    if (fread(hdr, 1, NOFFT_HEADER_SIZE, f) != NOFFT_HEADER_SIZE) {
+        fclose(f);
+        return ERR_BAD_NOFFT;
+    }
+    fclose(f);
+
+    return parse_header(hdr, version, cf, fit);
+}
+
 Err nofft_file_fit(const char* path, nofft_fit* out_fit)
 {
     uint8_t hdr[NOFFT_HEADER_SIZE];
@@ -1022,9 +1152,31 @@ Err nofft_file_fit(const char* path, nofft_fit* out_fit)
     return read_header(path, hdr, NULL, NULL, out_fit);
 }
 
-Err nofft_decode(const char* path, pcm_buf* out)
+/* ---- byte source ----
+   The mirror image of byte_sink: decode drives either a stdio file or a
+   caller-owned in-memory range through the same code.  A short read is always
+   reported the same way, so callers keep mapping it to ERR_BAD_NOFFT. */
+typedef struct {
+    FILE*          f;    /* non-NULL: read with fread */
+    const uint8_t* mem;  /* a file source keeps this NULL */
+    size_t         len;  /* total bytes available from mem */
+    size_t         pos;  /* next byte to read from mem */
+} byte_source;
+
+static int src_read(byte_source* s, void* dst, size_t n)
 {
-    FILE* f;
+    if (s->f != NULL)
+        return fread(dst, 1, n, s->f) == n;
+
+    if (s->pos > s->len || n > s->len - s->pos)
+        return 0;
+    memcpy(dst, s->mem + s->pos, n);
+    s->pos += n;
+    return 1;
+}
+
+static Err decode_impl(byte_source* src, pcm_buf* out)
+{
     uint8_t hdr[NOFFT_HEADER_SIZE];
     uint32_t version, sr, frame_len, n_frames, last_len;
     uint16_t degree, ch;
@@ -1032,26 +1184,19 @@ Err nofft_decode(const char* path, pcm_buf* out)
     nofft_fit fit = NOFFT_FIT_INTERP;
     uint64_t total_frames, total_samples;
     uint32_t fi;
-    float* buf;
-    double* coefs;
+    float* buf = NULL;
+    double* coefs = NULL;
     size_t used = 0;
+    Err rc = ERR_OK;
 
     memset(out, 0, sizeof(*out));
 
     /* validate magic, version and the version-dependent format bytes first */
-    {
-        Err he = read_header(path, hdr, &version, &cf, &fit);
-        if (he != ERR_OK)
-            return he;
-    }
-
-    f = fopen(path, "rb");
-    if (f == NULL)
-        return ERR_OPEN;
-    if (fseek(f, (long)NOFFT_HEADER_SIZE, SEEK_SET) != 0) {
-        fclose(f);
-        return ERR_IO;
-    }
+    if (!src_read(src, hdr, NOFFT_HEADER_SIZE))
+        return ERR_BAD_NOFFT;
+    rc = parse_header(hdr, &version, &cf, &fit);
+    if (rc != ERR_OK)
+        return rc;
 
     memcpy(&sr, hdr + 8, 4);
     memcpy(&ch, hdr + 12, 2);
@@ -1065,28 +1210,22 @@ Err nofft_decode(const char* path, pcm_buf* out)
         nofft_effective_degree(degree, frame_len) > 63 ||
         nofft_effective_degree(degree, last_len) > 63 ||
         (fit != NOFFT_FIT_INTERP && fit != NOFFT_FIT_LEAST_SQ)) {
-        fclose(f);
         return ERR_BAD_NOFFT;
     }
 
     total_frames = (uint64_t)(n_frames - 1) * frame_len + last_len;
     total_samples = total_frames * ch;
 
-    if (total_samples > (uint64_t)((SIZE_MAX / sizeof(float)) - 1)) {
-        fclose(f);
+    if (total_samples > (uint64_t)((SIZE_MAX / sizeof(float)) - 1))
         return ERR_NO_MEMORY;
-    }
 
     buf = (float*)malloc((size_t)total_samples * sizeof(float));
-    if (buf == NULL) {
-        fclose(f);
+    if (buf == NULL)
         return ERR_NO_MEMORY;
-    }
 
     coefs = (double*)malloc(sizeof(double) * (size_t)(nofft_effective_degree(degree, frame_len) + 1) * ch);
     if (coefs == NULL) {
         free(buf);
-        fclose(f);
         return ERR_NO_MEMORY;
     }
 
@@ -1100,18 +1239,14 @@ Err nofft_decode(const char* path, pcm_buf* out)
         uint8_t bnd_q[2] = { 0, 0 };
 
         if (version >= 6) {
-            if (fread(bnd_q, 1, 2, f) != 2) {
-                free(coefs);
-                free(buf);
-                fclose(f);
-                return ERR_BAD_NOFFT;
+            if (!src_read(src, bnd_q, 2)) {
+                rc = ERR_BAD_NOFFT;
+                goto done;
             }
         } else if (version == 5) {
-            if (fread(&fill_q, 1, 1, f) != 1) {
-                free(coefs);
-                free(buf);
-                fclose(f);
-                return ERR_BAD_NOFFT;
+            if (!src_read(src, &fill_q, 1)) {
+                rc = ERR_BAD_NOFFT;
+                goto done;
             }
         }
 
@@ -1120,11 +1255,9 @@ Err nofft_decode(const char* path, pcm_buf* out)
                 for (i = 0; i < n; ++i) {
                     uint8_t raw[2];
                     uint16_t h;
-                    if (fread(raw, 1, 2, f) != 2) {
-                        free(coefs);
-                        free(buf);
-                        fclose(f);
-                        return ERR_BAD_NOFFT;
+                    if (!src_read(src, raw, 2)) {
+                        rc = ERR_BAD_NOFFT;
+                        goto done;
                     }
                     h = (uint16_t)((uint16_t)raw[0] | ((uint16_t)raw[1] << 8));
                     coefs[(size_t)ci * n + i] = (double)f16_bits_to_f32(h);
@@ -1132,11 +1265,9 @@ Err nofft_decode(const char* path, pcm_buf* out)
             } else {
                 for (i = 0; i < n; ++i) {
                     float v;
-                    if (fread(&v, 1, sizeof(v), f) != sizeof(v)) {
-                        free(coefs);
-                        free(buf);
-                        fclose(f);
-                        return ERR_BAD_NOFFT;
+                    if (!src_read(src, &v, sizeof(v))) {
+                        rc = ERR_BAD_NOFFT;
+                        goto done;
                     }
                     coefs[(size_t)ci * n + i] = (double)v;
                 }
@@ -1189,14 +1320,54 @@ Err nofft_decode(const char* path, pcm_buf* out)
         used += (size_t)len * ch;
     }
 
-    free(coefs);
-    fclose(f);
-
     out->samples = buf;
     out->count = used;
     out->sample_rate = sr;
     out->channels = ch;
-    return ERR_OK;
+    buf = NULL;
+
+done:
+    free(coefs);
+    free(buf);
+    return rc;
+}
+
+Err nofft_decode(const char* path, pcm_buf* out)
+{
+    byte_source src;
+    FILE* f;
+    Err rc;
+
+    if (out == NULL)
+        return ERR_BAD_ARGS;
+
+    f = fopen(path, "rb");
+    if (f == NULL)
+        return ERR_OPEN;
+
+    src.f = f;
+    src.mem = NULL;
+    src.len = 0;
+    src.pos = 0;
+
+    rc = decode_impl(&src, out);
+    fclose(f);
+    return rc;
+}
+
+Err nofft_decode_buf(const uint8_t* data, size_t len, pcm_buf* out)
+{
+    byte_source src;
+
+    if (out == NULL || data == NULL)
+        return ERR_BAD_ARGS;
+
+    src.f = NULL;
+    src.mem = data;
+    src.len = len;
+    src.pos = 0;
+
+    return decode_impl(&src, out);
 }
 
 float nofft_decode_snr_db(const float* a, const float* b, size_t n)

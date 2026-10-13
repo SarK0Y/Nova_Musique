@@ -102,6 +102,10 @@ pub enum NadcVariant {
     Nfa3,
     /// Basket-only, no predictor (170 baskets).
     Nfa4,
+    /// Multiplicative (log-domain) predictor, lossy.
+    Nfa5,
+    /// NFA5 with a per-block re-fit of the log step, lossy.
+    Nfa6,
 }
 
 impl NadcVariant {
@@ -111,6 +115,8 @@ impl NadcVariant {
             NadcVariant::Nfa2 => 2,
             NadcVariant::Nfa3 => 3,
             NadcVariant::Nfa4 => 4,
+            NadcVariant::Nfa5 => 5,
+            NadcVariant::Nfa6 => 6,
         }
     }
 }
@@ -399,6 +405,8 @@ mod tests {
             NadcVariant::Nfa2,
             NadcVariant::Nfa3,
             NadcVariant::Nfa4,
+            NadcVariant::Nfa5,
+            NadcVariant::Nfa6,
         ] {
             let out = dir.join(format!("signal.{}.nadc", variant.as_raw()));
             encode_nadc(&wav, &out, 6, variant).expect("encode");

@@ -15,6 +15,16 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
+
+// Ubuntu 20.04's libstdc++.so.6.0.28 (GCC 9.4) is missing the out-of-line
+// std::__throw_bad_array_new_length() wrapper that <vector>'s fill-assign
+// path references.  Provide it so the codec links everywhere.
+namespace std {
+void __throw_bad_array_new_length() {
+    throw bad_array_new_length();
+}
+}
 
 namespace {
 
@@ -57,7 +67,8 @@ int nova_codec_kind(const char* path) {
         return 0;
     }
     if (magic_is(magic, ACPCM_MAGIC) || magic_is(magic, ACPCM_MAGIC2) ||
-        magic_is(magic, ACPCM_MAGIC3) || magic_is(magic, ACPCM_MAGIC4)) {
+        magic_is(magic, ACPCM_MAGIC3) || magic_is(magic, ACPCM_MAGIC4) ||
+        magic_is(magic, ACPCM_MAGIC5) || magic_is(magic, ACPCM_MAGIC6)) {
         return 1;
     }
     return -1;
@@ -190,7 +201,8 @@ int nova_encode_nofft(const char* in_wav, const char* out_path, uint32_t frame_l
 }
 
 // Encodes a WAV to `.nadc`. `variant` selects the codec: 1 = NFA1, 2 = NFA2
-// (block 1024, drift policy), 3 = NFA3, 4 = NFA4 (170 baskets).
+// (block 1024, drift policy), 3 = NFA3, 4 = NFA4 (170 baskets), 5 = NFA5
+// (multiplicative log-domain predictor), 6 = NFA6 (blocked NFA5).
 int nova_encode_nadc(const char* in_wav, const char* out_path, uint16_t bits,
                      uint32_t variant) {
     pcm_buf p;
@@ -211,6 +223,12 @@ int nova_encode_nadc(const char* in_wav, const char* out_path, uint16_t bits,
             break;
         case 4:
             e = acpcm_encode4_baskets(out_path, &p, bits, 170);
+            break;
+        case 5:
+            e = acpcm_encode5(out_path, &p, bits, 2.0, 0.01);
+            break;
+        case 6:
+            e = acpcm_encode6(out_path, &p, bits, 1024, 2.0, 2.6);
             break;
         default:
             e = ERR_BAD_ARGS;

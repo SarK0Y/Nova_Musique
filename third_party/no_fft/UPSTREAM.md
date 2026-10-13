@@ -10,8 +10,8 @@ pinned to the `main` branch (trunk).
 | ------- | ----- |
 | Repo    | `https://github.com/SarK0Y/No_FFT_v0.git` |
 | Branch  | `main` |
-| Commit  | `47ca13f1c13d596052e06dd747d425f9784dfafe` |
-| Date    | `2026-10-11T00:48:14+03:00` |
+| Commit  | `898a0467ad38f536ddb1b7dcdf315aa6acb29078` |
+| Date    | `2026-10-13T22:22:46+03:00` |
 
 ## Vendored files
 

@@ -831,13 +831,359 @@ Err encode_chunk4(const float* s, size_t n, uint16_t bits, uint32_t nb,
     return ERR_OK;
 }
 
+/* NFA5, the multiplicative (log-domain) predictor: one symbol per sample, the
+ * integer exponent K of the per-step ratio e^(K*err).  The grid is shifted onto
+ * u = xq + ACPCM5_OFFSET so it is strictly positive, the first sample is a raw
+ * 16 bit seed like NFA1, and every later sample is coded as
+ *   K = round( log(u[n] / u[n-1]) / (err * log e) )
+ * with the decoder rebuilding u[n] = clamp(round(u[n-1] * e^(K*err))).  The
+ * encoder must advance on the reconstructed u[n-1], not the source, or the two
+ * sides desync on the first rounding.  e^(K*err) is precomputed into a 16.16
+ * fixed-point table so the sample loop is integer only.  The geometric grid
+ * cannot hit every integer, so the codec is lossy by construction.
+ */
+
+/* Build the shared step table F[K] = round(e^(K*err) * 2^16) for
+   K in [-kmax, kmax].  Both sides call this with the *decoded* doubles, so the
+   table is bit-identical and no libm runs in the sample loop.  kmax spans the
+   whole positive grid (a ratio of ACPCM5_OFFSET .. 65536 on u), clamped to
+   ACPCM5_MAX_STEPS; factors are clipped at 2^34, well inside the 64 bit
+   product, because any factor that large clamps the update to the grid top. */
+void build_grid5(double e, double err, int* kmax_out,
+                 std::vector<uint64_t>* f)
+{
+    double need = std::log(65536.0) / err;
+    int kmax = (int)std::ceil(need) + 1;
+    if (kmax > ACPCM5_MAX_STEPS)
+        kmax = ACPCM5_MAX_STEPS;
+    if (kmax < 1)
+        kmax = 1;
+    f->assign((size_t)(2 * kmax + 1), 1);
+    for (int k = -kmax; k <= kmax; k++) {
+        double v = std::pow(e, (double)k * err) * 65536.0;
+        uint64_t fx;
+        if (!(v > 1.0))
+            fx = 1;
+        else if (v >= 17179869184.0)   /* 2^34 */
+            fx = (uint64_t)1 << 34;
+        else
+            fx = (uint64_t)std::floor(v + 0.5);
+        (*f)[(size_t)(k + kmax)] = fx;
+    }
+    *kmax_out = kmax;
+}
+
+/* Integer half-up multiply by the table factor: pred = round(u * F/2^16). */
+int32_t grid5_step(int32_t u, uint64_t factor)
+{
+    uint64_t p = ((uint64_t)u * factor + (1u << 15)) >> 16;
+    if (p < 1)
+        p = 1;
+    if (p > 65536)
+        p = 65536;
+    return (int32_t)p;
+}
+
+/* NFA6's per-block err travels as one 8 bit log-spaced code over the NFA5 err
+   window; both sides map the code through err_from_code8, so the double the
+   encoder built its grid from is exactly the double the decoder rebuilds it
+   from.  Only the encoder ever rounds down into a code. */
+int err_code8(double err)
+{
+    double t = std::log(err / ACPCM5_ERR_MIN) /
+               std::log(ACPCM5_ERR_MAX / ACPCM5_ERR_MIN);
+    int c = (int)std::floor(t * 255.0 + 0.5);
+    if (c < 0)
+        c = 0;
+    if (c > 255)
+        c = 255;
+    return c;
+}
+double err_from_code8(int code)
+{
+    if (code < 0)
+        code = 0;
+    if (code > 255)
+        code = 255;
+    return ACPCM5_ERR_MIN *
+           std::exp(std::log(ACPCM5_ERR_MAX / ACPCM5_ERR_MIN) *
+                    (double)code / 255.0);
+}
+
+/* Estimate the range-coded bits for a block's K symbols at a candidate err as
+   the Shannon entropy of the sign-symmetric K histogram.  |K| is capped at
+   kcap: anything beyond counts as one huge-K mass, so the estimate cannot
+   pretend a runaway block is cheap.  The adaptive range coder approaches the
+   empirical entropy over a long block, so this is the right cost model for the
+   encoder's per-block rate fit. */
+static double k_entropy_bits(const double* r, size_t cnt, double err,
+                             double loge, int kcap)
+{
+    if (cnt == 0)
+        return 0.0;
+    double inv = 1.0 / (err * loge);
+    std::vector<int> hist((size_t)(kcap + 1), 0);
+    for (size_t i = 0; i < cnt; i++) {
+        double kk = r[i] * inv;
+        if (!(kk == kk))
+            kk = 0.0;
+        int k = (int)std::floor(kk + 0.5);
+        if (k < 0)
+            k = 0;
+        if (k > kcap)
+            k = kcap;
+        hist[(size_t)k]++;
+    }
+    /* Signed Z: the zero bin keeps all its mass; every |k| > 0 splits its mass
+       evenly over +k and -k (the encoder only kept |log-ratio|). */
+    double z0 = 0.0, htail = 0.0;
+    for (int k = 0; k <= kcap; k++) {
+        double p = (double)hist[(size_t)k] / (double)cnt;
+        if (p <= 0.0)
+            continue;
+        if (k == 0) {
+            z0 += p;
+        } else {
+            double a = p / 2.0;
+            htail += 2.0 * a * std::log2(a);
+        }
+    }
+    double h = 0.0;
+    if (z0 > 0.0)
+        h -= z0 * std::log2(z0);
+    h -= htail;
+    return h * (double)cnt;
+}
+
+/* NFA6, the blocked NFA5: the log-domain quantum err is re-fitted at every
+ * block boundary.  Block b covers frames [b*block_len, (b+1)*block_len) on the
+ * shifted grid (frame 0 is the seed, so block 0 codes block_len-1 symbols).
+ * The encoder's fit is a per-block rate control: err is bisected down until the
+ * block's estimated K cost (k_entropy_bits) plus the 8 bit err code fits a
+ * per-block slice `rate` of the target bits/sample.  The decoder never sees the
+ * policy, only the byte, so any encoder-side fit would work; quiet blocks keep
+ * a fine step almost free because their K are mostly 0, loud or fast blocks
+ * coarsen to stay in budget, and each block's rate is bounded rather than only
+ * the average.  A block with no ratios or a flat span gets the coarsest err,
+ * which is free: all its K are exactly 0.  The 8 bit code, the rebuilt table
+ * and everything else travel exactly as NFA5.  (A pooled variant that let
+ * blocks spend each other's unspent budget was tried and rejected; see the note
+ * at the rate control below.)
+ */
+Err encode_chunk6(const float* s, size_t n, double ebase, uint32_t block_len,
+                  double rate, std::vector<uint8_t>* out)
+{
+    for (size_t i = 0; i < n; i++) {
+        double a = s[i] < 0.0 ? -s[i] : s[i];
+        if (!(a == a) || a > PEAK_LIMIT)
+            return ERR_BAD_INPUT;
+    }
+
+    std::vector<int32_t> u(n);
+    for (size_t i = 0; i < n; i++)
+        u[i] = quant_clamp(s[i], 32768.0, -32768.0, 32767.0) + ACPCM5_OFFSET;
+
+    EncCtx e;
+    uint64_t ebits;
+    memcpy(&ebits, &ebase, sizeof(ebits));
+    e.fixed((uint32_t)(ebits >> 32), 32);
+    e.fixed((uint32_t)ebits, 32);
+    e.fixed((uint32_t)(uint16_t)(int16_t)(u[0] - ACPCM5_OFFSET), 16);
+
+    SymModel m;
+    sym_init(&m);
+    int32_t prev = u[0];
+    int kmax = 0;
+    std::vector<uint64_t> F;
+    double inv = 0.0;
+
+    for (size_t i = 1; i < n; i++) {
+        if ((i - 1) % block_len == 0) {
+            size_t bstart = i - 1;
+            size_t bend = bstart + block_len;
+            if (bend > n)
+                bend = n;
+            size_t cnt = bend - bstart - 1;
+            double rmax = 0.0;
+            std::vector<double> rv(cnt);
+            for (size_t j = bstart + 1; j < bend; j++) {
+                double r = std::fabs(std::log((double)u[j]) -
+                                     std::log((double)u[j - 1]));
+                rv[j - bstart - 1] = r;
+                if (r > rmax)
+                    rmax = r;
+            }
+            double err;
+            if (cnt == 0 || rmax == 0.0) {
+                /* flat span: every K is exactly 0, so the step does not matter;
+                   pick the coarsest one for the smallest table */
+                err = ACPCM5_ERR_MAX;
+            } else {
+                /* rate control: the finest err whose estimated K cost fits this
+                   block's own slice of the target rate.  The 8 bit err byte is
+                   the only overhead; the per-chunk seed is amortised away.  A
+                   pooled variant that let blocks spend each other's unspent
+                   budget was tried and rejected: on real material the fit
+                   saturates every non-flat block, so no block leaves slack, and
+                   where slack is real (true silence) the finer step the pool
+                   buys costs far more than the entropy estimate, blowing the
+                   target (6.3 b/s against 2.6).  Equal slices keep the per-block
+                   rate an actual bound. */
+                double budget = rate * (double)cnt + 8.0;
+                double lo = ACPCM5_ERR_MIN, hi = ACPCM5_ERR_MAX;
+                double loge = std::log(ebase);
+                for (int it = 0; it < 18; it++) {
+                    double mid = std::sqrt(lo * hi);
+                    double est = k_entropy_bits(rv.data(), cnt, mid, loge, 64) + 8.0;
+                    if (est > budget)
+                        lo = mid;
+                    else
+                        hi = mid;
+                }
+                err = hi;
+            }
+            int code = err_code8(err);
+            e.fixed((uint32_t)code, 8);
+            err = err_from_code8(code);
+            build_grid5(ebase, err, &kmax, &F);
+            inv = 1.0 / (err * std::log(ebase));
+        }
+        int32_t ut = u[i];
+        double kk = (std::log((double)ut) - std::log((double)prev)) * inv;
+        if (!(kk == kk))
+            kk = 0.0;
+        /* clamp before rounding: a very flat base e makes inv huge, and an
+           int32 cast of an out-of-range double is undefined behaviour */
+        if (kk > (double)kmax)
+            kk = (double)kmax;
+        if (kk < -(double)kmax)
+            kk = -(double)kmax;
+        int32_t K = (int32_t)quant_fixed(kk, 1.0);
+        prev = grid5_step(prev, F[(size_t)(K + kmax)]);
+        enc_sym(&e, &m, K);
+    }
+
+    e.done();
+    out->swap(e.out);
+    return ERR_OK;
+}
+
+Err encode_chunk5(const float* s, size_t n, double ebase, double err,
+                  std::vector<uint8_t>* out)
+{
+    for (size_t i = 0; i < n; i++) {
+        double a = s[i] < 0.0 ? -s[i] : s[i];
+        if (!(a == a) || a > PEAK_LIMIT)
+            return ERR_BAD_INPUT;
+    }
+
+    int kmax = 0;
+    std::vector<uint64_t> F;
+    build_grid5(ebase, err, &kmax, &F);
+
+    EncCtx e;
+    uint64_t ebits, rbits;
+    memcpy(&ebits, &ebase, sizeof(ebits));
+    memcpy(&rbits, &err, sizeof(rbits));
+    e.fixed((uint32_t)(ebits >> 32), 32);
+    e.fixed((uint32_t)ebits, 32);
+    e.fixed((uint32_t)(rbits >> 32), 32);
+    e.fixed((uint32_t)rbits, 32);
+
+    int32_t xq0 = quant_clamp(s[0], 32768.0, -32768.0, 32767.0);
+    e.fixed((uint32_t)(uint16_t)(int16_t)xq0, 16);
+    int32_t prev = xq0 + ACPCM5_OFFSET;
+
+    SymModel m;
+    sym_init(&m);
+    double inv = 1.0 / (err * std::log(ebase));
+
+    for (size_t i = 1; i < n; i++) {
+        int32_t xq = quant_clamp(s[i], 32768.0, -32768.0, 32767.0);
+        int32_t ut = xq + ACPCM5_OFFSET;
+        double kk = (std::log((double)ut) - std::log((double)prev)) * inv;
+        if (!(kk == kk))
+            kk = 0.0;
+        /* clamp before rounding: a very flat base e makes inv huge, and an
+           int32 cast of an out-of-range double is undefined behaviour */
+        if (kk > (double)kmax)
+            kk = (double)kmax;
+        if (kk < -(double)kmax)
+            kk = -(double)kmax;
+        int32_t K = (int32_t)quant_fixed(kk, 1.0);
+        prev = grid5_step(prev, F[(size_t)(K + kmax)]);
+        enc_sym(&e, &m, K);
+    }
+
+    e.done();
+    out->swap(e.out);
+    return ERR_OK;
+}
+
+/* NFA5's auto-dial: pick the *global* err for a chunk (per channel, since each
+ * chunk stores its own err) so the finest step that still fits `rate`
+ * bits/sample wins.  This is the mis-dial cure for NFA5: a quiet file dials
+ * itself fine and stays cheap (its K are mostly 0), a loud or fast one coarsens
+ * to hold the rate, and budget quietly migrates from easy to hard material the
+ * way a user tuning err by ear would do by hand - without the per-block equal
+ * budgets NFA6 enforces, which overpay quiet blocks and starve hard ones on
+ * mixed material.  The estimator is k_entropy_bits, the same one NFA6 uses.
+ * The observed gap between the estimate and the real range coder is modest and
+ * signal-dependent (a moving target is not possible with one constant, so
+ * AUTO_ERR_FUDGE is kept at 1.0 and the delivered rate lands within a few
+ * tenths of a bit of the target on tonal material, below it on chirp-heavy
+ * material, where the adaptive coder beats the zero-order histogram). */
+static const double AUTO_ERR_FUDGE = 1.0;
+
+void auto_err5(const float* s, size_t n, double ebase, double rate,
+               double* err_out)
+{
+    size_t syms = (n > 1) ? (n - 1) : 0;
+    *err_out = ACPCM5_ERR_MAX;
+    if (syms == 0)
+        return;
+
+    std::vector<double> rv(syms);
+    double rmax = 0.0;
+    std::vector<int32_t> u(n);
+    u[0] = quant_clamp(s[0], 32768.0, -32768.0, 32767.0) + ACPCM5_OFFSET;
+    for (size_t i = 1; i < n; i++) {
+        u[i] = quant_clamp(s[i], 32768.0, -32768.0, 32767.0) + ACPCM5_OFFSET;
+        double r = std::fabs(std::log((double)u[i]) - std::log((double)u[i - 1]));
+        rv[i - 1] = r;
+        if (r > rmax)
+            rmax = r;
+    }
+    if (rmax == 0.0)
+        return; /* flat span: coarsest err, all K exactly 0 */
+
+    double budget = rate * (double)syms;
+    double lo = ACPCM5_ERR_MIN, hi = ACPCM5_ERR_MAX;
+    double loge = std::log(ebase);
+    for (int it = 0; it < 24; it++) {
+        double mid = std::sqrt(lo * hi);
+        double est = AUTO_ERR_FUDGE * k_entropy_bits(rv.data(), syms, mid, loge, 64);
+        if (est > budget)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    *err_out = hi;
+}
 
 } /* namespace */
 
-static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
-                             uint32_t block_len, acpcm_p2_policy policy,
-                             bool v3, uint32_t step, uint32_t baskets)
+/* Builds the whole container in memory.  acpcm_encode_impl writes the result to
+   a file; the buffer entry points further down hand it straight to the caller.
+   Both paths share this one copy of the encoder, so they cannot drift. */
+static Err acpcm_encode_mem(std::vector<uint8_t>& out, const pcm_buf* p, uint16_t bits,
+                            uint32_t block_len, acpcm_p2_policy policy,
+                            bool v3, uint32_t step, uint32_t baskets,
+                            bool v5, double e5, double err5,
+                            bool v6, uint32_t block6, double e6, double rate6,
+                            bool v5a, double rate5a)
 {
+    out.clear();
     if (p == NULL || p->samples == NULL || p->channels == 0)
         return ERR_BAD_ARGS;
     if (bits < ACPCM_BITS_MIN || bits > ACPCM_BITS_MAX)
@@ -876,6 +1222,17 @@ static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
         if (nfa4) {
             /* NFA4 plans its own shifted grid, so skip the predictor plan */
             e = encode_chunk4(gath.data(), frames, bits, nb4, &chunks[c]);
+        } else if (v6) {
+            /* NFA6: NFA5 with a per-block re-fit of err */
+            e = encode_chunk6(gath.data(), frames, e6, block6, rate6, &chunks[c]);
+        } else if (v5a) {
+            /* NFA5 with an auto-dialed global err (target rate per chunk) */
+            double aerr;
+            auto_err5(gath.data(), frames, e5, rate5a, &aerr);
+            e = encode_chunk5(gath.data(), frames, e5, aerr, &chunks[c]);
+        } else if (v5) {
+            /* NFA5 is multiplicative: no predictor plan, just the log grid */
+            e = encode_chunk5(gath.data(), frames, e5, err5, &chunks[c]);
         } else {
             ChanPlan pl;
             e = plan_channel(gath.data(), frames, bits, &pl);
@@ -897,8 +1254,11 @@ static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
 
     int v2 = (block_len != 0);
     const char* magic = nfa4 ? ACPCM_MAGIC4
+                     : v6 ? ACPCM_MAGIC6
+                     : (v5 || v5a) ? ACPCM_MAGIC5
                      : (v3 ? ACPCM_MAGIC3 : (v2 ? ACPCM_MAGIC2 : ACPCM_MAGIC));
-    size_t base = v2 ? (size_t)ACPCM_FIXED_HEADER2 : (size_t)ACPCM_FIXED_HEADER;
+    size_t base = (v2 || v6) ? (size_t)ACPCM_FIXED_HEADER2
+                                   : (size_t)ACPCM_FIXED_HEADER;
     size_t hsz = base + 4 * ch;
     std::vector<uint8_t> hdr(hsz, 0);
     memcpy(hdr.data(), magic, 4);
@@ -906,20 +1266,50 @@ static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
     put_u32(hdr.data() + 8, (uint32_t)bits);
     put_u32(hdr.data() + 12, (uint32_t)ch);
     put_u32(hdr.data() + 16, p->sample_rate);
-    if (v2)
-        put_u32(hdr.data() + ACPCM_FIXED_HEADER, block_len);
+    if (v2 || v6)
+        put_u32(hdr.data() + ACPCM_FIXED_HEADER,
+                (uint32_t)((v6) ? block6 : block_len));
     for (size_t c = 0; c < ch; c++)
         put_u32(hdr.data() + base + 4 * c, (uint32_t)chunks[c].size());
+
+    out.reserve(hdr.size() + (size_t)payload);
+    out.insert(out.end(), hdr.begin(), hdr.end());
+    for (size_t c = 0; c < ch; c++)
+        out.insert(out.end(), chunks[c].begin(), chunks[c].end());
+    return ERR_OK;
+}
+
+/* Copies an encoded container into a caller owned malloc buffer. */
+static Err acpcm_dup_buf(const std::vector<uint8_t>& v, uint8_t** out, size_t* out_len)
+{
+    uint8_t* m = (uint8_t*)malloc(v.empty() ? 1u : v.size());
+    if (m == NULL)
+        return ERR_NO_MEMORY;
+    if (!v.empty())
+        memcpy(m, v.data(), v.size());
+    *out = m;
+    *out_len = v.size();
+    return ERR_OK;
+}
+
+static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
+                             uint32_t block_len, acpcm_p2_policy policy,
+                             bool v3, uint32_t step, uint32_t baskets,
+                             bool v5, double e5, double err5,
+                             bool v6, uint32_t block6, double e6, double rate6,
+                             bool v5a, double rate5a)
+{
+    std::vector<uint8_t> out;
+    Err rc = acpcm_encode_mem(out, p, bits, block_len, policy, v3, step, baskets,
+                              v5, e5, err5, v6, block6, e6, rate6, v5a, rate5a);
+    if (rc != ERR_OK)
+        return rc;
 
     FILE* f = fopen(path, "wb");
     if (f == NULL)
         return ERR_OPEN;
-    Err rc = ERR_OK;
-    if (fwrite(hdr.data(), 1, hdr.size(), f) != hdr.size())
+    if (fwrite(out.data(), 1, out.size(), f) != out.size())
         rc = ERR_IO;
-    for (size_t c = 0; c < ch && rc == ERR_OK; c++)
-        if (fwrite(chunks[c].data(), 1, chunks[c].size(), f) != chunks[c].size())
-            rc = ERR_IO;
     if (fclose(f) != 0 && rc == ERR_OK)
         rc = ERR_IO;
     return rc;
@@ -927,7 +1317,8 @@ static Err acpcm_encode_impl(const char* path, const pcm_buf* p, uint16_t bits,
 
 Err acpcm_encode(const char* path, const pcm_buf* p, uint16_t bits)
 {
-    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, 0, 0);
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, 0, 0,
+                             false, 0.0, 0.0, false, 0, 0.0, 0.0, false, 0.0);
 }
 
 Err acpcm_encode2(const char* path, const pcm_buf* p, uint16_t bits,
@@ -937,12 +1328,14 @@ Err acpcm_encode2(const char* path, const pcm_buf* p, uint16_t bits,
         return ERR_RANGE;
     if ((int)policy < (int)ACP2_NEVER || (int)policy > (int)ACP2_DRIFT)
         return ERR_RANGE;
-    return acpcm_encode_impl(path, p, bits, block_len, policy, false, 0, 0);
+    return acpcm_encode_impl(path, p, bits, block_len, policy, false, 0, 0,
+                             false, 0.0, 0.0, false, 0, 0.0, 0.0, false, 0.0);
 }
 
 Err acpcm_encode3(const char* path, const pcm_buf* p, uint16_t bits)
 {
-    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, true, 0, 0);
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, true, 0, 0,
+                             false, 0.0, 0.0, false, 0, 0.0, 0.0, false, 0.0);
 }
 
 Err acpcm_encode4(const char* path, const pcm_buf* p, uint16_t bits,
@@ -950,7 +1343,8 @@ Err acpcm_encode4(const char* path, const pcm_buf* p, uint16_t bits,
 {
     if (step < ACPCM4_STEP_MIN || step > ACPCM4_STEP_MAX)
         return ERR_RANGE;
-    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, step, 0);
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, step, 0,
+                             false, 0.0, 0.0, false, 0, 0.0, 0.0, false, 0.0);
 }
 
 Err acpcm_encode4_baskets(const char* path, const pcm_buf* p, uint16_t bits,
@@ -958,7 +1352,218 @@ Err acpcm_encode4_baskets(const char* path, const pcm_buf* p, uint16_t bits,
 {
     if (baskets < ACPCM4_BASKETS_MIN || baskets > ACPCM4_MAX_BUCKETS)
         return ERR_RANGE;
-    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, 0, baskets);
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, 0, baskets,
+                             false, 0.0, 0.0, false, 0, 0.0, 0.0, false, 0.0);
+}
+
+Err acpcm_encode5(const char* path, const pcm_buf* p, uint16_t bits,
+                  double e, double err)
+{
+    if (!(e > 1.0) || !(e == e))
+        return ERR_RANGE;
+    if (!(err >= ACPCM5_ERR_MIN) || !(err <= ACPCM5_ERR_MAX))
+        return ERR_RANGE;
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, 0, 0,
+                             true, e, err, false, 0, 0.0, 0.0, false, 0.0);
+}
+
+Err acpcm_encode6(const char* path, const pcm_buf* p, uint16_t bits,
+                  uint32_t block_len, double e, double rate)
+{
+    if (block_len == 0)
+        return ERR_RANGE;
+    if (!(e > 1.0) || !(e == e))
+        return ERR_RANGE;
+    if (!(rate > 0.0) || !(rate == rate) || rate > 64.0)
+        return ERR_RANGE;
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, 0, 0,
+                             false, 0.0, 0.0, true, block_len, e, rate, false, 0.0);
+}
+
+
+
+Err acpcm_encode5_auto(const char* path, const pcm_buf* p, uint16_t bits,
+                       double e, double rate)
+{
+    if (!(e > 1.0) || !(e == e))
+        return ERR_RANGE;
+    if (!(rate > 0.0) || !(rate == rate) || rate > 64.0)
+        return ERR_RANGE;
+    return acpcm_encode_impl(path, p, bits, 0, ACP2_NEVER, false, 0, 0,
+                             false, e, 0.0, false, 0, 0.0, 0.0, true, rate);
+}
+
+/* ---- in-memory buffer encode ----
+ *
+ * The same container the file entry points write, handed back as one malloc'd
+ * block so an application can keep a compressed clip in memory.  Release the
+ * result with acpcm_buf_free.  These share acpcm_encode_mem, so the bytes are
+ * identical to the file forms.
+ */
+static Err acpcm_encode_buf_impl(uint8_t** out, size_t* out_len, const pcm_buf* p,
+                                 uint16_t bits, uint32_t block_len,
+                                 acpcm_p2_policy policy, bool v3, uint32_t step,
+                                 uint32_t baskets, bool v5, double e5, double err5,
+                                 bool v6, uint32_t block6, double e6, double rate6,
+                                 bool v5a, double rate5a)
+{
+    if (out == NULL || out_len == NULL)
+        return ERR_BAD_ARGS;
+    *out = NULL;
+    *out_len = 0;
+
+    std::vector<uint8_t> v;
+    Err e = acpcm_encode_mem(v, p, bits, block_len, policy, v3, step, baskets,
+                             v5, e5, err5, v6, block6, e6, rate6, v5a, rate5a);
+    if (e != ERR_OK)
+        return e;
+    return acpcm_dup_buf(v, out, out_len);
+}
+
+Err acpcm_encode_buf(uint8_t** out, size_t* out_len, const pcm_buf* p, uint16_t bits)
+{
+    return acpcm_encode_buf_impl(out, out_len, p, bits, 0, ACP2_NEVER, false, 0, 0,
+                                 false, 0.0, 0.0, false, 0, 0.0, 0.0, false, 0.0);
+}
+
+Err acpcm_encode2_buf(uint8_t** out, size_t* out_len, const pcm_buf* p, uint16_t bits,
+                      uint32_t block_len, acpcm_p2_policy policy)
+{
+    if (block_len == 0)
+        return ERR_RANGE;
+    if ((int)policy < (int)ACP2_NEVER || (int)policy > (int)ACP2_DRIFT)
+        return ERR_RANGE;
+    return acpcm_encode_buf_impl(out, out_len, p, bits, block_len, policy, false, 0, 0,
+                                 false, 0.0, 0.0, false, 0, 0.0, 0.0, false, 0.0);
+}
+
+Err acpcm_encode3_buf(uint8_t** out, size_t* out_len, const pcm_buf* p, uint16_t bits)
+{
+    return acpcm_encode_buf_impl(out, out_len, p, bits, 0, ACP2_NEVER, true, 0, 0,
+                                 false, 0.0, 0.0, false, 0, 0.0, 0.0, false, 0.0);
+}
+
+Err acpcm_encode4_buf(uint8_t** out, size_t* out_len, const pcm_buf* p, uint16_t bits,
+                      uint32_t step)
+{
+    if (step < ACPCM4_STEP_MIN || step > ACPCM4_STEP_MAX)
+        return ERR_RANGE;
+    return acpcm_encode_buf_impl(out, out_len, p, bits, 0, ACP2_NEVER, false, step, 0,
+                                 false, 0.0, 0.0, false, 0, 0.0, 0.0, false, 0.0);
+}
+
+Err acpcm_encode4_baskets_buf(uint8_t** out, size_t* out_len, const pcm_buf* p,
+                              uint16_t bits, uint32_t baskets)
+{
+    if (baskets < ACPCM4_BASKETS_MIN || baskets > ACPCM4_MAX_BUCKETS)
+        return ERR_RANGE;
+    return acpcm_encode_buf_impl(out, out_len, p, bits, 0, ACP2_NEVER, false, 0, baskets,
+                                 false, 0.0, 0.0, false, 0, 0.0, 0.0, false, 0.0);
+}
+
+Err acpcm_encode5_buf(uint8_t** out, size_t* out_len, const pcm_buf* p, uint16_t bits,
+                      double e, double err)
+{
+    if (!(e > 1.0) || !(e == e))
+        return ERR_RANGE;
+    if (!(err >= ACPCM5_ERR_MIN) || !(err <= ACPCM5_ERR_MAX))
+        return ERR_RANGE;
+    return acpcm_encode_buf_impl(out, out_len, p, bits, 0, ACP2_NEVER, false, 0, 0,
+                                 true, e, err, false, 0, 0.0, 0.0, false, 0.0);
+}
+
+Err acpcm_encode6_buf(uint8_t** out, size_t* out_len, const pcm_buf* p, uint16_t bits,
+                      uint32_t block_len, double e, double rate)
+{
+    if (block_len == 0)
+        return ERR_RANGE;
+    if (!(e > 1.0) || !(e == e))
+        return ERR_RANGE;
+    if (!(rate > 0.0) || !(rate == rate) || rate > 64.0)
+        return ERR_RANGE;
+    return acpcm_encode_buf_impl(out, out_len, p, bits, 0, ACP2_NEVER, false, 0, 0,
+                                 false, 0.0, 0.0, true, block_len, e, rate, false, 0.0);
+}
+
+Err acpcm_encode5_auto_buf(uint8_t** out, size_t* out_len, const pcm_buf* p,
+                           uint16_t bits, double e, double rate)
+{
+    if (!(e > 1.0) || !(e == e))
+        return ERR_RANGE;
+    if (!(rate > 0.0) || !(rate == rate) || rate > 64.0)
+        return ERR_RANGE;
+    return acpcm_encode_buf_impl(out, out_len, p, bits, 0, ACP2_NEVER, false, 0, 0,
+                                 false, e, 0.0, false, 0, 0.0, 0.0, true, rate);
+}
+
+void acpcm_buf_free(void* p)
+{
+    free(p);
+}
+
+/* Reads the fixed header and the per-channel length table out of a container
+   held in memory.  Shared by the file info query, the file decoder (which
+   slurps the file first) and the buffer decoder, so all three agree on what a
+   header is. */
+static Err acpcm_parse_header(const uint8_t* d, size_t n, acpcm_info* out)
+{
+    if (out == NULL)
+        return ERR_BAD_ARGS;
+    if (d == NULL || n < ACPCM_FIXED_HEADER)
+        return ERR_BAD_NOFFT;
+
+    if (memcmp(d, ACPCM_MAGIC, 4) != 0 &&
+        memcmp(d, ACPCM_MAGIC2, 4) != 0 &&
+        memcmp(d, ACPCM_MAGIC3, 4) != 0 &&
+        memcmp(d, ACPCM_MAGIC4, 4) != 0 &&
+        memcmp(d, ACPCM_MAGIC5, 4) != 0 &&
+        memcmp(d, ACPCM_MAGIC6, 4) != 0)
+        return ERR_BAD_NOFFT;
+
+    int fmt = (memcmp(d, ACPCM_MAGIC6, 4) == 0) ? 5
+            : (memcmp(d, ACPCM_MAGIC5, 4) == 0) ? 4
+            : (memcmp(d, ACPCM_MAGIC4, 4) == 0) ? 3
+            : (memcmp(d, ACPCM_MAGIC3, 4) == 0) ? 2
+            : (memcmp(d, ACPCM_MAGIC2, 4) == 0) ? 1 : 0;
+    int v2 = (fmt == 1 || fmt == 5);
+    size_t base = v2 ? (size_t)ACPCM_FIXED_HEADER2 : (size_t)ACPCM_FIXED_HEADER;
+
+    uint32_t frames = get_u32(d + 4);
+    uint32_t bits = get_u32(d + 8);
+    uint32_t ch = get_u32(d + 12);
+    uint32_t rate = get_u32(d + 16);
+    if (ch == 0 || ch > 64 || rate == 0 ||
+        bits < ACPCM_BITS_MIN || bits > ACPCM_BITS_MAX)
+        return ERR_BAD_NOFFT;
+
+    uint32_t block_len = 0;
+    if (v2) {
+        block_len = get_u32(d + ACPCM_FIXED_HEADER);
+        if (block_len == 0) /* NFA2/NFA6 magic without a block: not a valid file */
+            return ERR_BAD_NOFFT;
+    }
+
+    if (n < base + 4 * (size_t)ch)
+        return ERR_BAD_NOFFT;
+
+    uint64_t payload = 0;
+    for (uint32_t c = 0; c < ch; c++)
+        payload += get_u32(d + base + 4 * (size_t)c);
+
+    out->bits = (uint16_t)bits;
+    out->channels = (uint16_t)ch;
+    out->sample_rate = rate;
+    out->block_len = block_len;
+    out->format = (uint8_t)fmt;
+    out->frames = frames;
+    out->payload = payload;
+    out->total = base + (uint64_t)4 * ch + payload;
+    return ERR_OK;
+}
+
+Err acpcm_file_info_buf(const uint8_t* data, size_t len, acpcm_info* out)
+{
+    return acpcm_parse_header(data, len, out);
 }
 
 Err acpcm_file_info(const char* path, acpcm_info* out)
@@ -970,72 +1575,49 @@ Err acpcm_file_info(const char* path, acpcm_info* out)
     if (f == NULL)
         return ERR_OPEN;
 
+    /* The longest header is ACPCM_FIXED_HEADER2 + 4*64 bytes; read it in one
+       pass so a short file fails here rather than in the middle of a decode. */
+    uint8_t hdr[ACPCM_FIXED_HEADER2 + 4 * 64];
     uint8_t mag[4];
     if (fread(mag, 1, 4, f) != 4 ||
         (memcmp(mag, ACPCM_MAGIC, 4) != 0 &&
          memcmp(mag, ACPCM_MAGIC2, 4) != 0 &&
          memcmp(mag, ACPCM_MAGIC3, 4) != 0 &&
-         memcmp(mag, ACPCM_MAGIC4, 4) != 0)) {
+         memcmp(mag, ACPCM_MAGIC4, 4) != 0 &&
+         memcmp(mag, ACPCM_MAGIC5, 4) != 0 &&
+         memcmp(mag, ACPCM_MAGIC6, 4) != 0)) {
         fclose(f);
         return ERR_BAD_NOFFT;
     }
-    int fmt = (memcmp(mag, ACPCM_MAGIC4, 4) == 0) ? 3
+    memcpy(hdr, mag, 4);
+    if (fread(hdr + 4, 1, ACPCM_FIXED_HEADER - 4, f) != ACPCM_FIXED_HEADER - 4) {
+        fclose(f);
+        return ERR_BAD_NOFFT;
+    }
+
+    int fmt = (memcmp(mag, ACPCM_MAGIC6, 4) == 0) ? 5
+            : (memcmp(mag, ACPCM_MAGIC5, 4) == 0) ? 4
+            : (memcmp(mag, ACPCM_MAGIC4, 4) == 0) ? 3
             : (memcmp(mag, ACPCM_MAGIC3, 4) == 0) ? 2
             : (memcmp(mag, ACPCM_MAGIC2, 4) == 0) ? 1 : 0;
-    int v2 = (fmt == 1);
-
-    uint8_t rest[16]; /* frames, bits, channels, sample_rate */
-    if (fread(rest, 1, sizeof(rest), f) != sizeof(rest)) {
+    size_t base = (fmt == 1 || fmt == 5) ? (size_t)ACPCM_FIXED_HEADER2
+                                         : (size_t)ACPCM_FIXED_HEADER;
+    if (base > ACPCM_FIXED_HEADER &&
+        fread(hdr + ACPCM_FIXED_HEADER, 1, base - ACPCM_FIXED_HEADER, f) !=
+            base - ACPCM_FIXED_HEADER) {
         fclose(f);
         return ERR_BAD_NOFFT;
     }
 
-    uint32_t frames = get_u32(rest + 0);
-    uint32_t bits = get_u32(rest + 4);
-    uint32_t ch = get_u32(rest + 8);
-    uint32_t rate = get_u32(rest + 12);
-    if (ch == 0 || ch > 64 || rate == 0 ||
-        bits < ACPCM_BITS_MIN || bits > ACPCM_BITS_MAX) {
+    uint32_t ch = get_u32(hdr + 12);
+    if (ch == 0 || ch > 64 ||
+        fread(hdr + base, 1, 4 * (size_t)ch, f) != 4 * (size_t)ch) {
         fclose(f);
         return ERR_BAD_NOFFT;
     }
-
-    uint32_t block_len = 0;
-    if (v2) {
-        uint8_t blb[4];
-        if (fread(blb, 1, 4, f) != 4) {
-            fclose(f);
-            return ERR_BAD_NOFFT;
-        }
-        block_len = get_u32(blb);
-        if (block_len == 0) { /* NFA2 magic without a block: not a valid file */
-            fclose(f);
-            return ERR_BAD_NOFFT;
-        }
-    }
-
-    uint8_t lenbuf[256];
-    if (ch > 64 || fread(lenbuf, 1, 4 * ch, f) != 4 * ch) {
-        fclose(f);
-        return ERR_BAD_NOFFT;
-    }
-
-    uint64_t payload = 0;
-    for (uint32_t c = 0; c < ch; c++)
-        payload += get_u32(lenbuf + 4 * c);
-
-    out->bits = (uint16_t)bits;
-    out->channels = (uint16_t)ch;
-    out->sample_rate = rate;
-    out->block_len = block_len;
-    out->format = (uint8_t)fmt;
-    out->frames = frames;
-    out->payload = payload;
-    out->total = (v2 ? ACPCM_FIXED_HEADER2 : ACPCM_FIXED_HEADER) +
-                 (uint64_t)4 * ch + payload;
-
     fclose(f);
-    return ERR_OK;
+
+    return acpcm_parse_header(hdr, base + 4 * (size_t)ch, out);
 }
 
 struct DecChan {
@@ -1050,8 +1632,9 @@ struct DecChan {
     int32_t lim;
     int classes;   /* NFA3: basket alphabet size, bits+1 */
     int ctx;       /* NFA3: previous sample's basket, the histogram row */
-    int fmt;       /* 0: NFA1, 1: NFA2, 2: NFA3, 3: NFA4 */
+    int fmt;       /* 0: NFA1, 1: NFA2, 2: NFA3, 3: NFA4, 4: NFA5, 5: NFA6 */
     bool primed;
+    int32_t last_q;      /* last residual code (fmt 0/1), for acpcm_extract_codes */
     uint32_t block_len;  /* 0: NFA1/NFA3/NFA4, no flags */
     uint32_t in_block;   /* samples since the last boundary */
 
@@ -1061,6 +1644,15 @@ struct DecChan {
     int64_t factor4;    /* bt4.M - 1, baskets across the shifted range */
     int64_t peak4;      /* shifted channel range peak_q */
     int32_t base4;      /* signed grid offset on the 1/32768 scale */
+
+    /* NFA5: the multiplicative grid.  f5 is the fixed-point step table shared
+       with the encoder; the sample loop is integer only.  NFA6 reuses all of it
+       and adds ebase6, the decoded base, because its grid is rebuilt from the
+       per-block err read out of the stream. */
+    std::vector<uint64_t> f5;
+    int32_t kmax5;
+    int32_t u5;      /* current reconstructed position on the shifted grid */
+    double ebase6;   /* NFA6: decoded base, held for per-block grid rebuilds */
 
     Err init(const uint8_t* d, size_t n, uint16_t bits, uint32_t bl, int fmt)
     {
@@ -1075,6 +1667,10 @@ struct DecChan {
         this->fmt = fmt;
         if (fmt == 3)
             return init4(bits);
+        if (fmt == 4)
+            return init5();
+        if (fmt == 5)
+            return init6(bl);
 
         uint32_t peak_q = rc.fixed(16);
         int32_t mean_q = (int32_t)(int16_t)(uint16_t)rc.fixed(16);
@@ -1100,6 +1696,7 @@ struct DecChan {
 
         double x0 = (double)(int32_t)(int16_t)(uint16_t)rc.fixed(16) / 32768.0;
         xh = x0;
+        last_q = 0;
         primed = false;
         return ERR_OK;
     }
@@ -1129,12 +1726,100 @@ struct DecChan {
         return ERR_OK;
     }
 
+    /* NFA5 chunk: the codec's two doubles (e and err) and a raw 16 bit seed.
+       The step table is rebuilt from the decoded doubles, so encoder and
+       decoder share it exactly.  The first sample is the seed, every later one
+       is a K symbol. */
+    Err init5()
+    {
+        uint32_t hi = rc.fixed(32);
+        uint32_t lo = rc.fixed(32);
+        uint64_t ebits = ((uint64_t)hi << 32) | (uint64_t)lo;
+        double ebase;
+        memcpy(&ebase, &ebits, sizeof(ebase));
+        hi = rc.fixed(32);
+        lo = rc.fixed(32);
+        uint64_t rbits = ((uint64_t)hi << 32) | (uint64_t)lo;
+        double err;
+        memcpy(&err, &rbits, sizeof(err));
+
+        if (!(ebase > 1.0) || !(ebase == ebase) ||
+            !(err >= ACPCM5_ERR_MIN) || !(err <= ACPCM5_ERR_MAX))
+            return ERR_BAD_NOFFT;
+
+        build_grid5(ebase, err, &kmax5, &f5);
+
+        sym_init(&m);
+        int32_t xq0 = (int32_t)(int16_t)(uint16_t)rc.fixed(16);
+        u5 = xq0 + ACPCM5_OFFSET;
+        block_len = 0;
+        in_block = 0;
+        primed = false;   /* NFA5 codes a seed sample first */
+        return ERR_OK;
+    }
+
+    /* NFA6 chunk: the base double and the raw seed travel like NFA5; the err is
+       not a header field at all.  It is re-read per block by next(), which holds
+       the decoded base here because the grid has to be rebuilt from each new
+       err.  block_len comes from the container (nonzero, checked by
+       acpcm_file_info); in_block counts decoded frames past the seed. */
+    Err init6(uint32_t bl)
+    {
+        uint32_t hi = rc.fixed(32);
+        uint32_t lo = rc.fixed(32);
+        uint64_t ebits = ((uint64_t)hi << 32) | (uint64_t)lo;
+        double ebase;
+        memcpy(&ebase, &ebits, sizeof(ebase));
+
+        if (!(ebase > 1.0) || !(ebase == ebase))
+            return ERR_BAD_NOFFT;
+
+        ebase6 = ebase;
+        sym_init(&m);
+        int32_t xq0 = (int32_t)(int16_t)(uint16_t)rc.fixed(16);
+        u5 = xq0 + ACPCM5_OFFSET;
+        block_len = bl;
+        in_block = 1;     /* the seed is frame 0 of block 0 */
+        primed = false;
+        return ERR_OK;
+    }
+
     double next()
     {
         if (!primed) {
             primed = true;
             in_block = 1;
+            if (fmt == 5 || fmt == 4)
+                return (double)(u5 - ACPCM5_OFFSET) / 32768.0;
             return xh * peak + mean;
+        }
+        if (fmt == 5) {
+            /* in_block counts decoded frames; the next frame to decode has index
+               in_block, and a new block starts whenever that index is a multiple
+               of block_len.  First read that block's err and rebuild the grid,
+               exactly as the encoder rebuilt it from the same 8 bit code. */
+            if ((in_block - 1) % block_len == 0) {
+                double err = err_from_code8((int)rc.fixed(8));
+                build_grid5(ebase6, err, &kmax5, &f5);
+            }
+            int32_t K = dec_sym(&rc, &m);
+            if (K > kmax5)
+                K = kmax5;
+            if (K < -kmax5)
+                K = -kmax5;
+            u5 = grid5_step(u5, f5[(size_t)(K + kmax5)]);
+            in_block++;
+            return (double)(u5 - ACPCM5_OFFSET) / 32768.0;
+        }
+        if (fmt == 4) {
+            int32_t K = dec_sym(&rc, &m);
+            if (K > kmax5)
+                K = kmax5;
+            if (K < -kmax5)
+                K = -kmax5;
+            u5 = grid5_step(u5, f5[(size_t)(K + kmax5)]);
+            in_block++;
+            return (double)(u5 - ACPCM5_OFFSET) / 32768.0;
         }
         if (fmt == 3) {
             int b = rc.multi_tree(&bt4);
@@ -1191,6 +1876,7 @@ struct DecChan {
             q = lim - 1;
         if (q < -lim)
             q = -lim;
+        last_q = q;
         double pred = a1 * xh;
         xh = pred + (double)q * step;
         in_block++;
@@ -1206,15 +1892,20 @@ struct AcpcmDecoder {
     size_t pos;
 };
 
-Err acpcm_dec_open(const char* path, AcpcmDecoder** out)
+/* Opens a container already held in memory.  This is the entire decoder; the
+   path entry point below reads the file into a buffer and calls it, so the two
+   cannot decode differently. */
+Err acpcm_dec_open_mem(const uint8_t* data, size_t len, AcpcmDecoder** out)
 {
+    if (out == NULL)
+        return ERR_BAD_ARGS;
     *out = NULL;
 
     AcpcmDecoder* d = new (std::nothrow) AcpcmDecoder();
     if (d == NULL)
         return ERR_NO_MEMORY;
 
-    Err e = acpcm_file_info(path, &d->info);
+    Err e = acpcm_parse_header(data, len, &d->info);
     if (e != ERR_OK) {
         delete d;
         return e;
@@ -1227,37 +1918,28 @@ Err acpcm_dec_open(const char* path, AcpcmDecoder** out)
         return ERR_BAD_NOFFT;
     }
 
-    FILE* f = fopen(path, "rb");
-    if (f == NULL) {
-        delete d;
-        return ERR_OPEN;
-    }
-
+    size_t base = (d->info.block_len != 0) ? (size_t)ACPCM_FIXED_HEADER2
+                                           : (size_t)ACPCM_FIXED_HEADER;
     d->raw.assign(ch, std::vector<uint8_t>());
     d->ch.assign(ch, DecChan());
     d->frames = frames;
     d->pos = 0;
 
     e = ERR_OK;
-    std::vector<uint8_t> lenbuf(4 * ch);
-    size_t lbase = (d->info.block_len != 0) ? (size_t)ACPCM_FIXED_HEADER2
-                                            : (size_t)ACPCM_FIXED_HEADER;
-    if (fseek(f, (long)lbase, SEEK_SET) != 0 ||
-        fread(lenbuf.data(), 1, lenbuf.size(), f) != lenbuf.size()) {
-        e = ERR_IO;
-    }
-
+    size_t off = base + 4 * ch;
     for (size_t c = 0; c < ch && e == ERR_OK; c++) {
-        uint32_t len = get_u32(lenbuf.data() + 4 * c);
-        if (len == 0) {
+        uint32_t l = get_u32(data + base + 4 * c);
+        if (l == 0) {
             e = ERR_BAD_NOFFT;
             break;
         }
-        d->raw[c].resize(len);
-        if (fread(d->raw[c].data(), 1, len, f) != len)
+        if (off > len || l > len - off) {
             e = ERR_IO;
+            break;
+        }
+        d->raw[c].assign(data + off, data + off + l);
+        off += l;
     }
-    fclose(f);
 
     for (size_t c = 0; c < ch && e == ERR_OK; c++)
         e = d->ch[c].init(d->raw[c].data(), d->raw[c].size(), d->info.bits,
@@ -1270,6 +1952,29 @@ Err acpcm_dec_open(const char* path, AcpcmDecoder** out)
 
     *out = d;
     return ERR_OK;
+}
+
+Err acpcm_dec_open(const char* path, AcpcmDecoder** out)
+{
+    if (path == NULL || out == NULL)
+        return ERR_BAD_ARGS;
+    *out = NULL;
+
+    FILE* f = fopen(path, "rb");
+    if (f == NULL)
+        return ERR_OPEN;
+
+    std::vector<uint8_t> mem;
+    uint8_t buf[65536];
+    size_t got;
+    while ((got = fread(buf, 1, sizeof(buf), f)) > 0)
+        mem.insert(mem.end(), buf, buf + got);
+    int ioerr = ferror(f);
+    fclose(f);
+    if (ioerr)
+        return ERR_IO;
+
+    return acpcm_dec_open_mem(mem.empty() ? NULL : mem.data(), mem.size(), out);
 }
 
 void acpcm_dec_close(AcpcmDecoder* d)
@@ -1299,6 +2004,100 @@ Err acpcm_dec_read(AcpcmDecoder* d, float* out, size_t max_frames, size_t* got)
     return ERR_OK;
 }
 
+void acpcm_codes_free(acpcm_codes* c)
+{
+    if (c == NULL)
+        return;
+    free(c->q);
+    memset(c, 0, sizeof(*c));
+}
+
+/* Walk the same channel streams acpcm_dec_read does, frame by frame, but keep
+   the residual symbol each channel emits instead of the reconstructed sample.
+   The filter state (a1, xh, step) never feeds back into which symbol is read,
+   so skipping the reconstruction cannot drift; the NFA2 refit flags are still
+   consumed because DecChan::next() reads them. */
+Err acpcm_extract_codes(const char* path, acpcm_codes* out)
+{
+    if (path == NULL || out == NULL)
+        return ERR_BAD_ARGS;
+    memset(out, 0, sizeof(*out));
+
+    AcpcmDecoder* d = NULL;
+    Err e = acpcm_dec_open(path, &d);
+    if (e != ERR_OK)
+        return e;
+
+    if (d->info.format > 1) {
+        acpcm_dec_close(d);
+        return ERR_UNSUPPORTED_FMT;
+    }
+
+    size_t ch = d->info.channels;
+    size_t frames = d->frames;
+    size_t codes = (frames > 0) ? frames - 1 : 0;
+
+    int32_t* q = NULL;
+    if (ch != 0 && codes != 0) {
+        if (ch > SIZE_MAX / codes ||
+            ch * codes > SIZE_MAX / sizeof(int32_t)) {
+            acpcm_dec_close(d);
+            return ERR_NO_MEMORY;
+        }
+        q = (int32_t*)malloc(ch * codes * sizeof(int32_t));
+        if (q == NULL) {
+            acpcm_dec_close(d);
+            return ERR_NO_MEMORY;
+        }
+    }
+
+    for (size_t i = 0; i < frames; i++) {
+        for (size_t c = 0; c < ch; c++) {
+            d->ch[c].next();
+            if (i > 0 && q != NULL)
+                q[c * codes + (i - 1)] = d->ch[c].last_q;
+        }
+    }
+
+    acpcm_dec_close(d);
+
+    out->channels = (uint32_t)ch;
+    out->frames = (uint64_t)frames;
+    out->codes = (uint64_t)codes;
+    out->q = q;
+    return ERR_OK;
+}
+
+/* Shared body: turn an already opened decoder into a malloc'd pcm_buf. */
+static Err acpcm_decode_all(AcpcmDecoder* d, pcm_buf* out)
+{
+    size_t ch = d->info.channels;
+    size_t frames = d->frames;
+    if (frames > (SIZE_MAX / sizeof(float)) / (ch == 0 ? 1 : ch))
+        return ERR_NO_MEMORY;
+
+    float* buf = (float*)malloc(frames * ch * sizeof(float));
+    if (buf == NULL)
+        return ERR_NO_MEMORY;
+
+    size_t done = 0;
+    while (done < frames) {
+        size_t got = 0;
+        Err e = acpcm_dec_read(d, buf + done * ch, frames - done, &got);
+        if (e != ERR_OK || got == 0) {
+            free(buf);
+            return (e == ERR_OK) ? ERR_BAD_NOFFT : e;
+        }
+        done += got;
+    }
+
+    out->samples = buf;
+    out->count = frames * ch;
+    out->channels = (uint16_t)ch;
+    out->sample_rate = d->info.sample_rate;
+    return ERR_OK;
+}
+
 Err acpcm_decode(const char* path, pcm_buf* out)
 {
     memset(out, 0, sizeof(*out));
@@ -1308,40 +2107,25 @@ Err acpcm_decode(const char* path, pcm_buf* out)
     if (e != ERR_OK)
         return e;
 
-    size_t ch = d->info.channels;
-    size_t frames = d->frames;
-    if (frames > (SIZE_MAX / sizeof(float)) / (ch == 0 ? 1 : ch)) {
-        acpcm_dec_close(d);
-        return ERR_NO_MEMORY;
-    }
-
-    float* buf = (float*)malloc(frames * ch * sizeof(float));
-    if (buf == NULL) {
-        acpcm_dec_close(d);
-        return ERR_NO_MEMORY;
-    }
-
-    size_t done = 0;
-    while (done < frames) {
-        size_t got = 0;
-        e = acpcm_dec_read(d, buf + done * ch, frames - done, &got);
-        if (e != ERR_OK || got == 0) {
-            free(buf);
-            acpcm_dec_close(d);
-            return (e == ERR_OK) ? ERR_BAD_NOFFT : e;
-        }
-        done += got;
-    }
-    uint32_t rate = d->info.sample_rate;
-    uint16_t chans = (uint16_t)ch;
+    e = acpcm_decode_all(d, out);
     acpcm_dec_close(d);
+    return e;
+}
 
-    out->samples = buf;
-    out->count = frames * ch;
-    out->channels = chans;
-    out->sample_rate = rate;
-    out->sample_rate = rate;
-    return ERR_OK;
+Err acpcm_decode_buf(const uint8_t* data, size_t len, pcm_buf* out)
+{
+    if (out == NULL)
+        return ERR_BAD_ARGS;
+    memset(out, 0, sizeof(*out));
+
+    AcpcmDecoder* d = NULL;
+    Err e = acpcm_dec_open_mem(data, len, &d);
+    if (e != ERR_OK)
+        return e;
+
+    e = acpcm_decode_all(d, out);
+    acpcm_dec_close(d);
+    return e;
 }
 
 

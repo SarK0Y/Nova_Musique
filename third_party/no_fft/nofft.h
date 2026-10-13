@@ -24,6 +24,10 @@ enum Err {
     ERR_COUNT
 };
 
+/* So the C side of the codec ABI can name the error type too; C++ already
+   promotes the enum tag to a type name. */
+typedef enum Err Err;
+
 typedef const char* (*err_str_fn)(Err);
 
 extern err_str_fn g_err_str;
@@ -68,6 +72,18 @@ Err wav_write_stream(FILE* out, const pcm_buf* p);
 Err nofft_encode(const char* path, const pcm_buf* p, uint32_t frame_len, uint16_t degree,
                  nofft_coeff_format cf, nofft_fit fit);
 Err nofft_decode(const char* path, pcm_buf* out);
+
+/* Encodes to a malloc'd byte buffer instead of a file.  The layout is byte for
+   byte what nofft_encode writes to `path`.  Release *out with nofft_buf_free. */
+Err nofft_encode_buf(uint8_t** out, size_t* out_len, const pcm_buf* p,
+                     uint32_t frame_len, uint16_t degree,
+                     nofft_coeff_format cf, nofft_fit fit);
+
+/* Decodes a byte buffer produced by nofft_encode_buf / nofft_encode. */
+Err nofft_decode_buf(const uint8_t* data, size_t len, pcm_buf* out);
+
+/* Releases a buffer returned by nofft_encode_buf. */
+void nofft_buf_free(void* p);
 
 /* Reads only the header of a .no_fft file and reports which fit was used.
    Version 2 and 3 files report NOFFT_FIT_INTERP. */
