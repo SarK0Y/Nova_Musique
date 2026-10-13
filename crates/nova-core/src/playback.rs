@@ -214,10 +214,17 @@ impl AudioBackend for RodioBackend {
     }
 
     fn seek(&mut self, position: Duration) -> Result<()> {
-        let clamped = match self.duration {
+        let mut clamped = match self.duration {
             Some(total) => position.min(total),
             None => position,
         };
+        // rodio's SamplesBuffer::try_seek does `new_pos - curr_channel` in
+        // debug builds, which panics on underflow when seeking to 0 while the
+        // player's internal cursor is mid-frame.  Nudge zero seeks forward by
+        // enough time to produce at least one full frame of samples.
+        if clamped.is_zero() {
+            clamped = Duration::from_millis(1);
+        }
         self.player
             .try_seek(clamped)
             .map_err(|e| CoreError::Audio(format!("seek failed: {e}")))?;

@@ -618,8 +618,20 @@ impl NovaApp {
                 Action::Next => self.engine.next(&self.library),
                 Action::Prev => self.engine.previous(&self.library),
                 Action::Seek(seconds) => {
-                    if let Err(err) = self.engine.seek(Duration::from_secs_f32(seconds.max(0.0))) {
-                        self.toast(err.to_string());
+                    let pos = Duration::from_secs_f32(seconds.max(0.0));
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.engine.seek(pos)
+                    }));
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => self.toast(err.to_string()),
+                        Err(_) => {
+                            // rodio may panic on seek (e.g. underflow in
+                            // SamplesBuffer::try_seek).  Reset the transport
+                            // so the UI stays consistent.
+                            self.engine.stop();
+                            self.toast("Seek failed — reset to start".to_string());
+                        }
                     }
                 }
                 Action::SetVolume(volume) => {
