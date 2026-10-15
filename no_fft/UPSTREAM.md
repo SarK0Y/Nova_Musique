@@ -20,7 +20,8 @@ pinned to the `trunk` branch (dev mode).
 | ---- | ------ |
 | `nofft.cpp`, `nofft.h` | polynomial-fit codec (`.no_fft`) |
 | `acpcm.cpp`, `acpcm.h` | DPCM/basket codecs (`.nadc`, NFA1–NFA6) |
-| `third_party/dr_wav.h` | upstream's WAV reader dependency |
+| `nfm.cpp`, `nfm.h` | NFM container (wraps any codec + metadata + cover) |
+| `third_party/dr_wav.h` | upstream's WAV reader dependency (under no_fft/third_party/) |
 | `LICENSE` | upstream licence |
 
 Nothing here is edited by Nova: all glue lives in `crates/nova-codec`

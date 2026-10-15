@@ -33,9 +33,10 @@ but for music you already own on disk.
 - **Drag and drop** — drop files to play them (indexed on the spot from their
   tags) or a folder to scan it; files can also be passed on the command line as
   a path or `file://` URL.
-- **No_FFT codecs** — `.no_fft` (polynomial fit) and `.nadc` (NFA1–NFA4 DPCM /
-  basket) files are indexed and played in-process through the vendored upstream
-  codecs. See [Codecs](#codecs).
+- **No_FFT codecs** — `.no_fft` (polynomial fit), `.nadc` (NFA1–NFA6 DPCM /
+  basket) and `.nfm` (a container wrapping any codec with metadata and a cover)
+  are indexed and played in-process through the vendored upstream codecs. See
+  [Codecs](#codecs).
 
 ## Repository layout
 
@@ -175,12 +176,19 @@ alongside the usual MP3/FLAC/etc.:
 | `.nadc`   | DPCM / basket (NFA1–NFA4) | `NFA1`..`NFA4` |
 | `.nadc`   | Multiplicative log-domain (NFA5) | `NFA5` |
 | `.nadc`   | Blocked NFA5 (NFA6) | `NFA6` |
+| `.nfm`    | NFM container (wraps any codec + metadata + cover) | `nfm` |
 
 Files are detected by their **magic bytes**, not the extension, so a renamed
 file still decodes. During a scan the stream properties (sample rate, channels,
 duration) come straight from the codec header — no full decode — and playback
-decodes to PCM in-process and hands it to `rodio`. There are no external tools
-and no temporary files at runtime.
+decodes to PCM in-process and hands it to `rodio`. An `.nfm` container is
+unwrapped first: its text metadata (title/artist/album) and optional cover image
+are read for indexing, and the inner codec payload is decoded for playback
+(via a short-lived temp file). There are no external tools.
+
+Both NFM container revisions are read: the current layout (mandatory image
+block before the text fields) and the older v1 layout (text fields, then an
+optional image block) — including header-only v1 files with `header_len == 0`.
 
 ### Layout
 
@@ -241,7 +249,8 @@ The test suite needs no audio hardware and no external tools:
 - Unit tests in `nova-core` cover the model, tag parsing, grouping/sorting,
   search, queue semantics (shuffle/repeat/insert) and engine advance/pause/seek.
 - `crates/nova-codec` tests round-trip a generated signal through the polynomial
-  codec and all four NFA variants, so no binary fixtures are needed.
+  codec and all six NFA variants, and round-trip NFM containers (with and
+  without metadata/cover), so no binary fixtures are needed.
 - `crates/nova-core/tests/library_integration.rs` synthesises WAV files into a
   temporary directory and exercises the real scan → cache → play loop.
 

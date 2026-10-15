@@ -127,13 +127,19 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     while i < args.len() {
         match args[i].as_str() {
             "--index" => {
-                index = take_value(args, &mut i)?.parse().map_err(|e| format!("--index: {e}"))?;
+                index = take_value(args, &mut i)?
+                    .parse()
+                    .map_err(|e| format!("--index: {e}"))?;
             }
             "--volume" => {
-                volume = take_value(args, &mut i)?.parse().map_err(|e| format!("--volume: {e}"))?;
+                volume = take_value(args, &mut i)?
+                    .parse()
+                    .map_err(|e| format!("--volume: {e}"))?;
             }
             "--seconds" => {
-                max_seconds = take_value(args, &mut i)?.parse().map_err(|e| format!("--seconds: {e}"))?;
+                max_seconds = take_value(args, &mut i)?
+                    .parse()
+                    .map_err(|e| format!("--seconds: {e}"))?;
             }
             "--null" => use_null = true,
             other => return Err(format!("unknown option {other}")),
@@ -154,10 +160,16 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         PlaybackEngine::new()
     };
     engine.set_volume(volume);
-    engine.set_queue(&library, library.all_track_ids(), index).map_err(|e| e.to_string())?;
+    engine
+        .set_queue(&library, library.all_track_ids(), index)
+        .map_err(|e| e.to_string())?;
 
     println!("backend: {}", engine.backend_name());
-    println!("playing {} track(s), volume {:.0}%", library.len(), volume * 100.0);
+    println!(
+        "playing {} track(s), volume {:.0}%",
+        library.len(),
+        volume * 100.0
+    );
 
     let deadline = Instant::now() + Duration::from_secs(max_seconds);
     let mut last_line = String::new();
@@ -174,7 +186,11 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
                 let total = engine.duration(&library).unwrap_or_default();
                 format!(
                     "[{}/{}] {} — {}  {} / {}",
-                    engine.queue().current_item_index().map(|i| i + 1).unwrap_or(0),
+                    engine
+                        .queue()
+                        .current_item_index()
+                        .map(|i| i + 1)
+                        .unwrap_or(0),
                     library.len(),
                     track.title,
                     track.display_artist(),
@@ -201,7 +217,9 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
 
 fn take_value<'a>(args: &'a [String], i: &mut usize) -> Result<&'a str, String> {
     *i += 1;
-    args.get(*i).map(String::as_str).ok_or_else(|| "missing option value".to_string())
+    args.get(*i)
+        .map(String::as_str)
+        .ok_or_else(|| "missing option value".to_string())
 }
 
 fn format_clock(duration: Duration) -> String {

@@ -110,6 +110,16 @@ impl Clock {
 // rodio backend
 // ---------------------------------------------------------------------------
 
+/// Builds a unique temp path carrying `ext`, so the codec detection in
+/// [`RodioBackend::load`] can recognise an unwrapped NFM payload.
+#[cfg(all(feature = "audio", feature = "nofft"))]
+fn temp_payload_path(ext: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("nova-nfm-{}-{}.{}", std::process::id(), n, ext))
+}
+
 /// Plays audio through the operating system's default output device.
 #[cfg(feature = "audio")]
 pub struct RodioBackend {
@@ -153,6 +163,26 @@ impl AudioBackend for RodioBackend {
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
+        // NFM containers wrap an inner codec payload.  Extract the payload to a
+        // temp file whose extension tells the codec branch below which decoder
+        // to use, then decode it normally.
+        #[cfg(feature = "nofft")]
+        if crate::metadata::is_nfm(path) {
+            let nfm = nova_codec::nfm_read(path).map_err(|e| {
+                CoreError::Audio(format!("cannot read NFM {}: {e}", path.display()))
+            })?;
+            let ext = match nova_codec::kind_from_bytes(&nfm.payload) {
+                Ok(nova_codec::CodecKind::Polynomial) => "no_fft",
+                _ => "nadc",
+            };
+            let tmp = temp_payload_path(ext);
+            std::fs::write(&tmp, &nfm.payload)
+                .map_err(|e| CoreError::Audio(format!("cannot extract NFM payload: {e}")))?;
+            let result = self.load(&tmp);
+            let _ = std::fs::remove_file(&tmp);
+            return result;
+        }
+
         // Files from the vendored No_FFT codecs are not something symphonia
         // (and therefore `Decoder`) can read, so decode them ourselves and feed
         // the samples to rodio as an in-memory buffer.
@@ -552,9 +582,12 @@ impl PlaybackEngine {
 
     /// Duration of the current track, preferring what the decoder reported.
     pub fn duration(&self, library: &Library) -> Option<Duration> {
-        self.backend
-            .duration()
-            .or_else(|| self.queue.current().and_then(|id| library.track(id)).and_then(|t| t.duration()))
+        self.backend.duration().or_else(|| {
+            self.queue
+                .current()
+                .and_then(|id| library.track(id))
+                .and_then(|t| t.duration())
+        })
     }
 
     /// The track currently under the queue cursor.

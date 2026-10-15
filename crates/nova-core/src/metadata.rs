@@ -1,6 +1,7 @@
 //! Reading audio metadata with [`lofty`].
 
 use std::path::Path;
+use std::time::Duration;
 
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::tag::{Accessor, ItemKey};
@@ -26,6 +27,15 @@ pub fn is_codec(path: &Path) -> bool {
         .is_some_and(|ext| nova_codec::CODEC_EXTENSIONS.contains(&ext.as_str()))
 }
 
+/// Whether a path is an NFM container (magic `nfm`).
+#[cfg(feature = "nofft")]
+pub fn is_nfm(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|ext| nova_codec::NFM_EXTENSIONS.contains(&ext.as_str()))
+}
+
 /// Whether a path looks like an audio file we can index.
 pub fn is_supported(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
@@ -36,7 +46,9 @@ pub fn is_supported(path: &Path) -> bool {
         return true;
     }
     #[cfg(feature = "nofft")]
-    if nova_codec::CODEC_EXTENSIONS.contains(&ext.as_str()) {
+    if nova_codec::CODEC_EXTENSIONS.contains(&ext.as_str())
+        || nova_codec::NFM_EXTENSIONS.contains(&ext.as_str())
+    {
         return true;
     }
     false
@@ -57,6 +69,11 @@ pub fn read_track(path: &Path) -> Result<Track> {
     #[cfg(feature = "nofft")]
     if is_codec(path) {
         return read_codec_track(path);
+    }
+
+    #[cfg(feature = "nofft")]
+    if is_nfm(path) {
+        return read_nfm_track(path);
     }
 
     let tagged = lofty::read_from_path(path).map_err(|e| CoreError::metadata(path, e))?;
@@ -92,7 +109,10 @@ pub fn read_track(path: &Path) -> Result<Track> {
         .filter(|g| !g.trim().is_empty());
 
     let year = tag
-        .and_then(|t| t.get_string(ItemKey::Year).or_else(|| t.get_string(ItemKey::RecordingDate)))
+        .and_then(|t| {
+            t.get_string(ItemKey::Year)
+                .or_else(|| t.get_string(ItemKey::RecordingDate))
+        })
         .and_then(parse_year);
 
     let duration = match props.duration().as_secs_f64() {
@@ -145,10 +165,56 @@ fn read_codec_track(path: &Path) -> Result<Track> {
     })
 }
 
+/// Builds a track from an NFM container.
+///
+/// NFM wraps any No_FFT codec with optional text metadata and a cover image.
+/// The inner payload is decoded for stream properties; title/artist/album come
+/// from the NFM header.
+#[cfg(feature = "nofft")]
+fn read_nfm_track(path: &Path) -> Result<Track> {
+    let nfm = nova_codec::nfm_read(path).map_err(|e| CoreError::metadata(path, e))?;
+
+    // Write the inner payload to a temp file so the codec decoder can read it.
+    let tmp = std::env::temp_dir().join(format!("nova-nfm-{}.tmp", track_id(path)));
+    std::fs::write(&tmp, &nfm.payload).map_err(|e| CoreError::metadata(path, e))?;
+
+    let info = nova_codec::info(&tmp).map_err(|e| CoreError::metadata(path, e))?;
+    let duration = info.duration();
+
+    let _ = std::fs::remove_file(&tmp);
+
+    Ok(Track {
+        id: track_id(path),
+        path: path.to_path_buf(),
+        title: nfm
+            .meta
+            .title
+            .clone()
+            .unwrap_or_else(|| fallback_title(path)),
+        artist: nfm.meta.artist.clone().unwrap_or_default(),
+        album_artist: String::new(),
+        album: nfm.meta.album.clone().unwrap_or_default(),
+        genre: None,
+        year: None,
+        track_no: None,
+        disc_no: None,
+        duration: (duration > Duration::ZERO).then(|| duration.as_secs_f64()),
+        sample_rate: (info.sample_rate > 0).then_some(info.sample_rate),
+        channels: u8::try_from(info.channels).ok().filter(|&c| c > 0),
+        has_cover: nfm.cover.is_some(),
+    })
+}
+
 /// Read the first embedded picture of a file, if any.
 ///
 /// Prefers a front cover, then falls back to any other picture.
 pub fn read_cover(path: &Path) -> Result<Option<CoverArt>> {
+    #[cfg(feature = "nofft")]
+    if is_nfm(path) {
+        let nfm = nova_codec::nfm_read(path).map_err(|e| CoreError::metadata(path, e))?;
+        return Ok(nfm.cover.map(|c| CoverArt { data: c.data }));
+    }
+
     let tagged = lofty::read_from_path(path).map_err(|e| CoreError::metadata(path, e))?;
     let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
         return Ok(None);
@@ -209,6 +275,54 @@ mod tests {
         assert!(is_codec(Path::new("/a/b/Song.poly.no_fft")));
         assert!(is_codec(Path::new("/a/b/Song.nfa2.nadc")));
         assert!(!is_codec(Path::new("/a/b/Song.mp3")));
+        assert!(is_nfm(Path::new("/a/b/Song.nfm")));
+        assert!(is_supported(Path::new("/a/b/Song.NFM")));
+        assert!(!is_nfm(Path::new("/a/b/Song.nadc")));
+    }
+
+    #[cfg(feature = "nofft")]
+    #[test]
+    fn nfm_files_report_metadata_and_cover() {
+        let dir = std::env::temp_dir().join(format!("nova-nfm-meta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let wav = dir.join("signal.wav");
+        nova_codec::generate_wav(&wav, 0.5, 2, 44_100).expect("generate wav");
+        let inner = dir.join("song.nfa1.nadc");
+        nova_codec::encode_nadc(&wav, &inner, 6, nova_codec::NadcVariant::Nfa1).expect("encode");
+        std::fs::remove_file(&wav).expect("remove wav");
+
+        let payload = std::fs::read(&inner).expect("read payload");
+        let nfm = dir.join("wrapped.nfm");
+        let meta = nova_codec::NfmMeta {
+            title: Some("Wrapped Title".to_string()),
+            artist: Some("Wrapped Artist".to_string()),
+            album: Some("Wrapped Album".to_string()),
+        };
+        let png = {
+            let mut p = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+            p.extend_from_slice(b"payload");
+            p
+        };
+        let cover = nova_codec::NfmCover {
+            data: png.clone(),
+            img_type: nova_codec::NFM_IMG_PNG,
+        };
+        nova_codec::nfm_write(&nfm, &payload, &meta, Some(&cover)).expect("nfm_write");
+
+        let track = read_track(&nfm).expect("read_track");
+        assert_eq!(track.title, "Wrapped Title");
+        assert_eq!(track.artist, "Wrapped Artist");
+        assert_eq!(track.album, "Wrapped Album");
+        assert_eq!(track.sample_rate, Some(44_100));
+        assert_eq!(track.channels, Some(2));
+        assert!(track.has_cover);
+
+        let read = read_cover(&nfm).expect("read_cover").expect("cover");
+        assert_eq!(read.data, png);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(feature = "nofft")]

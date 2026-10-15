@@ -186,6 +186,11 @@ pub struct NovaApp {
     scan_status: Option<String>,
     config: Config,
     toast: Option<(String, Instant)>,
+    /// Whether the track-info panel is shown.
+    info_open: bool,
+    /// Last track the user explicitly played; the info panel falls back to it
+    /// when nothing is currently playing.
+    selected: Option<TrackId>,
 }
 
 impl NovaApp {
@@ -221,9 +226,7 @@ impl NovaApp {
             }
         }
 
-        let music_dir = requested_root
-            .clone()
-            .or_else(|| config.music_dir.clone());
+        let music_dir = requested_root.clone().or_else(|| config.music_dir.clone());
         let library = load_cached_library(music_dir.as_deref()).unwrap_or_default();
         let mut engine = PlaybackEngine::new();
         engine.set_volume(config.volume);
@@ -248,6 +251,8 @@ impl NovaApp {
             scan_status: None,
             config,
             toast: None,
+            info_open: false,
+            selected: None,
         };
 
         // If a file was requested and the cache already knows it, play right away.
@@ -508,11 +513,12 @@ impl NovaApp {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (toggle, next, prev) = ctx.input(|i| {
+        let (toggle, next, prev, info) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::Space),
                 i.modifiers.command && i.key_pressed(egui::Key::ArrowRight),
                 i.modifiers.command && i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::I),
             )
         });
         if toggle {
@@ -523,6 +529,9 @@ impl NovaApp {
         }
         if prev {
             self.engine.previous(&self.library);
+        }
+        if info {
+            self.info_open = !self.info_open;
         }
     }
 
@@ -565,6 +574,14 @@ impl NovaApp {
             }
         }
 
+        if self.info_open {
+            if let Some(track) = self.info_track() {
+                if !self.covers.contains(track.id) {
+                    wanted.push((track.id, track.path.clone()));
+                }
+            }
+        }
+
         let mut budget = COVER_BUDGET_PER_FRAME;
         for (id, path) in wanted {
             if budget == 0 {
@@ -599,11 +616,13 @@ impl NovaApp {
                 Action::CloseArtist => self.artist_filter = None,
                 Action::ScanDir(dir) => self.start_scan(PathBuf::from(dir)),
                 Action::PlayList(ids, start) => {
+                    self.selected = ids.get(start).copied();
                     if let Err(err) = self.engine.set_queue(&self.library, ids, start) {
                         self.toast(err.to_string());
                     }
                 }
                 Action::PlayQueueIndex(index) => {
+                    self.selected = self.engine.queue().items().get(index).copied();
                     if let Err(err) = self.engine.play_index(&self.library, index) {
                         self.toast(err.to_string());
                     }
@@ -684,6 +703,14 @@ impl NovaApp {
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .selectable_label(self.info_open, "ℹ Info")
+                    .on_hover_text("Track info panel (I)")
+                    .clicked()
+                {
+                    self.info_open = !self.info_open;
+                }
+                ui.separator();
                 if let Some((message, _)) = &self.toast {
                     ui.label(RichText::new(message).color(Color32::from_rgb(255, 200, 120)));
                 } else if let Some(status) = &self.scan_status {
@@ -753,6 +780,29 @@ impl NovaApp {
                 .weak()
                 .size(11.0),
         );
+    }
+
+    /// Track shown in the info panel: whatever is playing, otherwise the last
+    /// track the user explicitly started.
+    fn info_track(&self) -> Option<&Track> {
+        self.engine
+            .current_track(&self.library)
+            .or_else(|| self.selected.and_then(|id| self.library.track(id)))
+    }
+
+    /// Right-hand panel with the embedded art plus the text fields and the
+    /// technical details of the current track.
+    fn track_info_panel(&self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.label(RichText::new("TRACK INFO").weak().size(11.0));
+        ui.add_space(6.0);
+
+        let Some(track) = self.info_track() else {
+            ui.label(RichText::new("Nothing selected.").weak());
+            return;
+        };
+
+        track_info_body(ui, track, self.covers.get(track.id));
     }
 
     fn center(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -853,8 +903,8 @@ impl NovaApp {
                         }
 
                         ui.vertical(|ui| {
-                            let (rect, response) =
-                                ui.allocate_exact_size(egui::vec2(CARD, CARD), egui::Sense::click());
+                            let (rect, response) = ui
+                                .allocate_exact_size(egui::vec2(CARD, CARD), egui::Sense::click());
                             match self
                                 .album_cover_source(&album.key)
                                 .and_then(|id| self.covers.get(id))
@@ -1018,7 +1068,11 @@ impl NovaApp {
                 ui.add_space(4.0);
                 match track {
                     Some(track) => {
-                        ui.label(RichText::new(truncate(&track.title, 46)).strong().size(16.0));
+                        ui.label(
+                            RichText::new(truncate(&track.title, 46))
+                                .strong()
+                                .size(16.0),
+                        );
                         ui.label(RichText::new(track.display_artist()).weak());
                     }
                     None => {
@@ -1072,8 +1126,8 @@ impl NovaApp {
                 let mut seconds_position = position.as_secs_f32().min(seconds_total);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format_clock(position)).size(12.0).weak());
-                    let slider =
-                        egui::Slider::new(&mut seconds_position, 0.0..=seconds_total).show_value(false);
+                    let slider = egui::Slider::new(&mut seconds_position, 0.0..=seconds_total)
+                        .show_value(false);
                     if ui
                         .add_sized([ui.available_width() - 52.0, 18.0], slider)
                         .changed()
@@ -1136,6 +1190,15 @@ impl eframe::App for NovaApp {
                 self.side_bar(ui, &mut actions);
             });
 
+        if self.info_open {
+            egui::Panel::right("track-info")
+                .resizable(true)
+                .default_size(300.0)
+                .show(ui, |ui| {
+                    self.track_info_panel(ui);
+                });
+        }
+
         egui::Panel::bottom("player")
             .exact_size(104.0)
             .show(ui, |ui| {
@@ -1193,7 +1256,125 @@ fn format_clock(duration: Duration) -> String {
 }
 
 fn format_duration(duration: Option<Duration>) -> String {
-    duration.map(format_clock).unwrap_or_else(|| "--:--".to_string())
+    duration
+        .map(format_clock)
+        .unwrap_or_else(|| "--:--".to_string())
+}
+
+/// Renders the cover, the primary text fields and the technical details of
+/// `track` inside the info panel. Split out from [`NovaApp::track_info_panel`]
+/// so it can be exercised without a full application.
+fn track_info_body(ui: &mut egui::Ui, track: &Track, cover: Option<&egui::TextureHandle>) {
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        // Embedded cover art (NFM containers and tagged audio alike).
+        let cover_size = ui.available_width().min(320.0);
+        cover_thumb(ui, cover, cover_size);
+        ui.add_space(10.0);
+
+        // Primary text fields.
+        ui.label(RichText::new(&track.title).strong().size(17.0));
+        ui.label(RichText::new(track.display_artist()).size(13.0));
+        ui.label(RichText::new(track.display_album()).weak().size(13.0));
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        egui::Grid::new("track-info-grid")
+            .num_columns(2)
+            .spacing([16.0, 4.0])
+            .show(ui, |ui| {
+                info_row(ui, "Format", &format_label(&track.path));
+
+                if !track.album_artist.is_empty() {
+                    info_row(ui, "Album artist", &track.album_artist);
+                }
+                if let Some(genre) = track.genre.as_deref().filter(|g| !g.is_empty()) {
+                    info_row(ui, "Genre", genre);
+                }
+                if let Some(year) = track.year {
+                    info_row(ui, "Year", &year.to_string());
+                }
+                match (track.track_no, track.disc_no) {
+                    (Some(track_no), Some(disc_no)) => {
+                        info_row(ui, "Track", &format!("Disc {disc_no} · Track {track_no}"));
+                    }
+                    (Some(track_no), None) => info_row(ui, "Track", &track_no.to_string()),
+                    (None, Some(disc_no)) => info_row(ui, "Disc", &disc_no.to_string()),
+                    (None, None) => {}
+                }
+
+                info_row(ui, "Duration", &format_duration(track.duration()));
+                if let Some(rate) = track.sample_rate.filter(|r| *r > 0) {
+                    info_row(ui, "Sample rate", &format_sample_rate(rate));
+                }
+                if let Some(channels) = track.channels.filter(|c| *c > 0) {
+                    info_row(ui, "Channels", &format_channels(channels));
+                }
+                info_row(ui, "Embedded art", if track.has_cover { "Yes" } else { "No" });
+            });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+        ui.label(RichText::new("FILE").weak().size(11.0));
+        ui.add(
+            egui::Label::new(
+                RichText::new(track.path.display().to_string())
+                    .monospace()
+                    .weak()
+                    .size(11.0),
+            )
+            .wrap(),
+        );
+    });
+}
+
+/// One `label → value` row of the track-info grid.
+fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.label(RichText::new(label).weak().size(12.0));
+    ui.label(RichText::new(value).size(12.0));
+    ui.end_row();
+}
+
+/// Short, human-readable label for the container/codec behind a file path.
+fn format_label(path: &Path) -> String {
+    match path
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
+        .as_str()
+    {
+        "nfm" => "NFM container".to_string(),
+        "no_fft" => "NoFFT".to_string(),
+        "nadc" => "NADC adaptive".to_string(),
+        "mp3" => "MP3".to_string(),
+        "flac" => "FLAC".to_string(),
+        "ogg" | "oga" => "Ogg".to_string(),
+        "opus" => "Opus".to_string(),
+        "wav" => "WAV".to_string(),
+        "m4a" | "mp4" | "aac" => "AAC / MPEG-4".to_string(),
+        "wv" => "WavPack".to_string(),
+        "aiff" | "aif" => "AIFF".to_string(),
+        "" => "Unknown".to_string(),
+        other => other.to_ascii_uppercase(),
+    }
+}
+
+fn format_sample_rate(hz: u32) -> String {
+    if hz >= 1000 {
+        format!("{:.1} kHz", hz as f64 / 1000.0)
+    } else {
+        format!("{hz} Hz")
+    }
+}
+
+fn format_channels(count: u8) -> String {
+    match count {
+        1 => "1 (mono)".to_string(),
+        2 => "2 (stereo)".to_string(),
+        other => format!("{other} ch"),
+    }
 }
 
 /// Draws a square cover (or a music-note placeholder) in a single allocation,
@@ -1386,5 +1567,29 @@ mod tests {
         assert_eq!(skipped, 2);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn format_labels_name_known_containers() {
+        assert_eq!(format_label(Path::new("/a/b.nfm")), "NFM container");
+        assert_eq!(format_label(Path::new("/a/b.no_fft")), "NoFFT");
+        assert_eq!(format_label(Path::new("/a/b.nadc")), "NADC adaptive");
+        assert_eq!(format_label(Path::new("/a/b.flac")), "FLAC");
+        assert_eq!(format_label(Path::new("/a/b.MP3")), "MP3");
+        // Unknown extensions are upper-cased; missing ones are Unknown.
+        assert_eq!(format_label(Path::new("/a/b.xyz")), "XYZ");
+        assert_eq!(format_label(Path::new("/a/b")), "Unknown");
+    }
+
+    #[test]
+    fn sample_rates_and_channels_are_human_readable() {
+        assert_eq!(format_sample_rate(44_100), "44.1 kHz");
+        assert_eq!(format_sample_rate(48_000), "48.0 kHz");
+        assert_eq!(format_sample_rate(8_000), "8.0 kHz");
+        assert_eq!(format_sample_rate(320), "320 Hz");
+
+        assert_eq!(format_channels(1), "1 (mono)");
+        assert_eq!(format_channels(2), "2 (stereo)");
+        assert_eq!(format_channels(6), "6 ch");
     }
 }

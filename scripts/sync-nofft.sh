@@ -65,7 +65,7 @@ COMMIT="$(git -C "$TMP/nofft" rev-parse HEAD)"
 DATE="$(git -C "$TMP/nofft" log -1 --format=%cI)"
 
 mkdir -p "$DEST/third_party"
-for f in nofft.cpp nofft.h acpcm.cpp acpcm.h LICENSE; do
+for f in nofft.cpp nofft.h acpcm.cpp acpcm.h nfm.cpp nfm.h LICENSE; do
     if [ ! -f "$TMP/nofft/$f" ]; then
         echo "upstream is missing $f; aborting" >&2
         exit 1
@@ -97,6 +97,7 @@ pinned to the \`$BRANCH\` branch ($MODE mode).
 | ---- | ------ |
 | \`nofft.cpp\`, \`nofft.h\` | polynomial-fit codec (\`.no_fft\`) |
 | \`acpcm.cpp\`, \`acpcm.h\` | DPCM/basket codecs (\`.nadc\`, NFA1–NFA6) |
+| \`nfm.cpp\`, \`nfm.h\` | NFM container (wraps any codec + metadata + cover) |
 | \`third_party/dr_wav.h\` | upstream's WAV reader dependency (under no_fft/third_party/) |
 | \`LICENSE\` | upstream licence |
 

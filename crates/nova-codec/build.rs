@@ -47,6 +47,7 @@ fn main() {
         .include(codec_dir.join("third_party"))
         .file(codec_dir.join("nofft.cpp"))
         .file(codec_dir.join("acpcm.cpp"))
+        .file(codec_dir.join("nfm.cpp"))
         .file(&shim)
         .warnings(false);
     build.compile("nova_nofft");

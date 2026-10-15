@@ -11,6 +11,7 @@
 
 #include "nofft.h"
 #include "acpcm.h"
+#include "nfm.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -44,6 +45,11 @@ bool magic_is(const char magic[4], const char* text) {
     return std::memcmp(magic, text, 4) == 0;
 }
 
+// NFM's magic is only three bytes ("nfm"), so it needs its own comparison.
+bool magic_is3(const char magic[4], const char* text) {
+    return std::memcmp(magic, text, 3) == 0;
+}
+
 void read_u32le(const uint8_t* d, uint32_t* out) {
     *out = (uint32_t)d[0] | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) |
            ((uint32_t)d[3] << 24);
@@ -57,7 +63,8 @@ void read_u16le(const uint8_t* d, uint16_t* out) {
 
 extern "C" {
 
-// 0 for a polynomial `.no_fft` ("NOFF"), 1 for a `.nadc` (NFA1..NFA4), else -1.
+// 0 for a polynomial `.no_fft` ("NOFF"), 1 for a `.nadc` (NFA1..NFA6), 2 for
+// an NFM container ("nfm"), else -1.
 int nova_codec_kind(const char* path) {
     char magic[4];
     if (!read_magic(path, magic)) {
@@ -70,6 +77,9 @@ int nova_codec_kind(const char* path) {
         magic_is(magic, ACPCM_MAGIC3) || magic_is(magic, ACPCM_MAGIC4) ||
         magic_is(magic, ACPCM_MAGIC5) || magic_is(magic, ACPCM_MAGIC6)) {
         return 1;
+    }
+    if (magic_is3(magic, NFM_MAGIC)) {
+        return 2;
     }
     return -1;
 }
@@ -236,6 +246,91 @@ int nova_encode_nadc(const char* in_wav, const char* out_path, uint16_t bits,
     }
     pcm_free(&p);
     return (int)e;
+}
+
+// --- NFM container ---------------------------------------------------------
+
+// Reads an NFM file and extracts the inner codec payload, text metadata and
+// cover image.  On success the caller must release payload with nova_free,
+// meta strings with nova_nfm_free_meta, and img with nova_free.
+int nova_nfm_read(const char* path,
+                  uint8_t** payload, size_t* payload_len,
+                  const char** title, const char** artist, const char** album,
+                  uint8_t** img, size_t* img_len, int* img_type) {
+    if (payload == NULL || payload_len == NULL) {
+        return (int)ERR_BAD_ARGS;
+    }
+    *payload = NULL;
+    *payload_len = 0;
+    if (title != NULL) *title = NULL;
+    if (artist != NULL) *artist = NULL;
+    if (album != NULL) *album = NULL;
+    if (img != NULL) *img = NULL;
+    if (img_len != NULL) *img_len = 0;
+    if (img_type != NULL) *img_type = 0;
+
+    nfm_meta meta;
+    uint8_t* p = NULL;
+    size_t p_len = 0;
+    uint8_t* im = NULL;
+    size_t im_len = 0;
+    int im_type = 0;
+
+    const Err e = nfm_read(path, &p, &p_len, &meta, &im, &im_len, &im_type);
+    if (e != ERR_OK) {
+        nfm_buf_free(p);
+        nfm_buf_free(im);
+        nfm_free_meta(&meta);
+        return (int)e;
+    }
+
+    *payload = p;
+    *payload_len = p_len;
+    if (title != NULL) *title = meta.title;
+    if (artist != NULL) *artist = meta.artist;
+    if (album != NULL) *album = meta.album;
+    if (img != NULL) *img = im;
+    if (img_len != NULL) *img_len = im_len;
+    if (img_type != NULL) *img_type = im_type;
+
+    // Transfer ownership of meta strings; caller must free with nova_nfm_free_meta
+    // We can't call nfm_free_meta here because that would free the strings we just
+    // assigned to the output params.  The caller is responsible.
+    return (int)ERR_OK;
+}
+
+// Releases meta strings returned by nova_nfm_read.
+void nova_nfm_free_meta(const char** title, const char** artist, const char** album) {
+    if (title != NULL && *title != NULL) {
+        free((void*)*title);
+    }
+    if (artist != NULL && *artist != NULL) {
+        free((void*)*artist);
+    }
+    if (album != NULL && *album != NULL) {
+        free((void*)*album);
+    }
+}
+
+// Writes an NFM container wrapping `payload`.  Any of the text fields or the
+// image may be NULL/0 to omit them.
+int nova_nfm_write(const char* path,
+                   const uint8_t* payload, size_t payload_len,
+                   const char* title, const char* artist, const char* album,
+                   const uint8_t* img, size_t img_len, int img_type) {
+    if (path == NULL || payload == NULL || payload_len == 0) {
+        return (int)ERR_BAD_ARGS;
+    }
+    nfm_meta meta;
+    meta.title = title;
+    meta.artist = artist;
+    meta.album = album;
+
+    const uint8_t* image = (img != NULL && img_len > 0 && img_type > NFM_IMG_NONE) ? img : NULL;
+    const size_t image_len = (image != NULL) ? img_len : 0;
+    const int image_type = (image != NULL) ? img_type : NFM_IMG_NONE;
+
+    return (int)nfm_write(path, payload, payload_len, &meta, image, image_len, image_type);
 }
 
 }  // extern "C"

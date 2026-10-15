@@ -16,7 +16,11 @@ fn write_wav(path: &Path, seconds: f32, sample_rate: u32, frequency: f32) -> std
     let mut data = Vec::with_capacity(frames as usize * 2);
     for n in 0..frames {
         let t = n as f32 / sample_rate as f32;
-        let value = if (t * frequency) % 1.0 < 0.5 { 0.2 } else { -0.2 };
+        let value = if (t * frequency) % 1.0 < 0.5 {
+            0.2
+        } else {
+            -0.2
+        };
         let sample = (value * i16::MAX as f32) as i16;
         data.extend_from_slice(&sample.to_le_bytes());
     }
@@ -49,7 +53,8 @@ impl TempDir {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("nova-test-{tag}-{}-{nanos}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("nova-test-{tag}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&path).expect("create temp dir");
         TempDir(path)
     }
@@ -89,10 +94,7 @@ fn scans_a_directory_tree_and_groups_it() {
     // Duration comes from the container, not from tags.
     let one = library.tracks().iter().find(|t| t.title == "one").unwrap();
     let seconds = one.duration.expect("duration is known");
-    assert!(
-        (seconds - 1.0).abs() < 0.05,
-        "expected ~1s, got {seconds}s"
-    );
+    assert!((seconds - 1.0).abs() < 0.05, "expected ~1s, got {seconds}s");
 
     assert_eq!(library.albums().len(), 1);
     assert_eq!(library.artists().len(), 1);

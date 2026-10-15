@@ -112,7 +112,12 @@ impl Library {
         self.albums
             .iter()
             .find(|a| &a.key == key)
-            .map(|a| a.track_ids.iter().filter_map(|&id| self.track(id)).collect())
+            .map(|a| {
+                a.track_ids
+                    .iter()
+                    .filter_map(|&id| self.track(id))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -211,13 +216,15 @@ impl Library {
         let bytes = std::fs::read(path)?;
         let cache: CacheFile = serde_json::from_slice(&bytes)?;
         if cache.version != CACHE_VERSION {
-            return Err(CoreError::Cache(serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "cache version {} is not supported (expected {CACHE_VERSION})",
-                    cache.version
+            return Err(CoreError::Cache(serde_json::Error::io(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "cache version {} is not supported (expected {CACHE_VERSION})",
+                        cache.version
+                    ),
                 ),
-            ))));
+            )));
         }
         Ok(Library::from_tracks(cache.root, cache.tracks))
     }
