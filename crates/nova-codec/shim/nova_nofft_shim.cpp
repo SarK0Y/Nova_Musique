@@ -7,7 +7,7 @@
 // explicit `nova_free` call.
 //
 // It is deliberately tiny: no codec logic lives here, only adapters. The
-// vendored sources under third_party/no_fft stay byte-for-byte upstream.
+// vendored sources under no_fft stay byte-for-byte upstream.
 
 #include "nofft.h"
 #include "acpcm.h"

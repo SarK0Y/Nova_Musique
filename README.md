@@ -48,7 +48,7 @@ Nova is a Cargo workspace with four crates:
 | `crates/nova-cli`   | A tiny headless CLI used to verify scanning and playback. |
 | `crates/nova-app`   | The egui/eframe desktop application (binary: `nova`). |
 
-`third_party/no_fft/` holds a pristine copy of the upstream No_FFT codec
+`no_fft/` holds a pristine copy of the upstream No_FFT codec
 sources; `scripts/sync-nofft.sh` refreshes it from `main`/trunk.
 
 ### `nova-core`
@@ -186,7 +186,7 @@ and no temporary files at runtime.
 
 | Path | Role |
 | --- | --- |
-| `third_party/no_fft/` | Pristine, unmodified copy of the upstream `main` sources. |
+| `no_fft/` | Pristine, unmodified copy of the upstream `main` sources. |
 | `crates/nova-codec/` | The C ABI shim (`shim/nova_nofft_shim.cpp`), `build.rs`, and safe Rust wrappers. |
 | `scripts/sync-nofft.sh` | Re-vendors the sources from upstream `main`/trunk. |
 
@@ -195,17 +195,18 @@ The C++ sources are compiled into a static library by `nova-codec`'s
 whatever binary uses the `nofft` feature. `crates/nova-core` exposes that as the
 `nofft` feature; `nova-app` and `nova-cli` turn it on by default.
 
-### Refreshing from main/trunk
+### Refreshing
 
 ```sh
-scripts/sync-nofft.sh                 # fetch branch main
-scripts/sync-nofft.sh --branch main   # explicit
+scripts/sync-nofft.sh                 # dev: fetch branch trunk (default)
+scripts/sync-nofft.sh --release       # release: fetch branch main
+scripts/sync-nofft.sh --branch <name> # explicit branch override
 scripts/sync-nofft.sh --remote <url>  # alternative fork
 ```
 
 The script clones the requested branch, copies the codec sources into
-`third_party/no_fft/`, and records the exact branch/commit in
-`third_party/no_fft/UPSTREAM.md`. `NOVA_BRANCH` / `NOVA_REPO_URL` are accepted
+`no_fft/`, and records the exact branch/commit in
+`no_fft/UPSTREAM.md`. `NOVA_BRANCH` / `NOVA_REPO_URL` are accepted
 as environment overrides too.
 
 To build against a live checkout instead of the vendored copy, point

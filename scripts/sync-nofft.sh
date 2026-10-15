@@ -2,32 +2,49 @@
 #
 # Re-vendor the No_FFT codec sources that Nova links against.
 #
-# Copies the pristine upstream files into third_party/no_fft/ and rewrites
-# UPSTREAM.md with the exact branch/commit that was fetched. Defaults to the
-# `main` branch (trunk) of https://github.com/SarK0Y/No_FFT_v0.git.
+# Copies the pristine upstream files into no_fft/ and rewrites
+# UPSTREAM.md with the exact branch/commit that was fetched.
+#
+# Branch selection:
+#   dev     → trunk  (default; latest in-progress work)
+#   release → main   (stable releases)
 #
 # Usage:
-#   scripts/sync-nofft.sh [--branch <name>] [--remote <git-url>]
+#   scripts/sync-nofft.sh [--release] [--branch <name>] [--remote <git-url>]
 #
 set -euo pipefail
 
 REPO_URL="${NOFFT_REPO_URL:-https://github.com/SarK0Y/No_FFT_v0.git}"
-BRANCH="${NOFFT_BRANCH:-main}"
+MODE="${NOFFT_MODE:-dev}"
+BRANCH="${NOFFT_BRANCH:-}"
+
+# Resolve mode → branch when --branch is not given explicitly.
+if [ -z "$BRANCH" ]; then
+    case "$MODE" in
+        dev) BRANCH="trunk" ;;
+        release) BRANCH="main" ;;
+        *) echo "unknown mode: $MODE (use dev or release)" >&2; exit 2 ;;
+    esac
+fi
 
 usage() {
     cat <<'EOF'
 Re-vendor the No_FFT codecs from upstream.
 
-  --branch <name>   upstream branch to install from (default: main/trunk)
+  --release         fetch the release branch (main) instead of dev (trunk)
+  --branch <name>   upstream branch to install from (default: trunk for dev,
+                    main for release)
   --remote <url>    override the repository URL
   -h, --help        show this help
 
-Environment overrides: NOFFT_BRANCH, NOFFT_REPO_URL.
+Modes: dev (trunk, default), release (main).
+Environment overrides: NOFFT_MODE, NOFFT_BRANCH, NOFFT_REPO_URL.
 EOF
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --release) MODE="release"; shift ;;
         --branch) BRANCH="${2:?--branch needs a value}"; shift 2 ;;
         --remote) REPO_URL="${2:?--remote needs a value}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -36,7 +53,7 @@ while [ $# -gt 0 ]; do
 done
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEST="$ROOT/third_party/no_fft"
+DEST="$ROOT/no_fft"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -64,11 +81,12 @@ This directory is a **verbatim, unmodified** copy of the codec sources from
 
     $REPO_URL
 
-pinned to the \`$BRANCH\` branch (trunk).
+pinned to the \`$BRANCH\` branch ($MODE mode).
 
 | Field   | Value |
 | ------- | ----- |
 | Repo    | \`$REPO_URL\` |
+| Mode    | \`$MODE\` |
 | Branch  | \`$BRANCH\` |
 | Commit  | \`$COMMIT\` |
 | Date    | \`$DATE\` |
@@ -78,19 +96,20 @@ pinned to the \`$BRANCH\` branch (trunk).
 | File | Origin |
 | ---- | ------ |
 | \`nofft.cpp\`, \`nofft.h\` | polynomial-fit codec (\`.no_fft\`) |
-| \`acpcm.cpp\`, \`acpcm.h\` | DPCM/basket codecs (\`.nadc\`, NFA1–NFA4) |
-| \`third_party/dr_wav.h\` | upstream's WAV reader dependency |
+| \`acpcm.cpp\`, \`acpcm.h\` | DPCM/basket codecs (\`.nadc\`, NFA1–NFA6) |
+| \`third_party/dr_wav.h\` | upstream's WAV reader dependency (under no_fft/third_party/) |
 | \`LICENSE\` | upstream licence |
 
 Nothing here is edited by Nova: all glue lives in \`crates/nova-codec\`
 (\`shim/nova_nofft_shim.cpp\` gives the C++ code a stable C ABI) and
 \`crates/nova-codec/build.rs\`. Keeping the checkout pristine makes re-syncing
-from \`main\` a clean copy with no merge.
+a clean copy with no merge.
 
-## Refreshing from main/trunk
+## Refreshing
 
-    scripts/sync-nofft.sh                 # fetch branch main
-    scripts/sync-nofft.sh --branch main   # explicit
+    scripts/sync-nofft.sh                 # dev: fetch branch trunk
+    scripts/sync-nofft.sh --release       # release: fetch branch main
+    scripts/sync-nofft.sh --branch <name> # explicit branch override
 
 The script rewrites this file with the new commit, date and branch.
 EOF

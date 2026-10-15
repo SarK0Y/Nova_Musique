@@ -2,7 +2,7 @@
 //!
 //! Options:
 //!   NOVA_NOFFT_DIR   build against a different checkout instead of the
-//!                    vendored copy in `third_party/no_fft` (e.g. a live
+//!                    vendored copy in `no_fft` (e.g. a live
 //!                    checkout of upstream `main`/trunk). Must contain
 //!                    `nofft.cpp`, `acpcm.cpp` and their headers.
 
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let vendored = manifest.join("../../third_party/no_fft");
+    let vendored = manifest.join("../../no_fft");
 
     let codec_dir = match env::var_os("NOVA_NOFFT_DIR") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
