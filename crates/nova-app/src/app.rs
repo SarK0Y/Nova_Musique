@@ -1,6 +1,6 @@
 //! The egui application: library browser plus transport bar.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
@@ -74,6 +74,12 @@ fn cache_file() -> Option<PathBuf> {
     xdg_dir("XDG_CACHE_HOME", ".cache").map(|dir| dir.join("nova").join("library.json"))
 }
 
+/// Tracks the user hid from the library, kept beside the library cache so both
+/// live in the same place. Edit or delete this file to bring songs back.
+fn hidden_file() -> Option<PathBuf> {
+    cache_file().map(|path| path.with_file_name("hidden.json"))
+}
+
 // ---------------------------------------------------------------------------
 // Views and actions
 // ---------------------------------------------------------------------------
@@ -99,6 +105,7 @@ enum Action {
     OpenArtist(String),
     CloseArtist,
     ScanDir(String),
+    HideAll,
     PlayList(Vec<TrackId>, usize),
     PlayQueueIndex(usize),
     Enqueue(TrackId),
@@ -191,6 +198,11 @@ pub struct NovaApp {
     /// Last track the user explicitly played; the info panel falls back to it
     /// when nothing is currently playing.
     selected: Option<TrackId>,
+    /// Track ids the user hid from the library, persisted in `hidden.json`.
+    hidden: HashSet<TrackId>,
+    /// Keyboard cursor row in the list on screen. `Cell` so the list
+    /// renderers can move it without taking `&mut self`.
+    cursor: std::cell::Cell<usize>,
 }
 
 impl NovaApp {
@@ -227,7 +239,9 @@ impl NovaApp {
         }
 
         let music_dir = requested_root.clone().or_else(|| config.music_dir.clone());
-        let library = load_cached_library(music_dir.as_deref()).unwrap_or_default();
+        let hidden = load_hidden();
+        let mut library = load_cached_library(music_dir.as_deref()).unwrap_or_default();
+        library.hide(&hidden);
         let mut engine = PlaybackEngine::new();
         engine.set_volume(config.volume);
 
@@ -253,6 +267,8 @@ impl NovaApp {
             toast: None,
             info_open: false,
             selected: None,
+            hidden,
+            cursor: std::cell::Cell::new(0),
         };
 
         // If a file was requested and the cache already knows it, play right away.
@@ -461,7 +477,8 @@ impl NovaApp {
                     ctx.request_repaint();
                 }
                 ScanMsg::Done(payload) => {
-                    let (library, report) = *payload;
+                    let (mut library, report) = *payload;
+                    library.hide(&self.hidden);
                     let tracks = library.len();
                     self.library = library;
                     self.covers.clear();
@@ -513,12 +530,13 @@ impl NovaApp {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (toggle, next, prev, info) = ctx.input(|i| {
+        let (toggle, next, prev, info, del) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::Space),
                 i.modifiers.command && i.key_pressed(egui::Key::ArrowRight),
                 i.modifiers.command && i.key_pressed(egui::Key::ArrowLeft),
                 i.key_pressed(egui::Key::I),
+                i.key_pressed(egui::Key::Delete),
             )
         });
         if toggle {
@@ -533,6 +551,28 @@ impl NovaApp {
         if info {
             self.info_open = !self.info_open;
         }
+        if del {
+            self.delete_current();
+        }
+    }
+
+    /// <kbd>Del</kbd>. In Songs the highlighted track is hidden from the
+    /// library; anywhere else it is dropped from the queue.
+    fn delete_current(&mut self) {
+        let Some(track) = self.engine.current_track(&self.library) else {
+            return;
+        };
+        let id = track.id;
+
+        if self.view == View::Songs {
+            self.hidden.insert(id);
+            save_hidden(&self.hidden);
+            self.library.hide(&self.hidden);
+        } else {
+            self.engine.queue_mut().remove(id);
+        }
+        // Either way the file we were playing is gone from where it just was.
+        self.engine.stop();
     }
 
     /// Representative track used to render an album's cover.
@@ -615,6 +655,13 @@ impl NovaApp {
                 }
                 Action::CloseArtist => self.artist_filter = None,
                 Action::ScanDir(dir) => self.start_scan(PathBuf::from(dir)),
+                Action::HideAll => {
+                    self.hidden
+                        .extend(self.library.tracks().iter().map(|t| t.id));
+                    save_hidden(&self.hidden);
+                    self.library.hide(&self.hidden);
+                    self.engine.stop();
+                }
                 Action::PlayList(ids, start) => {
                     self.selected = ids.get(start).copied();
                     if let Err(err) = self.engine.set_queue(&self.library, ids, start) {
@@ -819,7 +866,12 @@ impl NovaApp {
 
         match self.view {
             View::Songs => {
-                ui.heading("Songs");
+                ui.horizontal(|ui| {
+                    ui.heading("Songs");
+                    if ui.button("Clear all").clicked() {
+                        actions.push(Action::HideAll);
+                    }
+                });
                 ui.label(RichText::new("Click a track to play it.").weak().size(12.0));
                 ui.add_space(4.0);
                 let tracks: Vec<&Track> = self.library.tracks().iter().collect();
@@ -850,25 +902,41 @@ impl NovaApp {
         let ids: Vec<TrackId> = tracks.iter().map(|t| t.id).collect();
         let current = self.engine.queue().current();
 
-        for (index, track) in tracks.iter().enumerate() {
-            let selected = current == Some(track.id);
-            let text = format!(
-                "{:>3}   {:<46}  {:<22}  {}",
-                track
-                    .track_no
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "·".into()),
-                truncate(&track.title, 46),
-                truncate(track.display_artist(), 22),
-                format_duration(track.duration()),
-            );
+        // Arrow keys walk the list, Enter plays whatever the cursor is on.
+        // Enter stays with a focused text field so typing is not hijacked.
+        let typing = ui.ctx().egui_wants_keyboard_input();
+        let (down, up, enter) = ui.ctx().input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::Enter) && !typing,
+            )
+        });
+        let last = tracks.len() - 1;
+        let cursor = if down {
+            (self.cursor.get() + 1).min(last)
+        } else if up {
+            self.cursor.get().saturating_sub(1)
+        } else {
+            self.cursor.get().min(last)
+        };
+        self.cursor.set(cursor);
 
+        for (index, track) in tracks.iter().enumerate() {
+            let playing = current == Some(track.id);
             let response = ui.add_sized(
                 [ui.available_width(), 24.0],
-                egui::Button::selectable(selected, RichText::new(text).size(14.0)),
+                egui::Button::selectable(
+                    index == cursor,
+                    RichText::new(track_row_text(track, playing)).size(14.0),
+                ),
             );
 
+            if index == cursor {
+                response.scroll_to_me(Some(Align::Center));
+            }
             if response.clicked() {
+                self.cursor.set(index);
                 actions.push(Action::PlayList(ids.clone(), index));
             }
             response.context_menu(|ui| {
@@ -881,6 +949,10 @@ impl NovaApp {
                     ui.close();
                 }
             });
+        }
+
+        if enter {
+            actions.push(Action::PlayList(ids.clone(), cursor));
         }
     }
 
@@ -1008,7 +1080,7 @@ impl NovaApp {
     fn queue_view(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
             ui.heading("Queue");
-            if ui.button("Clear").clicked() {
+            if ui.button("Clear all").clicked() {
                 actions.push(Action::ClearQueue);
             }
         });
@@ -1016,6 +1088,24 @@ impl NovaApp {
 
         let current_index = self.engine.queue().current_item_index();
         let items: Vec<TrackId> = self.engine.queue().items().to_vec();
+
+        let typing = ui.ctx().egui_wants_keyboard_input();
+        let (down, up, enter) = ui.ctx().input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::Enter) && !typing,
+            )
+        });
+        let last = items.len().saturating_sub(1);
+        let cursor = if down {
+            (self.cursor.get() + 1).min(last)
+        } else if up {
+            self.cursor.get().saturating_sub(1)
+        } else {
+            self.cursor.get().min(last)
+        };
+        self.cursor.set(cursor);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             if items.is_empty() {
@@ -1026,22 +1116,19 @@ impl NovaApp {
                 let Some(track) = self.library.track(*id) else {
                     continue;
                 };
-                let text = format!(
-                    "{:>3}   {:<46}  {:<22}  {}",
-                    track
-                        .track_no
-                        .map(|n| n.to_string())
-                        .unwrap_or_else(|| "·".into()),
-                    truncate(&track.title, 46),
-                    truncate(track.display_artist(), 22),
-                    format_duration(track.duration()),
-                );
-                let selected = current_index == Some(index);
                 let response = ui.add_sized(
                     [ui.available_width(), 24.0],
-                    egui::Button::selectable(selected, RichText::new(text).size(14.0)),
+                    egui::Button::selectable(
+                        index == cursor,
+                        RichText::new(track_row_text(track, current_index == Some(index)))
+                            .size(14.0),
+                    ),
                 );
+                if index == cursor {
+                    response.scroll_to_me(Some(Align::Center));
+                }
                 if response.clicked() {
+                    self.cursor.set(index);
                     actions.push(Action::PlayQueueIndex(index));
                 }
                 response.context_menu(|ui| {
@@ -1052,6 +1139,10 @@ impl NovaApp {
                 });
             }
         });
+
+        if enter && !items.is_empty() {
+            actions.push(Action::PlayQueueIndex(cursor));
+        }
     }
 
     fn player_bar(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -1250,6 +1341,25 @@ fn load_cached_library(expected_root: Option<&Path>) -> Option<Library> {
     }
 }
 
+/// Ids of tracks the user hid. A missing or corrupt file just means "nothing
+/// hidden", never a failed startup.
+fn load_hidden() -> HashSet<TrackId> {
+    hidden_file()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_hidden(hidden: &HashSet<TrackId>) {
+    let Some(path) = hidden_file() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(hidden) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
 fn format_clock(duration: Duration) -> String {
     let total = duration.as_secs();
     format!("{:02}:{:02}", total / 60, total % 60)
@@ -1343,6 +1453,26 @@ fn track_info_rows(track: &Track) -> Vec<(&'static str, String)> {
     ));
 
     rows
+}
+
+/// One list row: number, title, artist, duration. The playing track swaps its
+/// number for a marker, so the cursor highlight stays the only filled row.
+fn track_row_text(track: &Track, playing: bool) -> String {
+    let number = if playing {
+        "\u{25b6}".to_string()
+    } else {
+        track
+            .track_no
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "\u{b7}".into())
+    };
+    format!(
+        "{:>3}   {:<46}  {:<22}  {}",
+        number,
+        truncate(&track.title, 46),
+        truncate(track.display_artist(), 22),
+        format_duration(track.duration()),
+    )
 }
 
 /// One `label → value` row of the track-info grid.
@@ -1582,6 +1712,26 @@ mod tests {
         assert_eq!(skipped, 2);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_playing_row_shows_a_marker_instead_of_its_number() {
+        let mut track = sample_track("/music/a.flac");
+        track.track_no = Some(7);
+
+        let numbered = track_row_text(&track, false);
+        assert!(numbered.starts_with("  7   "), "got {numbered:?}");
+        assert!(numbered.contains("Test NFM Track"));
+        assert!(numbered.contains("Test Artist"));
+
+        // Playing: the marker takes the number column so the cursor stays the
+        // only filled row.
+        let playing = track_row_text(&track, true);
+        assert!(playing.starts_with("  \u{25b6}   "), "got {playing:?}");
+
+        // No track number and not playing: the middle dot.
+        track.track_no = None;
+        assert!(track_row_text(&track, false).starts_with("  \u{b7}   "));
     }
 
     #[test]

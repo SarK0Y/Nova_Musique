@@ -72,6 +72,17 @@ impl Library {
         library
     }
 
+    /// Drops the given tracks from the library.
+    ///
+    /// The files stay on disk; they only come back if they are unhidden.
+    pub fn hide(&mut self, ids: &HashSet<TrackId>) {
+        if ids.is_empty() {
+            return;
+        }
+        self.tracks.retain(|t| !ids.contains(&t.id));
+        self.reindex();
+    }
+
     /// Root directory that was scanned, if any.
     pub fn root(&self) -> Option<&Path> {
         self.root.as_deref()
@@ -344,6 +355,33 @@ mod tests {
             channels: Some(2),
             has_cover: false,
         }
+    }
+
+    #[test]
+    fn hiding_a_track_drops_it_from_every_view() {
+        let tracks = vec![
+            track(1, "One", "A", "Record", Some(1)),
+            track(2, "Two", "A", "Record", Some(2)),
+        ];
+        let mut lib = Library::from_tracks(None, tracks);
+
+        lib.hide(&HashSet::from([2]));
+        assert_eq!(lib.len(), 1);
+        assert!(lib.track(2).is_none());
+        // The album still exists, it just lost a track.
+        assert_eq!(
+            lib.album_tracks(&AlbumKey {
+                album_artist: "A".into(),
+                album: "Record".into()
+            })
+            .len(),
+            1
+        );
+        assert!(lib.search("Two", 10).is_empty());
+
+        // Hiding nothing is a no-op, so it is safe to call on every scan.
+        lib.hide(&HashSet::new());
+        assert_eq!(lib.len(), 1);
     }
 
     #[test]

@@ -329,6 +329,24 @@ mod tests {
     }
 
     #[test]
+    fn removing_the_playing_track_keeps_a_valid_cursor() {
+        let mut q = Queue::new();
+        q.set_items(ids(3));
+        assert_eq!(q.advance(), Some(0));
+
+        q.remove(0);
+        // The cursor moved on rather than dangling on a removed entry.
+        assert_eq!(q.current(), Some(1));
+        assert_eq!(q.advance(), Some(2));
+
+        q.remove(1);
+        q.remove(2);
+        // Last one gone: nothing is playing, but nothing is stale either.
+        assert_eq!(q.current(), None);
+        assert_eq!(q.advance(), None);
+    }
+
+    #[test]
     fn linear_playback_walks_insertion_order() {
         let mut q = Queue::new();
         q.set_items(ids(3));

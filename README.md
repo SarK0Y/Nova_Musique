@@ -149,6 +149,9 @@ nova-cli play   <dir> [--index N] [--volume V] [--null] [--seconds S]
 2. Pick a view in the sidebar: **Songs**, **Albums**, **Artists** or **Queue**.
 3. Click a track to play it. Right-click a track for *Play now* / *Play next*,
    or *Remove from queue* in the Queue view.
+4. Use <kbd>↑</kbd>/<kbd>↓</kbd> to move the cursor through any track list and
+   <kbd>Enter</kbd> to play it. The playing track is marked ▶ in the first
+   column, so the cursor and now-playing never look the same.
 4. Use the transport bar for play/pause, previous/next, seek, volume, shuffle
    and repeat.
 5. Press <kbd>I</kbd> (or the **ℹ Info** button) to open the track info panel.
@@ -179,6 +182,30 @@ has no tags at all.
 - Drop a **folder** to scan and open it.
 - While dragging, an overlay shows how many items are in flight.
 
+### The queue
+
+- Click a row to jump to it; right-click for *Play now* / *Play next*.
+- **Remove from queue** is on the row's right-click menu, or press
+  <kbd>Del</kbd> in the Queue view to drop the highlighted track. Playback
+  stops when the track you were listening to is the one removed, so audio never
+  outlives the queue.
+- **Clear all** empties the queue and stops playback.
+
+### Hiding songs
+
+<kbd>Del</kbd> in the **Songs** view hides the highlighted track instead: it
+disappears from the library without touching the file. Hidden ids are kept in
+`~/.cache/nova/hidden.json` (a plain JSON array of track ids), so songs stay
+hidden across restarts and rescans.
+
+To bring songs back, empty or delete that file **and then press Scan**. The
+rescan matters: hiding also drops the track from the cached library, so without
+one you would be reading the cache that no longer has it.
+
+**Clear all** above the Songs list hides every track at once, by the same
+mechanism — the files are untouched, and the same "empty `hidden.json` and
+rescan" brings the whole library back.
+
 ### Keyboard
 
 | Shortcut | Action |
@@ -187,6 +214,9 @@ has no tags at all.
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> | Previous track |
 | <kbd>Ctrl</kbd>+<kbd>→</kbd> | Next track |
 | <kbd>I</kbd> | Toggle the track info panel |
+| <kbd>↑</kbd> / <kbd>↓</kbd> | Move the cursor through a list |
+| <kbd>Enter</kbd> | Play the track under the cursor |
+| <kbd>Del</kbd> | Queue view: remove from queue · Songs view: hide from library |
 
 ## Codecs
 
