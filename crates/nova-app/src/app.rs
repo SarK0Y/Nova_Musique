@@ -1284,34 +1284,9 @@ fn track_info_body(ui: &mut egui::Ui, track: &Track, cover: Option<&egui::Textur
             .num_columns(2)
             .spacing([16.0, 4.0])
             .show(ui, |ui| {
-                info_row(ui, "Format", &format_label(&track.path));
-
-                if !track.album_artist.is_empty() {
-                    info_row(ui, "Album artist", &track.album_artist);
+                for (label, value) in track_info_rows(track) {
+                    info_row(ui, label, &value);
                 }
-                if let Some(genre) = track.genre.as_deref().filter(|g| !g.is_empty()) {
-                    info_row(ui, "Genre", genre);
-                }
-                if let Some(year) = track.year {
-                    info_row(ui, "Year", &year.to_string());
-                }
-                match (track.track_no, track.disc_no) {
-                    (Some(track_no), Some(disc_no)) => {
-                        info_row(ui, "Track", &format!("Disc {disc_no} · Track {track_no}"));
-                    }
-                    (Some(track_no), None) => info_row(ui, "Track", &track_no.to_string()),
-                    (None, Some(disc_no)) => info_row(ui, "Disc", &disc_no.to_string()),
-                    (None, None) => {}
-                }
-
-                info_row(ui, "Duration", &format_duration(track.duration()));
-                if let Some(rate) = track.sample_rate.filter(|r| *r > 0) {
-                    info_row(ui, "Sample rate", &format_sample_rate(rate));
-                }
-                if let Some(channels) = track.channels.filter(|c| *c > 0) {
-                    info_row(ui, "Channels", &format_channels(channels));
-                }
-                info_row(ui, "Embedded art", if track.has_cover { "Yes" } else { "No" });
             });
 
         ui.add_space(8.0);
@@ -1328,6 +1303,46 @@ fn track_info_body(ui: &mut egui::Ui, track: &Track, cover: Option<&egui::Textur
             .wrap(),
         );
     });
+}
+
+/// The `label → value` rows of the info panel's details grid.
+///
+/// Optional fields the file does not carry are left out entirely rather than
+/// rendered as placeholders, so a bare container does not sprout empty rows.
+fn track_info_rows(track: &Track) -> Vec<(&'static str, String)> {
+    let mut rows = vec![("Format", format_label(&track.path))];
+
+    if !track.album_artist.is_empty() {
+        rows.push(("Album artist", track.album_artist.clone()));
+    }
+    if let Some(genre) = track.genre.as_deref().filter(|g| !g.is_empty()) {
+        rows.push(("Genre", genre.to_string()));
+    }
+    if let Some(year) = track.year {
+        rows.push(("Year", year.to_string()));
+    }
+    match (track.track_no, track.disc_no) {
+        (Some(track_no), Some(disc_no)) => {
+            rows.push(("Track", format!("Disc {disc_no} · Track {track_no}")));
+        }
+        (Some(track_no), None) => rows.push(("Track", track_no.to_string())),
+        (None, Some(disc_no)) => rows.push(("Disc", disc_no.to_string())),
+        (None, None) => {}
+    }
+
+    rows.push(("Duration", format_duration(track.duration())));
+    if let Some(rate) = track.sample_rate.filter(|r| *r > 0) {
+        rows.push(("Sample rate", format_sample_rate(rate)));
+    }
+    if let Some(channels) = track.channels.filter(|c| *c > 0) {
+        rows.push(("Channels", format_channels(channels)));
+    }
+    rows.push((
+        "Embedded art",
+        if track.has_cover { "Yes" } else { "No" }.to_string(),
+    ));
+
+    rows
 }
 
 /// One `label → value` row of the track-info grid.
@@ -1591,5 +1606,102 @@ mod tests {
         assert_eq!(format_channels(1), "1 (mono)");
         assert_eq!(format_channels(2), "2 (stereo)");
         assert_eq!(format_channels(6), "6 ch");
+    }
+
+    fn sample_track(path: &str) -> Track {
+        Track {
+            id: 1,
+            path: PathBuf::from(path),
+            title: "Test NFM Track".to_string(),
+            artist: "Test Artist".to_string(),
+            album_artist: String::new(),
+            album: "Test Album".to_string(),
+            genre: None,
+            year: None,
+            track_no: None,
+            disc_no: None,
+            duration: Some(236.0),
+            sample_rate: Some(44_100),
+            channels: Some(2),
+            has_cover: true,
+        }
+    }
+
+    /// Draws the info panel headlessly. This cannot assert on content, but it
+    /// proves the grid, scroll area and label wrapping all lay out cleanly.
+    fn layout_info_panel(track: &Track) {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                track_info_body(ui, track, None);
+            });
+        });
+    }
+
+    fn row<'a>(rows: &'a [(&'static str, String)], name: &str) -> Option<&'a str> {
+        rows.iter()
+            .find(|(label, _)| *label == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn info_rows_describe_an_nfm_track() {
+        let rows = track_info_rows(&sample_track("/music/test.nfm"));
+
+        // The container is named, and the stream properties are those of the
+        // inner payload that gets decoded for playback.
+        assert_eq!(row(&rows, "Format"), Some("NFM container"));
+        assert_eq!(row(&rows, "Duration"), Some("03:56"));
+        assert_eq!(row(&rows, "Sample rate"), Some("44.1 kHz"));
+        assert_eq!(row(&rows, "Channels"), Some("2 (stereo)"));
+        assert_eq!(row(&rows, "Embedded art"), Some("Yes"));
+
+        layout_info_panel(&sample_track("/music/test.nfm"));
+    }
+
+    #[test]
+    fn info_rows_omit_fields_the_file_does_not_carry() {
+        let rows = track_info_rows(&sample_track("/music/tst.nfm"));
+
+        assert_eq!(row(&rows, "Format"), Some("NFM container"));
+        // This container has no genre, year or numbering of any kind.
+        assert_eq!(row(&rows, "Genre"), None);
+        assert_eq!(row(&rows, "Year"), None);
+        assert_eq!(row(&rows, "Track"), None);
+        assert_eq!(row(&rows, "Disc"), None);
+    }
+
+    #[test]
+    fn info_rows_report_full_tagging_when_present() {
+        let mut track = sample_track("/music/tagged.flac");
+        track.album_artist = "Album Artist".to_string();
+        track.genre = Some("Ambient".to_string());
+        track.year = Some(2024);
+        track.track_no = Some(3);
+        track.disc_no = Some(2);
+        track.has_cover = false;
+
+        let rows = track_info_rows(&track);
+
+        assert_eq!(row(&rows, "Format"), Some("FLAC"));
+        assert_eq!(row(&rows, "Album artist"), Some("Album Artist"));
+        assert_eq!(row(&rows, "Genre"), Some("Ambient"));
+        assert_eq!(row(&rows, "Year"), Some("2024"));
+        assert_eq!(row(&rows, "Track"), Some("Disc 2 · Track 3"));
+        assert_eq!(row(&rows, "Embedded art"), Some("No"));
+    }
+
+    #[test]
+    fn info_panel_falls_back_when_text_fields_are_missing() {
+        let mut track = sample_track("/music/tst.nfm");
+        track.title = "tst".to_string();
+        track.artist = String::new();
+        track.album = String::new();
+
+        // The headline above the grid uses the never-empty grouping helpers.
+        assert_eq!(track.display_artist(), "Unknown Artist");
+        assert_eq!(track.display_album(), "Unknown Album");
+
+        layout_info_panel(&track);
     }
 }

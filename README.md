@@ -19,6 +19,9 @@ but for music you already own on disk.
   duration, sample rate and channel count.
 - **Cover art** — embedded pictures are extracted (preferring "front cover")
   and decoded lazily into GPU textures.
+- **Track info panel** — press <kbd>I</kbd> for a side panel spelling out the
+  current track: its embedded image, its text fields, the stream details and
+  the file path.
 - **Browsing** — Songs, Albums and Artists views, plus a global search across
   title, artist and album.
 - **Queue** — click any track to replace the queue with the current list and
@@ -148,6 +151,25 @@ nova-cli play   <dir> [--index N] [--volume V] [--null] [--seconds S]
    or *Remove from queue* in the Queue view.
 4. Use the transport bar for play/pause, previous/next, seek, volume, shuffle
    and repeat.
+5. Press <kbd>I</kbd> (or the **ℹ Info** button) to open the track info panel.
+
+### Track info
+
+The info panel is the place where a file's embedded data is spelled out. It
+describes whatever is playing, or the last track you started:
+
+- the **embedded image** — the cover from an NFM container or a tagged picture
+  frame, with a placeholder note when a file has none;
+- the **text fields** — title, artist and album up top, then album artist,
+  genre, year and track/disc numbering where the file carries them;
+- the **stream details** — duration, sample rate, channel count and container
+  name. For an NFM these come from the inner payload that gets decoded, so the
+  panel reports the audio you actually hear;
+- the **file path**, so you can see exactly which file is loaded.
+
+Fields a file does not carry are left out rather than shown blank, and the
+grouping fallbacks (`Unknown Artist` / `Unknown Album`) are used where a file
+has no tags at all.
 
 ### Drag and drop
 
@@ -164,6 +186,7 @@ nova-cli play   <dir> [--index N] [--volume V] [--null] [--seconds S]
 | <kbd>Space</kbd> | Play / pause |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> | Previous track |
 | <kbd>Ctrl</kbd>+<kbd>→</kbd> | Next track |
+| <kbd>I</kbd> | Toggle the track info panel |
 
 ## Codecs
 
