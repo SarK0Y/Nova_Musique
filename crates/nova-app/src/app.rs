@@ -84,25 +84,6 @@ fn hidden_file() -> Option<PathBuf> {
     cache_file().map(|path| path.with_file_name("hidden.json"))
 }
 
-/// Where the floating playlist window sits and how big it is, in points.
-///
-/// The geometry is a pure function of the two window states, so minimise and
-/// maximise stay testable without driving the UI.
-fn playlist_geometry(
-    minimised: bool,
-    maximised: bool,
-    screen: egui::Rect,
-) -> (egui::Pos2, egui::Vec2) {
-    if maximised {
-        return (screen.min, screen.size());
-    }
-    if minimised {
-        // Collapsed to a slim bar, parked at the top of the window.
-        return (screen.left_top(), egui::vec2(380.0, 34.0));
-    }
-    (egui::pos2(150.0, 110.0), egui::vec2(380.0, 300.0))
-}
-
 // ---------------------------------------------------------------------------
 // Views and actions
 // ---------------------------------------------------------------------------
@@ -231,10 +212,6 @@ pub struct NovaApp {
     mpv: Option<Arc<Mpv>>,
     /// Floating playlist window, opened from the Nova menu in the top bar.
     playlist_open: bool,
-    /// Whether that window is collapsed to its title bar.
-    playlist_min: bool,
-    /// Whether that window fills the screen.
-    playlist_max: bool,
 }
 
 impl NovaApp {
@@ -304,8 +281,6 @@ impl NovaApp {
             cursor: std::cell::Cell::new(0),
             mpv,
             playlist_open: false,
-            playlist_min: false,
-            playlist_max: false,
         };
 
         // If a file was requested and the cache already knows it, play right away.
@@ -412,6 +387,66 @@ impl NovaApp {
             self.toast(format!("Skipped {skipped} unsupported file(s)"));
         } else {
             self.toast("Nothing playable in the drop");
+        }
+    }
+
+    /// Imports externally dropped audio files and appends them to the queue
+    /// without interrupting the track that is currently playing.
+    fn enqueue_dropped_files(&mut self, paths: Vec<PathBuf>) {
+        let (dirs, files, skipped) = classify_drop(paths);
+        if !dirs.is_empty() {
+            self.toast("Drop audio files here (folders are not added to the playlist)");
+        }
+        if files.is_empty() {
+            if skipped > 0 {
+                self.toast(format!("Skipped {skipped} unsupported file(s)"));
+            }
+            return;
+        }
+
+        let missing: Vec<PathBuf> = files
+            .iter()
+            .filter(|path| self.find_track_by_path(path).is_none())
+            .cloned()
+            .collect();
+
+        let mut added = 0usize;
+        if !missing.is_empty() {
+            let mut tracks = self.library.tracks().to_vec();
+            for path in &missing {
+                match metadata::read_track(path) {
+                    Ok(track) => {
+                        if !tracks.iter().any(|known| known.path == track.path) {
+                            tracks.push(track);
+                            added += 1;
+                        }
+                    }
+                    Err(err) => self.toast(format!("Could not read {}: {err}", path.display())),
+                }
+            }
+            if added > 0 {
+                let root = self.library.root().map(Path::to_path_buf);
+                self.library = Library::from_tracks(root, tracks);
+            }
+        }
+
+        let ids: Vec<TrackId> = files
+            .iter()
+            .filter_map(|path| self.find_track_by_path(path))
+            .collect();
+        if ids.is_empty() {
+            self.toast("No playable audio found in the dropped files");
+            return;
+        }
+
+        for id in &ids {
+            self.engine.enqueue(*id);
+        }
+        let count = ids.len();
+        if skipped > 0 {
+            self.toast(format!("Added {count} track(s); skipped {skipped} unsupported file(s)"));
+        } else {
+            self.toast(format!("Added {count} track(s) to the playlist"));
         }
     }
 
@@ -992,6 +1027,10 @@ impl NovaApp {
                 self.cursor.set(index);
                 actions.push(Action::PlayList(ids.clone(), index));
             }
+            // Tracks can be dragged from any library list into the external playlist window.
+            if response.drag_started() {
+                egui::DragAndDrop::set_payload(ui.ctx(), track.id);
+            }
             response.context_menu(|ui| {
                 if ui.button("Play now").clicked() {
                     actions.push(Action::PlayList(ids.clone(), index));
@@ -1348,59 +1387,64 @@ impl NovaApp {
         });
     }
 
-    /// The floating playlist window: its title bar, then the queue.
-    ///
-    /// `fixed_pos` plus a fixed size pin the window absolutely, which is what
-    /// makes minimising and maximising well-defined — the window never drifts
-    /// from where these states put it.
+    /// Render the playlist in its own native OS viewport, separate from the main window.
     fn playlist_window(&mut self, ctx: &egui::Context) {
-        let screen = ctx.content_rect();
-        let (pos, size) = playlist_geometry(self.playlist_min, self.playlist_max, screen);
+        let viewport_id = egui::ViewportId::from_hash_of("nova-playlist-window");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Nova Musique — Playlist")
+            .with_inner_size([380.0, 300.0])
+            .with_min_inner_size([280.0, 180.0]);
 
-        // Copied out of `self` so the window's closure can touch both the
-        // fields and the queue renderer at once.
-        let mut open = self.playlist_open;
-        let mut minimised = self.playlist_min;
-        let mut maximised = self.playlist_max;
-        let mut actions: Vec<Action> = Vec::new();
+        ctx.show_viewport_immediate(viewport_id, builder, |viewport_ctx, _class| {
+            if viewport_ctx.input(|input| input.viewport().close_requested()) {
+                self.playlist_open = false;
+                return;
+            }
 
-        // `open` is held by the returned Window, so the chain has to be broken here.
-        let mut closed = false;
-        let window = egui::Window::new("Playlist")
-            .title_bar(false)
-            .collapsible(false)
-            .fixed_pos(pos)
-            .resize(|resize| resize.fixed_size(size))
-            .open(&mut open);
+            // Native file-manager drops are delivered to the viewport that is
+            // under the pointer. Import them here (rather than in the main
+            // viewport) so files can be dropped directly onto this window.
+            let external_drops: Vec<PathBuf> = viewport_ctx.input(|input| {
+                input.raw.dropped_files.iter()
+                    .filter_map(|file| file.path.clone())
+                    .collect()
+            });
+            if !external_drops.is_empty() {
+                self.enqueue_dropped_files(external_drops);
+            }
 
-        window.show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.strong("Playlist");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.small_button("✕").clicked() {
-                        closed = true;
-                    }
-                    if ui.small_button(if maximised { "🗗" } else { "🗖" }).clicked() {
-                        maximised = !maximised;
-                    }
-                    if ui.small_button("🗕").clicked() {
-                        minimised = !minimised;
-                    }
+            let mut actions = Vec::new();
+            let panel = egui::CentralPanel::default().show(viewport_ctx, |ui| {
+                // The queue can also be rendered in the main window. Give this
+                // viewport its own widget-ID namespace so ScrollArea state,
+                // row interactions, and focus cannot collide between windows.
+                ui.push_id("external-playlist-window", |ui| {
+                    ui.heading("Playlist");
+                    ui.label(
+                        RichText::new("Drop audio files from your file manager, or drag tracks here")
+                            .weak()
+                            .size(12.0),
+                    );
+                    ui.separator();
+                    self.queue_view(ui, &mut actions);
                 });
             });
-            ui.separator();
 
-            // Minimised: the title bar is the whole window.
-            if !minimised {
-                self.queue_view(ui, &mut actions);
+            // egui's drag payload is shared by the viewports. Consume it only when
+            // the pointer is released over the playlist window, then append the
+            // track to the existing queue without interrupting current playback.
+            let (released, pointer_pos) = viewport_ctx.input(|input| {
+                (input.pointer.any_released(), input.pointer.interact_pos())
+            });
+            if released && pointer_pos.is_some_and(|pos| panel.response.rect.contains(pos)) {
+                if let Some(track_id) = egui::DragAndDrop::take_payload::<TrackId>(viewport_ctx) {
+                    actions.push(Action::Enqueue(*track_id));
+                }
             }
+            self.apply(actions);
         });
-
-        self.playlist_open = open && self.playlist_open && !closed;
-        self.playlist_min = minimised;
-        self.playlist_max = maximised;
-        self.apply(actions);
     }
+
 }
 
 impl eframe::App for NovaApp {
@@ -1816,45 +1860,6 @@ fn percent_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn screen() -> egui::Rect {
-        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))
-    }
-
-    #[test]
-    fn playlist_window_starts_at_a_fixed_default() {
-        let (pos, size) = playlist_geometry(false, false, screen());
-        assert_eq!(pos, egui::pos2(150.0, 110.0));
-        assert_eq!(size, egui::vec2(380.0, 300.0));
-        // Inside the screen it is meant to float in.
-        assert!(screen().contains_rect(egui::Rect::from_min_size(pos, size)));
-    }
-
-    #[test]
-    fn playlist_window_maximises_to_fill_the_window() {
-        // Maximise wins over minimise, so the ordering of the checks matters.
-        let (pos, size) = playlist_geometry(true, true, screen());
-        assert_eq!(pos, screen().min);
-        assert_eq!(size, screen().size());
-    }
-
-    #[test]
-    fn playlist_window_minimises_to_a_slim_bar() {
-        let (pos, size) = playlist_geometry(true, false, screen());
-        assert_eq!(pos, screen().left_top());
-        assert_eq!(size.x, 380.0);
-        assert!(size.y < 40.0, "a collapsed bar is thin, got {size:?}");
-    }
-
-    #[test]
-    fn playlist_window_state_never_yields_an_empty_rect() {
-        for minimised in [false, true] {
-            for maximised in [false, true] {
-                let (_, size) = playlist_geometry(minimised, maximised, screen());
-                assert!(size.x >= 1.0 && size.y >= 1.0, "{size:?}");
-            }
-        }
-    }
 
     #[test]
     fn plain_paths_are_used_verbatim() {
