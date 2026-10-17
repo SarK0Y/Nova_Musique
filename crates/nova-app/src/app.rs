@@ -84,6 +84,25 @@ fn hidden_file() -> Option<PathBuf> {
     cache_file().map(|path| path.with_file_name("hidden.json"))
 }
 
+/// Where the floating playlist window sits and how big it is, in points.
+///
+/// The geometry is a pure function of the two window states, so minimise and
+/// maximise stay testable without driving the UI.
+fn playlist_geometry(
+    minimised: bool,
+    maximised: bool,
+    screen: egui::Rect,
+) -> (egui::Pos2, egui::Vec2) {
+    if maximised {
+        return (screen.min, screen.size());
+    }
+    if minimised {
+        // Collapsed to a slim bar, parked at the top of the window.
+        return (screen.left_top(), egui::vec2(380.0, 34.0));
+    }
+    (egui::pos2(150.0, 110.0), egui::vec2(380.0, 300.0))
+}
+
 // ---------------------------------------------------------------------------
 // Views and actions
 // ---------------------------------------------------------------------------
@@ -210,6 +229,12 @@ pub struct NovaApp {
     /// libmpv, when it could be started. `None` means video plays through the
     /// audio backend only, which works for songs and not much else.
     mpv: Option<Arc<Mpv>>,
+    /// Floating playlist window, opened from the Nova menu in the top bar.
+    playlist_open: bool,
+    /// Whether that window is collapsed to its title bar.
+    playlist_min: bool,
+    /// Whether that window fills the screen.
+    playlist_max: bool,
 }
 
 impl NovaApp {
@@ -278,6 +303,9 @@ impl NovaApp {
             hidden,
             cursor: std::cell::Cell::new(0),
             mpv,
+            playlist_open: false,
+            playlist_min: false,
+            playlist_max: false,
         };
 
         // If a file was requested and the cache already knows it, play right away.
@@ -731,12 +759,15 @@ impl NovaApp {
     fn top_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
             ui.menu_button(RichText::new("Nova").strong().size(18.0), |ui| {
-                // TEMP TEST: disable() removed
-                ui.label("Playlist");
+                if ui.button("Playlist").clicked() {
+                    self.playlist_open = true;
+                    ui.close();
+                }
                 ui.separator();
-                ui.label("Video");
+                // Not wired up yet, so shown disabled rather than pretending.
+                ui.add_enabled(false, egui::Label::new("Video"));
                 ui.separator();
-                ui.label("Audio");
+                ui.add_enabled(false, egui::Label::new("Audio"));
             });
             ui.separator();
 
@@ -1316,6 +1347,60 @@ impl NovaApp {
             }
         });
     }
+
+    /// The floating playlist window: its title bar, then the queue.
+    ///
+    /// `fixed_pos` plus a fixed size pin the window absolutely, which is what
+    /// makes minimising and maximising well-defined — the window never drifts
+    /// from where these states put it.
+    fn playlist_window(&mut self, ctx: &egui::Context) {
+        let screen = ctx.content_rect();
+        let (pos, size) = playlist_geometry(self.playlist_min, self.playlist_max, screen);
+
+        // Copied out of `self` so the window's closure can touch both the
+        // fields and the queue renderer at once.
+        let mut open = self.playlist_open;
+        let mut minimised = self.playlist_min;
+        let mut maximised = self.playlist_max;
+        let mut actions: Vec<Action> = Vec::new();
+
+        // `open` is held by the returned Window, so the chain has to be broken here.
+        let mut closed = false;
+        let window = egui::Window::new("Playlist")
+            .title_bar(false)
+            .collapsible(false)
+            .fixed_pos(pos)
+            .resize(|resize| resize.fixed_size(size))
+            .open(&mut open);
+
+        window.show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong("Playlist");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("✕").clicked() {
+                        closed = true;
+                    }
+                    if ui.small_button(if maximised { "🗗" } else { "🗖" }).clicked() {
+                        maximised = !maximised;
+                    }
+                    if ui.small_button("🗕").clicked() {
+                        minimised = !minimised;
+                    }
+                });
+            });
+            ui.separator();
+
+            // Minimised: the title bar is the whole window.
+            if !minimised {
+                self.queue_view(ui, &mut actions);
+            }
+        });
+
+        self.playlist_open = open && self.playlist_open && !closed;
+        self.playlist_min = minimised;
+        self.playlist_max = maximised;
+        self.apply(actions);
+    }
 }
 
 impl eframe::App for NovaApp {
@@ -1382,6 +1467,10 @@ impl eframe::App for NovaApp {
 
         self.apply(actions);
         self.ensure_covers(&ctx);
+
+        if self.playlist_open {
+            self.playlist_window(&ctx);
+        }
 
         drop_overlay(&ctx);
 
@@ -1727,6 +1816,45 @@ fn percent_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn screen() -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))
+    }
+
+    #[test]
+    fn playlist_window_starts_at_a_fixed_default() {
+        let (pos, size) = playlist_geometry(false, false, screen());
+        assert_eq!(pos, egui::pos2(150.0, 110.0));
+        assert_eq!(size, egui::vec2(380.0, 300.0));
+        // Inside the screen it is meant to float in.
+        assert!(screen().contains_rect(egui::Rect::from_min_size(pos, size)));
+    }
+
+    #[test]
+    fn playlist_window_maximises_to_fill_the_window() {
+        // Maximise wins over minimise, so the ordering of the checks matters.
+        let (pos, size) = playlist_geometry(true, true, screen());
+        assert_eq!(pos, screen().min);
+        assert_eq!(size, screen().size());
+    }
+
+    #[test]
+    fn playlist_window_minimises_to_a_slim_bar() {
+        let (pos, size) = playlist_geometry(true, false, screen());
+        assert_eq!(pos, screen().left_top());
+        assert_eq!(size.x, 380.0);
+        assert!(size.y < 40.0, "a collapsed bar is thin, got {size:?}");
+    }
+
+    #[test]
+    fn playlist_window_state_never_yields_an_empty_rect() {
+        for minimised in [false, true] {
+            for maximised in [false, true] {
+                let (_, size) = playlist_geometry(minimised, maximised, screen());
+                assert!(size.x >= 1.0 && size.y >= 1.0, "{size:?}");
+            }
+        }
+    }
 
     #[test]
     fn plain_paths_are_used_verbatim() {

@@ -167,6 +167,24 @@ nova-cli play   <dir> [--index N] [--volume V] [--null] [--seconds S]
 4. Use the transport bar for play/pause, previous/next, seek, volume, shuffle
    and repeat.
 5. Press <kbd>I</kbd> (or the **ℹ Info** button) to open the track info panel.
+6. Click **Nova** in the top bar to open its menu; **Playlist** opens a floating
+   playlist window. **Video** and **Audio** are placeholders for now.
+
+### The Nova menu
+
+The **Nova** label at the top-left of the window is also the menu button. It
+opens a small dropdown whose items are **Playlist**, **Video** and **Audio**.
+
+**Playlist** opens a floating playlist window over the app. Its title bar carries
+the three window controls:
+
+- **🗕 Minimise** — collapses the window to a slim bar at the top; nothing is
+  lost, click again to bring it back.
+- **🗖 Maximise** — makes the window fill the app. Click again to restore.
+- **✕ Close** — puts the window away.
+
+The window's position and size are pinned, so these states are exact rather than
+approximate. **Video** and **Audio** do nothing yet and are shown greyed out.
 
 ### Video
 
