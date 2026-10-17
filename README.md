@@ -40,10 +40,11 @@ but for music you already own on disk.
   basket) and `.nfm` (a container wrapping any codec with metadata and a cover)
   are indexed and played in-process through the vendored upstream codecs. See
   [Codecs](#codecs).
-- **Video** — video files are indexed alongside music and play **inside Nova's
-  window**: libmpv decodes and renders straight into an OpenGL texture, shown in
-  a floating *Video* window, while the library stays browsable. Needs `libmpv`
-  (see [Requirements](#requirements)) and `ffprobe`/`ffmpeg` for indexing.
+- **Video** — video files are indexed alongside music and play **in the main
+  window**: the picture takes over the sidebar and the playlist, with the top
+  bar and transport bar still around it. libmpv decodes straight into an
+  OpenGL texture at the size it is displayed. Needs `libmpv` (see
+  [Requirements](#requirements)) and `ffprobe`/`ffmpeg` for indexing.
 
 ## Repository layout
 
@@ -171,15 +172,21 @@ nova-cli play   <dir> [--index N] [--volume V] [--null] [--seconds S]
 
 Video files are indexed with the music (title/artist/album, duration and
 resolution from `ffprobe`, a poster frame grabbed on demand for the cover art)
-and are marked `V` in track lists. Playing one opens a floating **Video** window
-inside the app; drag or resize it like any other panel. The rest of the UI stays
-live, so you can keep browsing while a clip plays.
+and are marked `V` in track lists. Playing one hands the main window over to the
+picture: the sidebar and the playlist step aside, and the video fills the space
+between the top bar and the transport bar, scaled to its own aspect ratio and
+centred. Press <kbd>Esc</kbd> to stop and get the library back.
 
 There is no decoder in Nova. `crates/nova-app/src/mpv.rs` is a small hand-written
 libmpv binding: libmpv decodes, renders into an OpenGL texture that egui draws as
 an ordinary image, and drives the clock, so audio and video stay in step. Audio
 files keep going through rodio — `VideoBackend` implements `AudioBackend` and
 picks whichever of the two can play the track, so `PlaybackEngine` is unchanged.
+
+The texture is allocated at the size the video is actually shown at, so mpv
+decodes straight to that resolution; resizing the window reallocates it rather
+than scaling a stale frame. Only the width is snapped to an allocation grid, and
+the height is derived from it, so the aspect ratio survives.
 
 Two things are worth knowing if you touch that file:
 
@@ -253,6 +260,7 @@ rescan" brings the whole library back.
 | <kbd>↑</kbd> / <kbd>↓</kbd> | Move the cursor through a list |
 | <kbd>Enter</kbd> | Play the track under the cursor |
 | <kbd>Del</kbd> | Queue view: remove from queue · Songs view: hide from library |
+| <kbd>Esc</kbd> | Stop and return to the library while a video is on screen |
 
 ## Codecs
 

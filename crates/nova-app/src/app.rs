@@ -539,13 +539,14 @@ impl NovaApp {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (toggle, next, prev, info, del) = ctx.input(|i| {
+        let (toggle, next, prev, info, del, escape) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::Space),
                 i.modifiers.command && i.key_pressed(egui::Key::ArrowRight),
                 i.modifiers.command && i.key_pressed(egui::Key::ArrowLeft),
                 i.key_pressed(egui::Key::I),
                 i.key_pressed(egui::Key::Delete),
+                i.key_pressed(egui::Key::Escape),
             )
         });
         if toggle {
@@ -562,6 +563,11 @@ impl NovaApp {
         }
         if del {
             self.delete_current();
+        }
+        // The video hides the sidebar, so this is the only way back to the
+        // library once a clip has finished and nothing is queued behind it.
+        if escape && self.video_showing() {
+            self.engine.stop();
         }
     }
 
@@ -1258,43 +1264,50 @@ impl NovaApp {
         });
         ui.add_space(6.0);
     }
-    /// Shows the video surface for a track that has one.
+    /// Whether the video surface should take over the content area.
     ///
-    /// A floating window rather than the centre panel: the library stays
-    /// browsable while a film plays, and there is nothing to switch views for.
-    fn video_window(&self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    /// True only while a video is actually loaded: `current_track` keeps
+    /// answering with the queue's selection after a stop, so the state is what
+    /// decides, or the library would never come back.
+    fn video_showing(&self) -> bool {
+        self.mpv.is_some()
+            && self.engine.state() != PlaybackState::Stopped
+            && self
+                .engine
+                .current_track(&self.library)
+                .is_some_and(Track::is_video)
+    }
+
+    /// Aspect ratio of the video on screen, from its declared frame size.
+    fn video_aspect(&self) -> f32 {
+        self.engine
+            .current_track(&self.library)
+            .and_then(|track| track.video)
+            .filter(|v| v.width > 0 && v.height > 0)
+            .map_or(16.0 / 9.0, |v| v.width as f32 / v.height as f32)
+    }
+
+    /// Draws the video, centred in whatever space the panel offers.
+    ///
+    /// The sidebar is hidden while this runs, so the surface spans the full
+    /// width under the top bar.
+    fn video_view(&self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let Some(mpv) = self.mpv.clone() else {
             return;
         };
-        let Some(track) = self.engine.current_track(&self.library) else {
-            return;
-        };
-        if !track.is_video() {
-            return;
-        }
-        let aspect = track
-            .video
-            .filter(|v| v.width > 0 && v.height > 0)
-            .map_or(16.0 / 9.0, |v| v.width as f32 / v.height as f32);
+        let aspect = self.video_aspect();
+        let size = crate::mpv::fit(ui.available_size(), aspect);
 
-        egui::Window::new("Video")
-            .default_size([640.0, 360.0])
-            .resizable(true)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                let size = crate::mpv::fit(ui.available_size(), aspect);
-                // Render at the on-screen pixel size so the frame is decoded and
-                // scaled exactly once, at the size it is displayed.
-                let texture = mpv.texture(frame, size * ui.ctx().pixels_per_point(), aspect);
-                if let Some(texture) = texture {
-                    ui.image(egui::load::SizedTexture::new(texture, size));
-                }
-            });
-
-        // A video needs a fresh frame far more often than the audio clock ticks.
-        if self.engine.state() == PlaybackState::Playing {
-            ctx.request_repaint();
-        }
+        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+            // Render at the on-screen pixel size so the frame is decoded and
+            // scaled exactly once, at the size it is displayed.
+            let pixels = size * ui.ctx().pixels_per_point();
+            if let Some(texture) = mpv.texture(frame, pixels, aspect) {
+                ui.image(egui::load::SizedTexture::new(texture, size));
+            } else {
+                ui.colored_label(Color32::RED, "video could not be started");
+            }
+        });
     }
 }
 
@@ -1320,12 +1333,16 @@ impl eframe::App for NovaApp {
             self.top_bar(ui, &mut actions);
             ui.add_space(4.0);
         });
-        egui::Panel::left("nav")
-            .resizable(false)
-            .default_size(220.0)
-            .show(ui, |ui| {
-                self.side_bar(ui, &mut actions);
-            });
+        // While a video plays, the sidebar gives up its width to the picture.
+        let showing_video = self.video_showing();
+        if !showing_video {
+            egui::Panel::left("nav")
+                .resizable(false)
+                .default_size(220.0)
+                .show(ui, |ui| {
+                    self.side_bar(ui, &mut actions);
+                });
+        }
 
         if self.info_open {
             egui::Panel::right("track-info")
@@ -1342,11 +1359,19 @@ impl eframe::App for NovaApp {
                 self.player_bar(ui, &mut actions);
             });
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.center(ui, &mut actions);
-        });
-
-        self.video_window(&ctx, frame);
+        if showing_video {
+            egui::CentralPanel::default().show(ui, |ui| {
+                self.video_view(ui, frame);
+            });
+            // A video needs a fresh frame far more often than the audio clock ticks.
+            if self.engine.state() == PlaybackState::Playing {
+                ctx.request_repaint();
+            }
+        } else {
+            egui::CentralPanel::default().show(ui, |ui| {
+                self.center(ui, &mut actions);
+            });
+        }
 
         self.apply(actions);
         self.ensure_covers(&ctx);
