@@ -730,7 +730,14 @@ impl NovaApp {
 
     fn top_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Nova").strong().size(18.0));
+            ui.menu_button(RichText::new("Nova").strong().size(18.0), |ui| {
+                // TEMP TEST: disable() removed
+                ui.label("Playlist");
+                ui.separator();
+                ui.label("Video");
+                ui.separator();
+                ui.label("Audio");
+            });
             ui.separator();
 
             ui.label("Folder");
