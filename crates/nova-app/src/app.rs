@@ -15,6 +15,8 @@ use nova_core::{AlbumKey, Library, PlaybackEngine, PlaybackState, ScanReport, Tr
 const TOAST_TTL: Duration = Duration::from_secs(6);
 /// How many cover images to decode per frame, to avoid stalling the UI.
 const COVER_BUDGET_PER_FRAME: usize = 6;
+/// Height of one track row in the list views.
+const ROW_HEIGHT: f32 = 24.0;
 
 // ---------------------------------------------------------------------------
 // Persisted configuration
@@ -925,14 +927,14 @@ impl NovaApp {
         for (index, track) in tracks.iter().enumerate() {
             let playing = current == Some(track.id);
             let response = ui.add_sized(
-                [ui.available_width(), 24.0],
+                [ui.available_width(), ROW_HEIGHT],
                 egui::Button::selectable(
                     index == cursor,
                     RichText::new(track_row_text(track, playing)).size(14.0),
                 ),
             );
 
-            if index == cursor {
+            if index == cursor && !ui.clip_rect().contains_rect(response.rect) {
                 response.scroll_to_me(Some(Align::Center));
             }
             if response.clicked() {
@@ -1117,14 +1119,14 @@ impl NovaApp {
                     continue;
                 };
                 let response = ui.add_sized(
-                    [ui.available_width(), 24.0],
+                    [ui.available_width(), ROW_HEIGHT],
                     egui::Button::selectable(
                         index == cursor,
                         RichText::new(track_row_text(track, current_index == Some(index)))
                             .size(14.0),
                     ),
                 );
-                if index == cursor {
+                if index == cursor && !ui.clip_rect().contains_rect(response.rect) {
                     response.scroll_to_me(Some(Align::Center));
                 }
                 if response.clicked() {
