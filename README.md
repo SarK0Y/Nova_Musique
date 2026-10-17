@@ -40,6 +40,10 @@ but for music you already own on disk.
   basket) and `.nfm` (a container wrapping any codec with metadata and a cover)
   are indexed and played in-process through the vendored upstream codecs. See
   [Codecs](#codecs).
+- **Video** — video files are indexed alongside music and play **inside Nova's
+  window**: libmpv decodes and renders straight into an OpenGL texture, shown in
+  a floating *Video* window, while the library stays browsable. Needs `libmpv`
+  (see [Requirements](#requirements)) and `ffprobe`/`ffmpeg` for indexing.
 
 ## Repository layout
 
@@ -64,6 +68,7 @@ sources; `scripts/sync-nofft.sh` refreshes it from `main`/trunk.
 | `library`    | Directory scanning, indexing, grouping, search and JSON caching. |
 | `queue`      | The playback queue: cursor, shuffle, repeat, insert/remove. |
 | `playback`   | `PlaybackEngine` and the `AudioBackend` abstraction. |
+| `video`      | Video extensions, `ffprobe` metadata, poster frames. |
 | `error`      | `CoreError` / `Result`. |
 
 The key design point is that `PlaybackEngine` is **driver-agnostic**: it exposes
@@ -83,7 +88,8 @@ A single-window egui app: a top bar (folder + scan + search), a left sidebar
 (library sections and *now playing*), a content pane (the current view), and a
 bottom transport bar. UI intent is collected as `Action`s during the frame and
 applied afterwards, which keeps borrows simple and the state changes easy to
-follow.
+follow. `mpv` is the hand-written libmpv binding behind in-window video
+playback.
 
 ## Requirements
 
@@ -92,6 +98,11 @@ follow.
 - **A C++ compiler** (g++/clang++), for the vendored No_FFT codecs. The codec
   support is the `nofft` feature, which the app and CLI enable by default;
   `nova-core` alone still builds without a C++ toolchain.
+- **libmpv** (`libmpv.so` plus its headers) — required to *build* the GUI, since
+  the bindings are linked in. `pkg-config --exists mpv` is the check. Without it
+  the app still builds audio-only if you drop `crates/nova-app/src/mpv.rs`.
+- **ffmpeg's `ffprobe` and `ffmpeg`** — used to read video metadata and to grab
+  poster frames. Optional: video indexing degrades, nothing else breaks.
 - **Linux**: ALSA for audio, plus the usual X11/Wayland + OpenGL bits that
   `eframe` needs. The folder picker uses the XDG desktop portal; if no portal is
   available you can simply paste a path into the folder field and press **Scan**.
@@ -155,6 +166,31 @@ nova-cli play   <dir> [--index N] [--volume V] [--null] [--seconds S]
 4. Use the transport bar for play/pause, previous/next, seek, volume, shuffle
    and repeat.
 5. Press <kbd>I</kbd> (or the **ℹ Info** button) to open the track info panel.
+
+### Video
+
+Video files are indexed with the music (title/artist/album, duration and
+resolution from `ffprobe`, a poster frame grabbed on demand for the cover art)
+and are marked `V` in track lists. Playing one opens a floating **Video** window
+inside the app; drag or resize it like any other panel. The rest of the UI stays
+live, so you can keep browsing while a clip plays.
+
+There is no decoder in Nova. `crates/nova-app/src/mpv.rs` is a small hand-written
+libmpv binding: libmpv decodes, renders into an OpenGL texture that egui draws as
+an ordinary image, and drives the clock, so audio and video stay in step. Audio
+files keep going through rodio — `VideoBackend` implements `AudioBackend` and
+picks whichever of the two can play the track, so `PlaybackEngine` is unchanged.
+
+Two things are worth knowing if you touch that file:
+
+- **The UI thread never calls into mpv.** While a video is loaded the core waits
+  on the render API, which only runs on the UI thread, so a synchronous property
+  read from there deadlocks. A background thread polls the properties into a
+  shared snapshot, and commands are issued asynchronously.
+- **`advanced-control` is deliberately off.** With it on, mpv holds the core
+  until the client reports each swap, which aborts the process on hosts without
+  real-time priority. Letting mpv keep its own timing costs a little A/V
+  precision and works everywhere.
 
 ### Track info
 

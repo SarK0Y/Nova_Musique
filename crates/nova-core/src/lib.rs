@@ -31,6 +31,7 @@ pub mod metadata;
 pub mod model;
 pub mod playback;
 pub mod queue;
+pub mod video;
 
 pub use error::{CoreError, Result};
 pub use library::{Library, ScanProgress, ScanReport};

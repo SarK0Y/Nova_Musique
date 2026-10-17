@@ -45,6 +45,9 @@ pub fn is_supported(path: &Path) -> bool {
     if AUDIO_EXTENSIONS.contains(&ext.as_str()) {
         return true;
     }
+    if crate::video::VIDEO_EXTENSIONS.contains(&ext.as_str()) {
+        return true;
+    }
     #[cfg(feature = "nofft")]
     if nova_codec::CODEC_EXTENSIONS.contains(&ext.as_str())
         || nova_codec::NFM_EXTENSIONS.contains(&ext.as_str())
@@ -66,6 +69,10 @@ pub struct CoverArt {
 /// Missing tags never fail: the title falls back to the file stem and artists
 /// fall back to `"Unknown Artist"`.
 pub fn read_track(path: &Path) -> Result<Track> {
+    if crate::video::is_video(path) {
+        return crate::video::read_video_track(path);
+    }
+
     #[cfg(feature = "nofft")]
     if is_codec(path) {
         return read_codec_track(path);
@@ -135,6 +142,7 @@ pub fn read_track(path: &Path) -> Result<Track> {
         sample_rate: props.sample_rate(),
         channels: props.channels(),
         has_cover: tag.map(|t| t.picture_count() > 0).unwrap_or(false),
+        video: None,
     })
 }
 
@@ -162,6 +170,7 @@ fn read_codec_track(path: &Path) -> Result<Track> {
         sample_rate: (info.sample_rate > 0).then_some(info.sample_rate),
         channels: u8::try_from(info.channels).ok().filter(|&c| c > 0),
         has_cover: false,
+        video: None,
     })
 }
 
@@ -202,6 +211,7 @@ fn read_nfm_track(path: &Path) -> Result<Track> {
         sample_rate: (info.sample_rate > 0).then_some(info.sample_rate),
         channels: u8::try_from(info.channels).ok().filter(|&c| c > 0),
         has_cover: nfm.cover.is_some(),
+        video: None,
     })
 }
 
@@ -209,6 +219,12 @@ fn read_nfm_track(path: &Path) -> Result<Track> {
 ///
 /// Prefers a front cover, then falls back to any other picture.
 pub fn read_cover(path: &Path) -> Result<Option<CoverArt>> {
+    if crate::video::is_video(path) {
+        // Videos carry no embedded picture we can read cheaply, so the poster
+        // is a frame grabbed on demand — only for videos actually displayed.
+        return Ok(crate::video::poster(path).map(|data| CoverArt { data }));
+    }
+
     #[cfg(feature = "nofft")]
     if is_nfm(path) {
         let nfm = nova_codec::nfm_read(path).map_err(|e| CoreError::metadata(path, e))?;

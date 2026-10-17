@@ -687,6 +687,7 @@ mod tests {
                 sample_rate: Some(44_100),
                 channels: Some(2),
                 has_cover: false,
+                video: None,
             })
             .collect();
         Library::from_tracks(None, tracks)

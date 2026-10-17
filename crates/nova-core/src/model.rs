@@ -39,9 +39,23 @@ pub struct Track {
     pub channels: Option<u8>,
     /// Whether the file embeds cover art.
     pub has_cover: bool,
+    /// Frame size, set only for video files; `None` means audio.
+    #[serde(default)]
+    pub video: Option<VideoStream>,
 }
 
 impl Track {
+    /// Whether this track is a video rather than audio.
+    pub fn is_video(&self) -> bool {
+        self.video.is_some()
+    }
+
+    /// Resolution as `WIDTHxHEIGHT`, for video files that declared one.
+    pub fn resolution(&self) -> Option<String> {
+        let v = self.video?;
+        (v.width > 0 && v.height > 0).then(|| format!("{}x{}", v.width, v.height))
+    }
+
     /// Artist used for grouping, never empty.
     pub fn display_artist(&self) -> &str {
         if !self.artist.is_empty() {
@@ -125,6 +139,15 @@ pub struct Artist {
     pub album_count: usize,
 }
 
+/// Frame size of a video track, as reported by the container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoStream {
+    /// Frame width in pixels.
+    pub width: u32,
+    /// Frame height in pixels.
+    pub height: u32,
+}
+
 /// Stable id for a path. FNV-1a over the raw OS bytes: cheap and reproducible
 /// between runs, which matters because the library cache is persisted.
 pub fn track_id(path: &Path) -> TrackId {
@@ -168,6 +191,7 @@ mod tests {
             sample_rate: None,
             channels: None,
             has_cover: false,
+            video: None,
         };
         assert_eq!(track.album_key().album_artist, "Various Artists");
         track.album_artist.clear();

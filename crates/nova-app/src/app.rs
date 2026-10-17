@@ -3,11 +3,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText};
 use serde::{Deserialize, Serialize};
 
+use crate::mpv::{Mpv, VideoBackend};
 use nova_core::metadata;
 use nova_core::{AlbumKey, Library, PlaybackEngine, PlaybackState, ScanReport, Track, TrackId};
 
@@ -205,6 +207,9 @@ pub struct NovaApp {
     /// Keyboard cursor row in the list on screen. `Cell` so the list
     /// renderers can move it without taking `&mut self`.
     cursor: std::cell::Cell<usize>,
+    /// libmpv, when it could be started. `None` means video plays through the
+    /// audio backend only, which works for songs and not much else.
+    mpv: Option<Arc<Mpv>>,
 }
 
 impl NovaApp {
@@ -244,7 +249,8 @@ impl NovaApp {
         let hidden = load_hidden();
         let mut library = load_cached_library(music_dir.as_deref()).unwrap_or_default();
         library.hide(&hidden);
-        let mut engine = PlaybackEngine::new();
+        let mpv = Mpv::new(cc).map(Arc::new);
+        let mut engine = PlaybackEngine::with_backend(Box::new(VideoBackend::new(mpv.clone())));
         engine.set_volume(config.volume);
 
         let folder_input = music_dir
@@ -271,6 +277,7 @@ impl NovaApp {
             selected: None,
             hidden,
             cursor: std::cell::Cell::new(0),
+            mpv,
         };
 
         // If a file was requested and the cache already knows it, play right away.
@@ -1251,10 +1258,48 @@ impl NovaApp {
         });
         ui.add_space(6.0);
     }
+    /// Shows the video surface for a track that has one.
+    ///
+    /// A floating window rather than the centre panel: the library stays
+    /// browsable while a film plays, and there is nothing to switch views for.
+    fn video_window(&self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let Some(mpv) = self.mpv.clone() else {
+            return;
+        };
+        let Some(track) = self.engine.current_track(&self.library) else {
+            return;
+        };
+        if !track.is_video() {
+            return;
+        }
+        let aspect = track
+            .video
+            .filter(|v| v.width > 0 && v.height > 0)
+            .map_or(16.0 / 9.0, |v| v.width as f32 / v.height as f32);
+
+        egui::Window::new("Video")
+            .default_size([640.0, 360.0])
+            .resizable(true)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let size = crate::mpv::fit(ui.available_size(), aspect);
+                // Render at the on-screen pixel size so the frame is decoded and
+                // scaled exactly once, at the size it is displayed.
+                let texture = mpv.texture(frame, size * ui.ctx().pixels_per_point(), aspect);
+                if let Some(texture) = texture {
+                    ui.image(egui::load::SizedTexture::new(texture, size));
+                }
+            });
+
+        // A video needs a fresh frame far more often than the audio clock ticks.
+        if self.engine.state() == PlaybackState::Playing {
+            ctx.request_repaint();
+        }
+    }
 }
 
 impl eframe::App for NovaApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
         if let Some((_, at)) = &self.toast {
@@ -1275,7 +1320,6 @@ impl eframe::App for NovaApp {
             self.top_bar(ui, &mut actions);
             ui.add_space(4.0);
         });
-
         egui::Panel::left("nav")
             .resizable(false)
             .default_size(220.0)
@@ -1301,6 +1345,8 @@ impl eframe::App for NovaApp {
         egui::CentralPanel::default().show(ui, |ui| {
             self.center(ui, &mut actions);
         });
+
+        self.video_window(&ctx, frame);
 
         self.apply(actions);
         self.ensure_covers(&ctx);
@@ -1443,6 +1489,9 @@ fn track_info_rows(track: &Track) -> Vec<(&'static str, String)> {
     }
 
     rows.push(("Duration", format_duration(track.duration())));
+    if let Some(resolution) = track.resolution() {
+        rows.push(("Resolution", resolution));
+    }
     if let Some(rate) = track.sample_rate.filter(|r| *r > 0) {
         rows.push(("Sample rate", format_sample_rate(rate)));
     }
@@ -1460,7 +1509,10 @@ fn track_info_rows(track: &Track) -> Vec<(&'static str, String)> {
 /// One list row: number, title, artist, duration. The playing track swaps its
 /// number for a marker, so the cursor highlight stays the only filled row.
 fn track_row_text(track: &Track, playing: bool) -> String {
-    let number = if playing {
+    let number = if track.is_video() {
+        // Films and clips share the music list, so mark the odd ones out.
+        "V".to_string()
+    } else if playing {
         "\u{25b6}".to_string()
     } else {
         track
@@ -1486,12 +1538,14 @@ fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
 
 /// Short, human-readable label for the container/codec behind a file path.
 fn format_label(path: &Path) -> String {
-    match path
+    let ext = path
         .extension()
         .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default()
-        .as_str()
-    {
+        .unwrap_or_default();
+    if nova_core::video::VIDEO_EXTENSIONS.contains(&ext.as_str()) {
+        return format!("{} video", ext.to_ascii_uppercase());
+    }
+    match ext.as_str() {
         "nfm" => "NFM container".to_string(),
         "no_fft" => "NoFFT".to_string(),
         "nadc" => "NADC adaptive".to_string(),
@@ -1776,6 +1830,7 @@ mod tests {
             sample_rate: Some(44_100),
             channels: Some(2),
             has_cover: true,
+            video: None,
         }
     }
 
