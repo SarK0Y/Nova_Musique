@@ -412,6 +412,6 @@ Deliberately out of scope for this first pass — the natural next steps:
 - Richer now-playing (waveform/visualiser, lyrics).
 - Drag-and-drop import and reordering of the queue.
 
-## Project has been assisted by awesome OpenCode 🙂
+## Project has been assisted by awesome OpenCode (Big Pickle, LongCat, Space Bunny) / ChatGPT 🙂
 
 ## my the Best Wishes to You, Dear User 🙃
