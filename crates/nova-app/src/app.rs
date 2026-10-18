@@ -10,6 +10,7 @@ use eframe::egui::{self, Align, Color32, FontId, Layout, RichText};
 use serde::{Deserialize, Serialize};
 
 use crate::mpv::{Mpv, VideoBackend};
+use crate::videowin;
 use nova_core::metadata;
 use nova_core::{AlbumKey, Library, PlaybackEngine, PlaybackState, ScanReport, Track, TrackId};
 
@@ -212,6 +213,10 @@ pub struct NovaApp {
     mpv: Option<Arc<Mpv>>,
     /// Floating playlist window, opened from the Nova menu in the top bar.
     playlist_open: bool,
+    /// External video window: picks which video stream mpv should show.
+    video_open: bool,
+    /// That window's process, started on demand and killed when dropped.
+    video_window: Option<videowin::VideoWindow>,
 }
 
 impl NovaApp {
@@ -281,6 +286,8 @@ impl NovaApp {
             cursor: std::cell::Cell::new(0),
             mpv,
             playlist_open: false,
+            video_open: false,
+            video_window: None,
         };
 
         // If a file was requested and the cache already knows it, play right away.
@@ -444,7 +451,9 @@ impl NovaApp {
         }
         let count = ids.len();
         if skipped > 0 {
-            self.toast(format!("Added {count} track(s); skipped {skipped} unsupported file(s)"));
+            self.toast(format!(
+                "Added {count} track(s); skipped {skipped} unsupported file(s)"
+            ));
         } else {
             self.toast(format!("Added {count} track(s) to the playlist"));
         }
@@ -798,10 +807,12 @@ impl NovaApp {
                     self.playlist_open = true;
                     ui.close();
                 }
+                if ui.button("Video").clicked() {
+                    self.video_open = true;
+                    ui.close();
+                }
                 ui.separator();
                 // Not wired up yet, so shown disabled rather than pretending.
-                ui.add_enabled(false, egui::Label::new("Video"));
-                ui.separator();
                 ui.add_enabled(false, egui::Label::new("Audio"));
             });
             ui.separator();
@@ -1405,7 +1416,10 @@ impl NovaApp {
             // under the pointer. Import them here (rather than in the main
             // viewport) so files can be dropped directly onto this window.
             let external_drops: Vec<PathBuf> = viewport_ctx.input(|input| {
-                input.raw.dropped_files.iter()
+                input
+                    .raw
+                    .dropped_files
+                    .iter()
                     .filter_map(|file| file.path.clone())
                     .collect()
             });
@@ -1421,9 +1435,11 @@ impl NovaApp {
                 ui.push_id("external-playlist-window", |ui| {
                     ui.heading("Playlist");
                     ui.label(
-                        RichText::new("Drop audio files from your file manager, or drag tracks here")
-                            .weak()
-                            .size(12.0),
+                        RichText::new(
+                            "Drop audio files from your file manager, or drag tracks here",
+                        )
+                        .weak()
+                        .size(12.0),
                     );
                     ui.separator();
                     self.queue_view(ui, &mut actions);
@@ -1433,9 +1449,8 @@ impl NovaApp {
             // egui's drag payload is shared by the viewports. Consume it only when
             // the pointer is released over the playlist window, then append the
             // track to the existing queue without interrupting current playback.
-            let (released, pointer_pos) = viewport_ctx.input(|input| {
-                (input.pointer.any_released(), input.pointer.interact_pos())
-            });
+            let (released, pointer_pos) = viewport_ctx
+                .input(|input| (input.pointer.any_released(), input.pointer.interact_pos()));
             if released && pointer_pos.is_some_and(|pos| panel.response.rect.contains(pos)) {
                 if let Some(track_id) = egui::DragAndDrop::take_payload::<TrackId>(viewport_ctx) {
                     actions.push(Action::Enqueue(*track_id));
@@ -1445,6 +1460,47 @@ impl NovaApp {
         });
     }
 
+    /// Keeps the external video-stream picker in step with mpv.
+    ///
+    /// This is what SMPlayer calls *Video → Track*: a container carrying more
+    /// than one video stream (multi-angle discs, dual-cam footage) lets you
+    /// pick which one mpv shows. The picker runs as its own process, so the
+    /// picture stays here and nothing about mpv's GL context is disturbed.
+    fn video_window(&mut self) {
+        if !self.video_open {
+            return;
+        }
+        if self.video_window.is_none() {
+            self.video_window = videowin::VideoWindow::spawn();
+            if self.video_window.is_none() {
+                // Spawning failed; leave the flag off so this is not retried on
+                // every frame. Opening it again from the menu tries afresh.
+                self.video_open = false;
+                return;
+            }
+        }
+        let Some(window) = self.video_window.as_mut() else {
+            return;
+        };
+
+        // Closing the picker window, or its process dying, closes it here too.
+        if window.closed() {
+            log::debug!("the video window closed");
+            self.video_window = None;
+            self.video_open = false;
+            return;
+        }
+
+        if let Some(mpv) = self.mpv.clone() {
+            window.send_tracks(&mpv.video_tracks());
+        }
+        if let Some(id) = window.picked() {
+            if let Some(mpv) = self.mpv.clone() {
+                log::info!("video stream {id} selected");
+                mpv.select_video_track(&id);
+            }
+        }
+    }
 }
 
 impl eframe::App for NovaApp {
@@ -1514,6 +1570,9 @@ impl eframe::App for NovaApp {
 
         if self.playlist_open {
             self.playlist_window(&ctx);
+        }
+        if self.video_open {
+            self.video_window();
         }
 
         drop_overlay(&ctx);

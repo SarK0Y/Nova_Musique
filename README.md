@@ -168,7 +168,8 @@ nova-cli play   <dir> [--index N] [--volume V] [--null] [--seconds S]
    and repeat.
 5. Press <kbd>I</kbd> (or the **ℹ Info** button) to open the track info panel.
 6. Click **Nova** in the top bar to open its menu; **Playlist** opens a floating
-   playlist window. **Video** and **Audio** are placeholders for now.
+   playlist window and **Video** opens the video-stream picker. **Audio** is a
+   placeholder for now.
 
 ### The Nova menu
 
@@ -184,7 +185,25 @@ the three window controls:
 - **✕ Close** — puts the window away.
 
 The window's position and size are pinned, so these states are exact rather than
-approximate. **Video** and **Audio** do nothing yet and are shown greyed out.
+approximate.
+
+**Video** opens the video-stream picker in its own OS window — the same thing
+SMPlayer calls *Video → Track*. A container carrying more than one video stream
+(multi-angle discs, dual-cam footage) lists them all, the one being shown is
+marked, and clicking another switches to it. The picture itself stays in the main
+window; the picker only chooses. It reads `<empty>` when no video stream is
+loaded.
+
+That window runs as a **separate process** (`nova --video-window`), not a second
+window inside the app. This is deliberate: a second native window inside one
+process gets a GL context of its own, and libmpv's render context is bound to the
+main window's context for good, so the two together segfault. Behind a process
+boundary the picker's context belongs to a different process and never touches
+mpv. The two ends talk in plain lines over the picker's stdin and stdout — the
+parent sends the streams it read from mpv, the picker sends back the one picked —
+and the picker exits by itself if the main window goes away.
+
+**Audio** does nothing yet and is shown greyed out.
 
 ### Video
 
@@ -193,7 +212,9 @@ resolution from `ffprobe`, a poster frame grabbed on demand for the cover art)
 and are marked `V` in track lists. Playing one hands the main window over to the
 picture: the sidebar and the playlist step aside, and the video fills the space
 between the top bar and the transport bar, scaled to its own aspect ratio and
-centred. Press <kbd>Esc</kbd> to stop and get the library back.
+centred. Press <kbd>Esc</kbd> to stop and get the library back. A file with more
+than one video stream can switch between them from the **Nova** menu's **Video**
+item, which opens the stream picker in its own process.
 
 There is no decoder in Nova. `crates/nova-app/src/mpv.rs` is a small hand-written
 libmpv binding: libmpv decodes, renders into an OpenGL texture that egui draws as

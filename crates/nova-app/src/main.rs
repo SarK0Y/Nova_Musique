@@ -2,9 +2,16 @@
 
 mod app;
 mod mpv;
+mod videowin;
 
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // Re-launched by the main window to host the video-stream picker in its own
+    // process, so that its GL context cannot collide with mpv's.
+    if std::env::args_os().any(|arg| arg == videowin::FLAG) {
+        return videowin::run();
+    }
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()

@@ -112,6 +112,41 @@ struct RenderParam {
     data: *mut c_void,
 }
 
+/// The value half of `mpv_node`; only the arm matching `format` is valid.
+#[repr(C)]
+union MpvNodeValue {
+    string: *mut c_char,
+    flag: c_int,
+    int64: i64,
+    double_: f64,
+    list: *mut MpvNodeList,
+    map: *mut MpvNodeMap,
+    byte_array: *mut c_void,
+}
+
+/// `mpv_node` from `client.h`.
+#[repr(C)]
+struct MpvNode {
+    u: MpvNodeValue,
+    format: c_int,
+}
+
+/// `mpv_node_list` from `client.h`.
+#[repr(C)]
+struct MpvNodeList {
+    num: c_int,
+    values: *mut MpvNode,
+    keys: *mut *mut c_char,
+}
+
+/// `mpv_node_map` from `client.h` — same shape as a list, keyed.
+#[repr(C)]
+struct MpvNodeMap {
+    num: c_int,
+    values: *mut MpvNode,
+    keys: *mut *mut c_char,
+}
+
 const RENDER_PARAM_API_TYPE: c_int = 1;
 const RENDER_PARAM_OPENGL_INIT_PARAMS: c_int = 2;
 const RENDER_PARAM_OPENGL_FBO: c_int = 3;
@@ -119,8 +154,13 @@ const RENDER_PARAM_FLIP_Y: c_int = 4;
 /// Terminates a `mpv_render_param` array.
 const RENDER_PARAM_INVALID: c_int = 0;
 
+const FORMAT_STRING: c_int = 1;
 const FORMAT_FLAG: c_int = 3;
 const FORMAT_DOUBLE: c_int = 5;
+const FORMAT_INT64: c_int = 4;
+const FORMAT_NODE: c_int = 6;
+const FORMAT_NODE_ARRAY: c_int = 7;
+const FORMAT_NODE_MAP: c_int = 8;
 
 /// `MPV_RENDER_UPDATE_FRAME`: a new frame is ready to be rendered.
 const RENDER_UPDATE_FRAME: u64 = 1;
@@ -153,6 +193,7 @@ extern "C" {
         format: c_int,
         data: *mut c_void,
     ) -> c_int;
+    fn mpv_free_node_contents(node: *mut MpvNode);
     fn mpv_error_string(code: c_int) -> *const c_char;
     fn mpv_render_context_create(
         res: *mut *mut MpvRenderContext,
@@ -198,19 +239,36 @@ const OPTIONS: &[(&str, &str)] = &[
     ("hwdec", "no"),
 ];
 
+/// One video stream inside the loaded file, as mpv reports it.
+///
+/// This is the same thing SMPlayer lists under *Video → Track*: a multi-angle
+/// or multi-video-stream container offers several, and one is picked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoTrack {
+    /// The id mpv knows this stream by; what `video-track` wants.
+    pub id: String,
+    /// Stream label, falling back to the codec when the container has none.
+    pub title: String,
+    /// Frame size, when the container declared one.
+    pub size: Option<(u32, u32)>,
+    /// Whether this is the stream currently being shown.
+    pub selected: bool,
+}
+
 /// Playback state as last reported by mpv, cached for the UI to read.
 ///
 /// The UI must never ask mpv for a value directly: with a video loaded the core
 /// waits on the render API, which only runs on the UI thread, so a synchronous
 /// read from there deadlocks. mpv therefore pushes values to a control thread
 /// (the arrangement SMPlayer uses), which publishes them here.
-#[derive(Clone, Copy)]
 struct State {
     position: Duration,
     duration: Option<Duration>,
     paused: bool,
     finished: bool,
     volume: f32,
+    /// Video streams of the loaded file; empty when nothing video-ish is open.
+    video_tracks: Vec<VideoTrack>,
 }
 
 impl Default for State {
@@ -221,8 +279,136 @@ impl Default for State {
             paused: true,
             finished: false,
             volume: 1.0,
+            video_tracks: Vec::new(),
         }
     }
+}
+
+/// Reads a `MPV_FORMAT_STRING` node as a Rust `String`.
+fn node_string(node: &MpvNode) -> Option<String> {
+    if node.format != FORMAT_STRING {
+        return None;
+    }
+    // Safe: for MPV_FORMAT_STRING the union arm is a NUL-terminated string.
+    let raw = unsafe { node.u.string };
+    if raw.is_null() {
+        return None;
+    }
+    // Safe: mpv owns it and NUL-terminates it, per the header.
+    Some(
+        unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// Reads a `MPV_FORMAT_FLAG` node.
+fn node_flag(node: &MpvNode) -> bool {
+    node.format == FORMAT_FLAG && unsafe { node.u.flag } != 0
+}
+
+/// Reads a `MPV_FORMAT_INT64` node.
+fn node_int(node: &MpvNode) -> Option<i64> {
+    (node.format == FORMAT_INT64).then_some(unsafe { node.u.int64 })
+}
+
+/// Looks a key up in a `MPV_FORMAT_NODE_MAP`.
+fn map_get<'a>(map: &'a MpvNode, key: &str) -> Option<&'a MpvNode> {
+    if map.format != FORMAT_NODE_MAP {
+        return None;
+    }
+    // Safe: for MPV_FORMAT_NODE_MAP the union arm is a map of `num` entries.
+    let map = unsafe { &*map.u.map };
+    if map.num <= 0 || map.keys.is_null() || map.values.is_null() {
+        return None;
+    }
+    (0..map.num as usize)
+        .find(|&i| {
+            // Safe: keys are NUL-terminated strings owned by this node, and
+            // `i` is below `num`.
+            let name = unsafe { CStr::from_ptr(*map.keys.add(i)) }.to_bytes();
+            name == key.as_bytes()
+        })
+        // Safe: same bounds reasoning as the key lookup above.
+        .and_then(|i| unsafe { map.values.add(i).as_ref() })
+}
+
+/// Reads mpv's `track-list` and keeps the video streams.
+///
+/// The node tree is owned by mpv and freed here; only plain values are copied
+/// out, so nothing dangles after the call.
+fn read_video_tracks(handle: *mut MpvHandle) -> Vec<VideoTrack> {
+    let mut root = MpvNode {
+        u: MpvNodeValue {
+            string: std::ptr::null_mut(),
+        },
+        format: 0,
+    };
+    // Safe: `root` matches the requested format, and is initialised on success.
+    let rc = unsafe {
+        mpv_get_property(
+            handle,
+            cstr("track-list").as_ptr(),
+            FORMAT_NODE,
+            &mut root as *mut MpvNode as *mut c_void,
+        )
+    };
+    if rc < 0 {
+        return Vec::new();
+    }
+
+    let mut tracks = Vec::new();
+    if root.format == FORMAT_NODE_ARRAY {
+        // Safe: for MPV_FORMAT_NODE_ARRAY the union arm is `num` valid nodes.
+        let list = unsafe { &*root.u.list };
+        for index in 0..list.num.max(0) as usize {
+            // Safe: `index` is below `num`.
+            let entry = unsafe { list.values.add(index) };
+            // Safe: mpv's entries are valid nodes for the node's lifetime.
+            let entry = unsafe { entry.as_ref() };
+            let Some(entry) = entry else {
+                continue;
+            };
+            // Only video streams; audio and subtitle tracks are not our business.
+            if map_get(entry, "type").and_then(node_string).as_deref() != Some("video") {
+                continue;
+            }
+            let selected = map_get(entry, "selected").is_some_and(node_flag);
+            let width = map_get(entry, "demux-w").and_then(node_int).unwrap_or(0);
+            let height = map_get(entry, "demux-h").and_then(node_int).unwrap_or(0);
+            let codec = map_get(entry, "codec")
+                .and_then(node_string)
+                .unwrap_or_default();
+            let title = map_get(entry, "title")
+                .and_then(node_string)
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if codec.is_empty() {
+                        "Video".to_string()
+                    } else {
+                        codec
+                    }
+                });
+            // `id` is an integer in the node tree, but `video-track` wants the
+            // same id as text, so hand back its decimal form.
+            let Some(id) = map_get(entry, "id")
+                .and_then(node_int)
+                .map(|id| id.to_string())
+            else {
+                continue;
+            };
+            tracks.push(VideoTrack {
+                id,
+                title,
+                size: (width > 0 && height > 0).then_some((width as u32, height as u32)),
+                selected,
+            });
+        }
+    }
+
+    // Safe: mpv allocated this tree; the call releases it and everything in it.
+    unsafe { mpv_free_node_contents(&mut root as *mut MpvNode) };
+    tracks
 }
 
 fn cstr(text: &str) -> CString {
@@ -531,25 +717,46 @@ impl Mpv {
 
     /// Playback position, or zero when nothing is loaded yet.
     pub fn position(&self) -> Duration {
-        self.state().position
+        self.read(|state| state.position)
     }
 
     /// Total running time, once mpv has probed the file.
     pub fn duration(&self) -> Option<Duration> {
-        self.state().duration
+        self.read(|state| state.duration)
     }
 
     pub fn is_paused(&self) -> bool {
-        self.state().paused
+        self.read(|state| state.paused)
+    }
+
+    /// The video streams of the loaded file, newest report first.
+    pub fn video_tracks(&self) -> Vec<VideoTrack> {
+        self.read(|state| state.video_tracks.clone())
+    }
+
+    /// Switches to another video stream. Takes the track id from [`VideoTrack`].
+    ///
+    /// mpv spells this property `vid` and wants it as a number: there is no
+    /// `video-track` property at all, so setting that name silently does nothing.
+    pub fn select_video_track(&self, id: &str) {
+        match id.parse() {
+            Ok(id) => self.set_int("vid", id),
+            Err(_) => log::warn!("mpv: {id:?} is not a track id"),
+        }
     }
 
     /// Whether the file ran to its end. `keep-open` holds it there.
     pub fn is_finished(&self) -> bool {
-        self.state().finished
+        self.read(|state| state.finished)
     }
 
-    fn state(&self) -> State {
-        *self.state.lock().unwrap_or_else(|err| err.into_inner())
+    /// Reads one field out of the cached state.
+    ///
+    /// Per-field rather than copying the whole thing, so the cheap scalars the
+    /// transport bar polls every frame never clone the track list.
+    fn read<T>(&self, field: impl FnOnce(&State) -> T) -> T {
+        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        field(&state)
     }
 
     /// Optimistic local update, so the UI reacts before mpv's event arrives.
@@ -578,6 +785,11 @@ impl Mpv {
         if rc < 0 {
             log::debug!("mpv: setting {name:?} failed: {}", error_text(rc));
         }
+    }
+
+    /// Sets an integer property.
+    fn set_int(&self, name: &str, value: i64) {
+        self.set_property(name, FORMAT_INT64, &value as *const _ as *mut c_void);
     }
 
     fn command(&self, args: &[&str]) {
@@ -633,6 +845,9 @@ fn spawn_control_thread(handle: *mut MpvHandle, state: &Arc<Mutex<State>>) {
 
 fn control_loop(handle: &SharedHandle, state: &Mutex<State>) {
     let mut next = Instant::now();
+    let mut last_playlist_pos: i64 = -1;
+    let mut last_video_id: i64 = -2;
+    let mut refresh_tracks = true;
     loop {
         // Safe: `handle` outlives this thread — see `Drop for Mpv`.
         let read = |name: &str, format: c_int, slot: *mut c_void| unsafe {
@@ -671,6 +886,30 @@ fn control_loop(handle: &SharedHandle, state: &Mutex<State>) {
                 &mut finished as *mut c_int as *mut c_void,
             );
 
+            // Track list is a node tree and mpv rebuilds the whole thing on
+            // every read, so only ask when the file or the picked stream may have
+            // changed. Polling it at the tick rate meant 20 tree allocations a
+            // second while a video was rendering, which is both wasteful and
+            // churny for mpv's core. `playlist-pos` catches a new file; `vid`
+            // catches a switch within the current one.
+            let mut playlist_pos: i64 = 0;
+            read(
+                "playlist-pos",
+                FORMAT_INT64,
+                &mut playlist_pos as *mut i64 as *mut c_void,
+            );
+            let mut video_id: i64 = -1;
+            read(
+                "vid",
+                FORMAT_INT64,
+                &mut video_id as *mut i64 as *mut c_void,
+            );
+            if playlist_pos != last_playlist_pos || video_id != last_video_id {
+                last_playlist_pos = playlist_pos;
+                last_video_id = video_id;
+                refresh_tracks = true;
+            }
+
             // One lock for the whole batch, so the UI never sees a torn update.
             let mut state = state.lock().unwrap_or_else(|err| err.into_inner());
             state.position = Duration::from_secs_f64(position.max(0.0));
@@ -678,6 +917,15 @@ fn control_loop(handle: &SharedHandle, state: &Mutex<State>) {
             state.volume = (volume / 100.0).clamp(0.0, 1.0) as f32;
             state.paused = paused != 0;
             state.finished = finished != 0;
+            if refresh_tracks {
+                // Outside the lock: this walks an mpv-owned tree.
+                state.video_tracks = read_video_tracks(handle.0);
+                refresh_tracks = false;
+            } else if state.video_tracks.is_empty() {
+                // Keep asking until something shows up, so opening the file
+                // while it is already playing is still noticed.
+                state.video_tracks = read_video_tracks(handle.0);
+            }
         }
 
         // 20 Hz is plenty for a progress bar, and keeps mpv's core responsive.
