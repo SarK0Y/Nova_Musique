@@ -109,7 +109,7 @@ enum Action {
     CloseAlbum,
     OpenArtist(String),
     CloseArtist,
-    ScanDir(String),
+    SelectPath(String),
     HideAll,
     PlayList(Vec<TrackId>, usize),
     PlayQueueIndex(usize),
@@ -512,6 +512,52 @@ impl NovaApp {
 
     // -- scanning -----------------------------------------------------------
 
+    /// Acts on whatever path the folder selector was given.
+    ///
+    /// A folder is indexed as before. A file is not a request to walk its parent —
+    /// pointing the selector at one track should add that track and leave the rest of
+    /// the folder alone, which is the difference between adding a video and
+    /// indexing whatever else happens to sit beside it.
+    fn select_path(&mut self, path: PathBuf) {
+        if path.is_dir() {
+            self.start_scan(path);
+        } else if path.is_file() {
+            self.add_file(path);
+        } else {
+            self.toast(format!(
+                "{} is not a folder or a media file",
+                path.display()
+            ));
+        }
+    }
+
+    /// Adds a single media file to the library without indexing its folder.
+    fn add_file(&mut self, path: PathBuf) {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        if self.find_track_by_path(&path).is_some() {
+            self.toast(format!("{name} is already in the library"));
+            return;
+        }
+
+        let track = match metadata::read_track(&path) {
+            Ok(track) => track,
+            Err(err) => {
+                self.toast(format!("Could not read {name}: {err}"));
+                return;
+            }
+        };
+        let title = track.title.clone();
+        let root = self.library.root().map(Path::to_path_buf);
+        let mut tracks = self.library.tracks().to_vec();
+        tracks.push(track);
+        self.library = Library::from_tracks(root, tracks);
+        self.covers.clear();
+        self.toast(format!("Added {title} to the library"));
+    }
+
     fn start_scan(&mut self, dir: PathBuf) {
         if !dir.is_dir() {
             self.toast(format!("{} is not a directory", dir.display()));
@@ -741,7 +787,7 @@ impl NovaApp {
                     self.view = View::Artists;
                 }
                 Action::CloseArtist => self.artist_filter = None,
-                Action::ScanDir(dir) => self.start_scan(PathBuf::from(dir)),
+                Action::SelectPath(path) => self.select_path(PathBuf::from(path)),
                 Action::HideAll => {
                     self.hidden
                         .extend(self.library.tracks().iter().map(|t| t.id));
@@ -818,13 +864,19 @@ impl NovaApp {
             ui.separator();
 
             ui.label("Folder");
-            ui.add(
+            let folder_field = ui.add(
                 egui::TextEdit::singleline(&mut self.folder_input)
                     .desired_width(300.0)
                     .hint_text("/home/you/Music"),
             );
-            if ui.button("Scan").clicked() {
-                actions.push(Action::ScanDir(self.folder_input.trim().to_string()));
+            // Enter does what the Scan button does, so a typed path needs no
+            // mouse. A one-line field drops focus on Enter, so `has_focus` is
+            // already false by the time the frame closes; `lost_focus` plus the
+            // key is how egui itself spells this.
+            let entered =
+                folder_field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if entered || ui.button("Scan").clicked() {
+                actions.push(Action::SelectPath(self.folder_input.trim().to_string()));
             }
             if ui.button("Browse…").clicked() {
                 let mut dialog = rfd::FileDialog::new();
@@ -833,7 +885,7 @@ impl NovaApp {
                 }
                 if let Some(dir) = dialog.pick_folder() {
                     self.folder_input = dir.display().to_string();
-                    actions.push(Action::ScanDir(dir.display().to_string()));
+                    actions.push(Action::SelectPath(dir.display().to_string()));
                 }
             }
 

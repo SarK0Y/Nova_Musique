@@ -106,7 +106,9 @@ playback.
   poster frames. Optional: video indexing degrades, nothing else breaks.
 - **Linux**: ALSA for audio, plus the usual X11/Wayland + OpenGL bits that
   `eframe` needs. The folder picker uses the XDG desktop portal; if no portal is
-  available you can simply paste a path into the folder field and press **Scan**.
+  available you can simply paste a path into the folder field and press **Scan**
+  (or <kbd>Enter</kbd>). The field takes either a folder to index or a single
+  media file to add.
 
 ## Build & run
 
@@ -156,8 +158,11 @@ nova-cli play   <dir> [--index N] [--volume V] [--null] [--seconds S]
 
 ## Using the app
 
-1. Enter a music folder (or use **Browse…**) and press **Scan**. Progress shows
-   in the top bar; the result is cached.
+1. Enter a music folder (or use **Browse…**) and press **Scan** — or just press
+   <kbd>Enter</kbd> in the field. Point it at a folder and the tree is indexed;
+   point it at a **single file** and only that file is added to the library,
+   without walking its neighbours. Progress shows in the top bar; a folder scan
+   is cached.
 2. Pick a view in the sidebar: **Songs**, **Albums**, **Artists** or **Queue**.
 3. Click a track to play it. Right-click a track for *Play now* / *Play next*,
    or *Remove from queue* in the Queue view.
