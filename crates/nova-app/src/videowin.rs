@@ -100,6 +100,7 @@ impl VideoWindow {
         let Some(stdin) = self.stdin.as_mut() else {
             return;
         };
+        log::debug!("video window: {} streams", tracks.len());
         if let Err(err) = stdin.write_all(encode(tracks).as_bytes()) {
             // A dead child is normal, not an error worth logging every frame.
             log::debug!("video window is gone ({err})");

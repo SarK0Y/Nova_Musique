@@ -389,8 +389,8 @@ fn read_video_tracks(handle: *mut MpvHandle) -> Vec<VideoTrack> {
                         codec
                     }
                 });
-            // `id` is an integer in the node tree, but `video-track` wants the
-            // same id as text, so hand back its decimal form.
+            // `id` is an integer in the node tree; hand back its decimal
+            // form, which is what `vid` wants when switching streams.
             let Some(id) = map_get(entry, "id")
                 .and_then(node_int)
                 .map(|id| id.to_string())
@@ -848,6 +848,7 @@ fn control_loop(handle: &SharedHandle, state: &Mutex<State>) {
     let mut last_playlist_pos: i64 = -1;
     let mut last_video_id: i64 = -2;
     let mut refresh_tracks = true;
+    let mut next_track_read = Instant::now();
     loop {
         // Safe: `handle` outlives this thread — see `Drop for Mpv`.
         let read = |name: &str, format: c_int, slot: *mut c_void| unsafe {
@@ -907,6 +908,15 @@ fn control_loop(handle: &SharedHandle, state: &Mutex<State>) {
             if playlist_pos != last_playlist_pos || video_id != last_video_id {
                 last_playlist_pos = playlist_pos;
                 last_video_id = video_id;
+                refresh_tracks = true;
+            }
+            // Edges alone are not enough: the list is also re-read on a slow beat,
+            // so a read that lands mid-reload and comes back short or empty is
+            // corrected rather than cached for the rest of the file. Half a second
+            // is far below what a picker can show, and costs two tree reads a
+            // second instead of the twenty per tick this replaced.
+            if Instant::now() >= next_track_read {
+                next_track_read = Instant::now() + Duration::from_millis(500);
                 refresh_tracks = true;
             }
 
