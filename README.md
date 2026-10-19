@@ -221,6 +221,19 @@ centred. Press <kbd>Esc</kbd> to stop and get the library back. A file with more
 than one video stream can switch between them from the **Nova** menu's **Video**
 item, which opens the stream picker in its own process.
 
+That window also carries SMPlayer's **Mirror image** and **Flip image**
+toggles. SMPlayer implements both by asking mpv for the `hflip` and `vflip`
+lavfi filters (`MPVProcess::lavfi`); mpv has no property for either, but its
+`vf add` command puts them in the pipeline in the same place, so that is what
+Nova asks for.
+
+**Zoom** comes from the same submenu: `Zoom −`, **Reset** and `Zoom +`, stepping
+by 5% with a floor of 50%, and the percentage shown beside them. SMPlayer
+implements this by resizing its video widget and re-centring it — no mpv command
+involved — so Nova scales the picture it draws and lets the panel clip it.
+Nova adds a 4× ceiling that SMPlayer has no need for: the picture is drawn
+into a texture that size.
+
 There is no decoder in Nova. `crates/nova-app/src/mpv.rs` is a small hand-written
 libmpv binding: libmpv decodes, renders into an OpenGL texture that egui draws as
 an ordinary image, and drives the clock, so audio and video stay in step. Audio

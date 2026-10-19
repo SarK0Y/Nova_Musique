@@ -219,6 +219,10 @@ pub struct NovaApp {
     /// mpv as video filters rather than drawn flipped here.
     flip_x: bool,
     flip_y: bool,
+    /// SMPlayer's *Zoom*: how far past the size that fits the picture is drawn.
+    /// It scales the video widget and re-centres it, and nothing reaches mpv;
+    /// `video_view` does the same by drawing the image that much larger.
+    zoom: f32,
     /// That window's process, started on demand and killed when dropped.
     video_window: Option<videowin::VideoWindow>,
 }
@@ -290,9 +294,10 @@ impl NovaApp {
             cursor: std::cell::Cell::new(0),
             mpv,
             playlist_open: false,
-            video_open: std::env::var_os("NOVA_TEST_VIDEO").is_some(),
+            video_open: false,
             flip_x: false,
             flip_y: false,
+            zoom: 1.0,
             video_window: None,
         };
 
@@ -1442,7 +1447,9 @@ impl NovaApp {
             return;
         };
         let aspect = self.video_aspect();
-        let size = crate::mpv::fit(ui.available_size(), aspect);
+        // Zoom scales the picture past the panel, which clips it — the same
+        // effect SMPlayer gets by resizing its video widget and re-centring it.
+        let size = crate::mpv::fit(ui.available_size(), aspect) * self.zoom;
 
         ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
             // Render at the on-screen pixel size so the frame is decoded and
@@ -1552,7 +1559,7 @@ impl NovaApp {
         if let Some(mpv) = self.mpv.clone() {
             window.send_tracks(&mpv.video_tracks());
         }
-        window.send_flips(self.flip_x, self.flip_y);
+        window.send_state(self.flip_x, self.flip_y, self.zoom);
         let commands = window.commands();
 
         // The window's borrow ends with its last use above, so the app can be
@@ -1565,6 +1572,7 @@ impl NovaApp {
                         mpv.select_video_track(&id);
                     }
                 }
+                videowin::VideoCommand::Zoom(zoom) => self.zoom = zoom,
                 videowin::VideoCommand::Flip { x, y } => {
                     self.flip_x = x;
                     self.flip_y = y;

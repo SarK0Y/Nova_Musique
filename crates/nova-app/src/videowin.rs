@@ -19,6 +19,13 @@ use std::time::Duration;
 
 use crate::mpv::VideoTrack;
 
+/// SMPlayer's zoom step and floor, from its `mplayerwindow.h`.
+const ZOOM_STEP: f32 = 0.05;
+const ZOOM_MIN: f32 = 0.5;
+/// SMPlayer has no ceiling. One is needed here: the picture is drawn into a
+/// texture this big, so an unbounded zoom would ask for an unbounded one.
+const ZOOM_MAX: f32 = 4.0;
+
 /// The flag that turns this same binary into the picker window.
 pub const FLAG: &str = "--video-window";
 
@@ -34,8 +41,8 @@ pub struct VideoWindow {
     picks: Receiver<String>,
     /// What the child already knows, so the list is only sent when it changes.
     sent: Vec<VideoTrack>,
-    /// Same, for the mirror/flip state.
-    sent_flips: (bool, bool),
+    /// Same, for the mirror/flip/zoom state.
+    sent_state: (bool, bool, f32),
 }
 
 impl VideoWindow {
@@ -81,7 +88,7 @@ impl VideoWindow {
             stdin,
             picks,
             sent: Vec::new(),
-            sent_flips: (false, false),
+            sent_state: (false, false, 1.0),
         })
     }
 
@@ -114,15 +121,16 @@ impl VideoWindow {
     /// Tells the picker where the picture currently sits.
     ///
     /// Only sent when it changes, for the same reason the stream list is.
-    pub fn send_flips(&mut self, x: bool, y: bool) {
-        if (x, y) == self.sent_flips && self.stdin.is_some() {
+    pub fn send_state(&mut self, x: bool, y: bool, zoom: f32) {
+        let state = (x, y, zoom);
+        if state == self.sent_state && self.stdin.is_some() {
             return;
         }
-        self.sent_flips = (x, y);
+        self.sent_state = state;
         let Some(stdin) = self.stdin.as_mut() else {
             return;
         };
-        if let Err(err) = stdin.write_all(format!("flips {x} {y}\n").as_bytes()) {
+        if let Err(err) = stdin.write_all(format!("state {x} {y} {zoom}\n").as_bytes()) {
             log::debug!("video window is gone ({err})");
             self.stdin = None;
         }
@@ -154,6 +162,8 @@ pub enum VideoCommand {
     Pick(String),
     /// Mirror the picture left-right (`x`), flip it top-bottom (`y`).
     Flip { x: bool, y: bool },
+    /// Scale the picture by this factor; 1.0 is the size that fits.
+    Zoom(f32),
 }
 
 /// Reads one line from the picker. Anything unrecognised is ignored: this is a
@@ -162,6 +172,9 @@ pub enum VideoCommand {
 fn parse_command(line: &str) -> Option<VideoCommand> {
     if let Some(id) = line.strip_prefix("pick ") {
         return Some(VideoCommand::Pick(id.to_string()));
+    }
+    if let Some(zoom) = line.strip_prefix("zoom ") {
+        return Some(VideoCommand::Zoom(zoom.trim().parse().unwrap_or(1.0)));
     }
     let (x, y) = line.strip_prefix("flip ")?.split_once(' ')?;
     Some(VideoCommand::Flip {
@@ -262,6 +275,7 @@ pub fn run() -> eframe::Result<()> {
                 incoming,
                 flip_x: false,
                 flip_y: false,
+                zoom: 1.0,
                 rows: Vec::new(),
                 stdout: std::io::stdout(),
             }))
@@ -275,6 +289,8 @@ struct Picker {
     /// Whether the picture is mirrored left-right and flipped top-bottom.
     flip_x: bool,
     flip_y: bool,
+    /// How far the picture is scaled up from the size that fits.
+    zoom: f32,
     stdout: std::io::Stdout,
 }
 
@@ -283,12 +299,15 @@ impl Picker {
     fn drain(&mut self) {
         let lines = std::mem::take(&mut *self.incoming.lock().expect("poisoned"));
         for line in lines {
-            if let Some(state) = line.strip_prefix("flips ") {
-                let Some((x, y)) = state.split_once(' ') else {
+            if let Some(state) = line.strip_prefix("state ") {
+                let mut parts = state.split_whitespace();
+                let (Some(x), Some(y), Some(zoom)) = (parts.next(), parts.next(), parts.next())
+                else {
                     continue;
                 };
                 self.flip_x = x == "1";
                 self.flip_y = y == "1";
+                self.zoom = zoom.parse().unwrap_or(1.0);
                 continue;
             }
             decode(&mut self.rows, &line);
@@ -306,6 +325,11 @@ impl Picker {
     fn flip(&mut self) {
         let line = format!("flip {} {}", u8::from(self.flip_x), u8::from(self.flip_y));
         self.send(&line);
+    }
+
+    fn zoom_by(&mut self, step: f32) {
+        self.zoom = (self.zoom + step).clamp(ZOOM_MIN, ZOOM_MAX);
+        self.send(&format!("zoom {:.2}", self.zoom));
     }
 }
 
@@ -337,6 +361,22 @@ impl eframe::App for Picker {
                 self.flip_y = !self.flip_y;
                 self.flip();
             }
+        });
+        // SMPlayer's *Zoom*: stepping, and a way back to the size that fits. It
+        // scales the video widget and re-centres it; nothing goes to mpv, and
+        // neither does anything here.
+        ui.horizontal(|ui| {
+            if ui.button("Zoom \u{2212}").clicked() {
+                self.zoom_by(-ZOOM_STEP);
+            }
+            if ui.button("Reset").clicked() {
+                self.zoom = 1.0;
+                self.send("zoom 1.00");
+            }
+            if ui.button("Zoom +").clicked() {
+                self.zoom_by(ZOOM_STEP);
+            }
+            ui.label(format!("{:.0}%", self.zoom * 100.0));
         });
         ui.separator();
 
@@ -440,8 +480,15 @@ mod tests {
     }
 
     #[test]
+    fn zoom_comes_back_as_a_number() {
+        assert_eq!(parse_command("zoom 1.35"), Some(VideoCommand::Zoom(1.35)));
+        // A garbled zoom is a reset, not a crash.
+        assert_eq!(parse_command("zoom soon"), Some(VideoCommand::Zoom(1.0)));
+    }
+
+    #[test]
     fn rubbish_from_the_pipe_is_ignored() {
-        for line in ["", "pick", "flip", "flip x", "nonsense"] {
+        for line in ["", "pick", "flip", "flip x", "state", "nonsense"] {
             assert_eq!(parse_command(line), None, "{line:?} was not ignored");
         }
         let mut rows = Vec::new();
