@@ -28,6 +28,18 @@ const ZOOM_MAX: f32 = 4.0;
 /// SMPlayer's nudge step, `MplayerWindow::moveLayer(±16, ±16)`.
 const PAN_STEP: f32 = 16.0;
 
+/// SMPlayer's *Deinterlace* submenu (`basegui.cpp:1189-1194`), in its order.
+/// The index is what travels over the pipe, so the labels sit beside the wire
+/// and the filter each one means sits beside mpv, in `crate::mpv`.
+pub const DEINTERLACERS: [&str; 6] = [
+    "None",
+    "Lowpass5",
+    "Yadif (normal)",
+    "Yadif (double framerate)",
+    "Linear Blend",
+    "Kerndeint",
+];
+
 /// The flag that turns this same binary into the picker window.
 pub const FLAG: &str = "--video-window";
 
@@ -44,7 +56,7 @@ pub struct VideoWindow {
     /// What the child already knows, so the list is only sent when it changes.
     sent: Vec<VideoTrack>,
     /// Same, for the mirror/flip/zoom/pan/move-allowed state.
-    sent_state: (bool, bool, f32, eframe::egui::Vec2, bool),
+    sent_state: (bool, bool, f32, eframe::egui::Vec2, bool, usize),
 }
 
 impl VideoWindow {
@@ -90,7 +102,7 @@ impl VideoWindow {
             stdin,
             picks,
             sent: Vec::new(),
-            sent_state: (false, false, 1.0, eframe::egui::Vec2::ZERO, true),
+            sent_state: (false, false, 1.0, eframe::egui::Vec2::ZERO, true, 0),
         })
     }
 
@@ -130,8 +142,9 @@ impl VideoWindow {
         zoom: f32,
         pan: eframe::egui::Vec2,
         move_allowed: bool,
+        deinterlace: usize,
     ) {
-        let state = (x, y, zoom, pan, move_allowed);
+        let state = (x, y, zoom, pan, move_allowed, deinterlace);
         if state == self.sent_state && self.stdin.is_some() {
             return;
         }
@@ -140,10 +153,11 @@ impl VideoWindow {
             return;
         };
         let line = format!(
-            "state {x} {y} {zoom} {:.2} {:.2} {}\n",
+            "state {x} {y} {zoom} {:.2} {:.2} {} {}\n",
             pan.x,
             pan.y,
-            u8::from(move_allowed)
+            u8::from(move_allowed),
+            deinterlace
         );
         if let Err(err) = stdin.write_all(line.as_bytes()) {
             log::debug!("video window is gone ({err})");
@@ -183,17 +197,24 @@ pub enum VideoCommand {
     Pan(f32, f32),
     /// Whether the picture may be moved at all.
     MoveAllowed(bool),
+    /// Which of [`DEINTERLACERS`] should be on the filter chain.
+    Deinterlace(usize),
 }
 
-/// Reads one line from the picker. Anything unrecognised is ignored: this is a
-/// pipe, and a line that does not parse is not worth acting on. Both flags are
-/// read as "is it 1", so a garbled one counts as off rather than as an error.
-fn parse_command(line: &str) -> Option<VideoCommand> {
+/// Reads one line from the pipe, whether that is the picker's end or nova's
+/// own stdin. Anything unrecognised is ignored: this is a pipe, and a line
+/// that does not parse is not worth acting on. Both flags are read as "is it
+/// 1", so a garbled one counts as off rather than as an error.
+pub(crate) fn parse_command(line: &str) -> Option<VideoCommand> {
     if let Some(id) = line.strip_prefix("pick ") {
         return Some(VideoCommand::Pick(id.to_string()));
     }
     if let Some(flag) = line.strip_prefix("move ") {
         return Some(VideoCommand::MoveAllowed(flag.trim() == "1"));
+    }
+    if let Some(choice) = line.strip_prefix("deint ") {
+        let choice = choice.trim().parse::<usize>().ok()?;
+        return Some(VideoCommand::Deinterlace(choice));
     }
     if let Some(pan) = line.strip_prefix("pan ") {
         let (x, y) = pan.trim().split_once(' ')?;
@@ -307,6 +328,7 @@ pub fn run() -> eframe::Result<()> {
                 zoom: 1.0,
                 pan: eframe::egui::Vec2::ZERO,
                 allow_video_movement: true,
+                deinterlace: 0,
                 rows: Vec::new(),
                 stdout: std::io::stdout(),
             }))
@@ -326,6 +348,8 @@ struct Picker {
     pan: eframe::egui::Vec2,
     /// Whether the picture may be moved at all.
     allow_video_movement: bool,
+    /// Which of [`DEINTERLACERS`] is on the filter chain.
+    deinterlace: usize,
     stdout: std::io::Stdout,
 }
 
@@ -352,11 +376,18 @@ impl Picker {
                     Some(flag) => flag == "1",
                     None => self.allow_video_movement,
                 };
+                let deinterlace = parts
+                    .next()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|index| *index < DEINTERLACERS.len());
                 self.flip_x = x == "1";
                 self.flip_y = y == "1";
                 self.zoom = zoom.parse().unwrap_or(1.0);
                 self.pan = eframe::egui::vec2(pan_x, pan_y);
                 self.allow_video_movement = move_allowed;
+                if let Some(index) = deinterlace {
+                    self.deinterlace = index;
+                }
                 continue;
             }
             decode(&mut self.rows, &line);
@@ -415,6 +446,23 @@ impl eframe::App for Picker {
             if ui.selectable_label(self.flip_y, "Flip").clicked() {
                 self.flip_y = !self.flip_y;
                 self.flip();
+            }
+        });
+        // SMPlayer's *Deinterlace* submenu, as a picker over the same six
+        // choices. Choosing one replaces whatever was on the chain rather than
+        // adding to it, which is what `Core::changeDeinterlace` does for mpv.
+        ui.horizontal(|ui| {
+            ui.label("Deinterlace:");
+            let previous = self.deinterlace;
+            eframe::egui::ComboBox::from_id_salt("deinterlace")
+                .selected_text(DEINTERLACERS[self.deinterlace])
+                .show_ui(ui, |ui| {
+                    for (index, name) in DEINTERLACERS.iter().enumerate() {
+                        ui.selectable_value(&mut self.deinterlace, index, *name);
+                    }
+                });
+            if self.deinterlace != previous {
+                self.send(&format!("deint {}", self.deinterlace));
             }
         });
         // SMPlayer's *Zoom*: stepping, and a way back to the size that fits. It
@@ -543,15 +591,16 @@ mod tests {
     fn a_state_line_lands_field_by_field() {
         // The exact line `send_state` writes: x y zoom pan.x pan.y move.
         let mut picker = Picker {
-            incoming: Arc::new(Mutex::new(
-                vec!["state 1 0 1.50 -16.00 32.00 1".to_string()],
-            )),
+            incoming: Arc::new(Mutex::new(vec![
+                "state 1 0 1.50 -16.00 32.00 1 3".to_string()
+            ])),
             rows: Vec::new(),
             flip_x: false,
             flip_y: false,
             zoom: 1.0,
             pan: eframe::egui::Vec2::ZERO,
             allow_video_movement: false,
+            deinterlace: 0,
             stdout: std::io::stdout(),
         };
 
@@ -564,6 +613,15 @@ mod tests {
         // The flag is the last token. Read one place early it becomes pan.x == "1",
         // which is false for every real pan, so the checkbox always came back off.
         assert!(picker.allow_video_movement, "allow moving");
+        // Last token, and only accepted when it names a real choice.
+        assert_eq!(picker.deinterlace, 3, "deinterlace");
+    }
+
+    #[test]
+    fn a_deinterlace_choice_travels_as_an_index() {
+        assert_eq!(parse_command("deint 3"), Some(VideoCommand::Deinterlace(3)));
+        assert_eq!(parse_command("deint nope"), None);
+        assert_eq!(parse_command("deint"), None);
     }
 
     #[test]

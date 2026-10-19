@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText};
 use serde::{Deserialize, Serialize};
 
-use crate::mpv::{Mpv, VideoBackend};
+use crate::mpv::{deinterlace_filter, Mpv, VideoBackend};
 use crate::videowin;
 use nova_core::metadata;
 use nova_core::{AlbumKey, Library, PlaybackEngine, PlaybackState, ScanReport, Track, TrackId};
@@ -163,6 +163,59 @@ enum ScanMsg {
     Failed(String),
 }
 
+/// One line of the stdin remote control.
+///
+/// It speaks the picker's own wire language, so anything the video window can
+/// ask for can be asked for from a pipe, plus the transport a script needs to
+/// drive playback.
+#[derive(Debug)]
+enum RemoteCommand {
+    Action(Action),
+    Video(videowin::VideoCommand),
+}
+
+/// Reads commands from stdin, one per line, waking the frame for each one.
+///
+/// A paused window repaints only when something asks it to, and nothing that
+/// happens in a pipe reaches winit, so the wake-up has to come from here.
+/// A terminal's stdin is left alone on purpose: this app is run from a shell
+/// as often as from a launcher, and reading it would take those keystrokes.
+fn remote_reader(ctx: egui::Context) -> Option<Receiver<String>> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return None;
+    }
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+            ctx.request_repaint();
+        }
+    });
+    Some(rx)
+}
+
+/// Turns one stdin line into something to do. Anything unrecognised is
+/// ignored, the same way the picker's end of the pipe ignores it: this is a
+/// pipe, and a line that does not parse is not worth acting on.
+fn remote_command(line: &str) -> Option<RemoteCommand> {
+    let line = line.trim();
+    match line {
+        "toggle" => return Some(RemoteCommand::Action(Action::Toggle)),
+        "next" => return Some(RemoteCommand::Action(Action::Next)),
+        "prev" => return Some(RemoteCommand::Action(Action::Prev)),
+        _ => {}
+    }
+    if let Some(seconds) = line.strip_prefix("seek ") {
+        let seconds = seconds.trim().parse::<f32>().ok()?;
+        return Some(RemoteCommand::Action(Action::Seek(seconds)));
+    }
+    videowin::parse_command(line).map(RemoteCommand::Video)
+}
+
 // ---------------------------------------------------------------------------
 // Cover cache
 // ---------------------------------------------------------------------------
@@ -259,8 +312,13 @@ pub struct NovaApp {
     /// The buttons in the video window nudge it; dragging the picture does the
     /// same, which is the only way to move it that feels direct.
     pan: egui::Vec2,
+    /// Which of SMPlayer's *Deinterlace* choices is on the filter chain. The
+    /// picker's combo box shows this one and changes it.
+    deinterlace: usize,
     /// That window's process, started on demand and killed when dropped.
     video_window: Option<videowin::VideoWindow>,
+    /// Lines read from stdin, drained once per frame.
+    remote: Option<Receiver<String>>,
 }
 
 impl NovaApp {
@@ -340,7 +398,9 @@ impl NovaApp {
             flip_y: false,
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
+            deinterlace: 0,
             video_window: None,
+            remote: remote_reader(cc.egui_ctx.clone()),
         };
 
         // If a file was requested and the cache already knows it, play right away.
@@ -1604,6 +1664,26 @@ impl NovaApp {
         });
     }
 
+    /// Puts SMPlayer's chosen deinterlacer on mpv's filter chain, taking the
+    /// previous one off first. `Core::changeDeinterlace` does the same, and mpv
+    /// matches a removal against the whole parameterised filter, so the string
+    /// that went on comes back off unchanged.
+    fn set_deinterlace(&mut self, choice: usize) {
+        if choice >= videowin::DEINTERLACERS.len() || choice == self.deinterlace {
+            return;
+        }
+        if let Some(mpv) = self.mpv.clone() {
+            if let Some(previous) = deinterlace_filter(self.deinterlace) {
+                mpv.set_video_filter(previous, false);
+            }
+            if let Some(filter) = deinterlace_filter(choice) {
+                mpv.set_video_filter(filter, true);
+            }
+            log::debug!("deinterlace -> {}", videowin::DEINTERLACERS[choice]);
+        }
+        self.deinterlace = choice;
+    }
+
     /// Keeps the external video-stream picker in step with mpv.
     ///
     /// This is what SMPlayer calls *Video → Track*: a container carrying more
@@ -1644,30 +1724,53 @@ impl NovaApp {
             self.zoom,
             self.pan,
             allow_video_movement(),
+            self.deinterlace,
         );
         let commands = window.commands();
 
         // The window's borrow ends with its last use above, so the app can be
         // changed here.
         for command in commands {
-            match command {
-                videowin::VideoCommand::Pick(id) => {
-                    log::info!("video stream {id} selected");
-                    if let Some(mpv) = self.mpv.clone() {
-                        mpv.select_video_track(&id);
-                    }
+            self.apply_video_command(command);
+        }
+    }
+
+    /// Does what the video window asked for. Stdin speaks the same language,
+    /// so this is the one place that changes the picture from outside.
+    fn apply_video_command(&mut self, command: videowin::VideoCommand) {
+        match command {
+            videowin::VideoCommand::Pick(id) => {
+                log::info!("video stream {id} selected");
+                if let Some(mpv) = self.mpv.clone() {
+                    mpv.select_video_track(&id);
                 }
-                videowin::VideoCommand::Zoom(zoom) => self.zoom = zoom,
-                videowin::VideoCommand::Pan(x, y) => self.pan = egui::vec2(x, y),
-                videowin::VideoCommand::MoveAllowed(allowed) => set_allow_video_movement(allowed),
-                videowin::VideoCommand::Flip { x, y } => {
-                    self.flip_x = x;
-                    self.flip_y = y;
-                    if let Some(mpv) = self.mpv.clone() {
-                        mpv.set_video_filter("hflip", x);
-                        mpv.set_video_filter("vflip", y);
-                    }
+            }
+            videowin::VideoCommand::Zoom(zoom) => self.zoom = zoom,
+            videowin::VideoCommand::Pan(x, y) => self.pan = egui::vec2(x, y),
+            videowin::VideoCommand::MoveAllowed(allowed) => set_allow_video_movement(allowed),
+            videowin::VideoCommand::Deinterlace(choice) => self.set_deinterlace(choice),
+            videowin::VideoCommand::Flip { x, y } => {
+                self.flip_x = x;
+                self.flip_y = y;
+                if let Some(mpv) = self.mpv.clone() {
+                    mpv.set_video_filter("hflip", x);
+                    mpv.set_video_filter("vflip", y);
                 }
+            }
+        }
+    }
+
+    /// Applies whatever stdin asked for since the last frame.
+    fn remote_commands(&mut self, actions: &mut Vec<Action>) {
+        let lines: Vec<String> = match &self.remote {
+            Some(remote) => remote.try_iter().collect(),
+            None => return,
+        };
+        for line in lines {
+            match remote_command(&line) {
+                Some(RemoteCommand::Action(action)) => actions.push(action),
+                Some(RemoteCommand::Video(command)) => self.apply_video_command(command),
+                None => {}
             }
         }
     }
@@ -1689,6 +1792,7 @@ impl eframe::App for NovaApp {
         self.handle_drops(&ctx);
 
         let mut actions = Vec::new();
+        self.remote_commands(&mut actions);
 
         egui::Panel::top("top-bar").show(ui, |ui| {
             ui.add_space(4.0);
@@ -1743,6 +1847,13 @@ impl eframe::App for NovaApp {
         }
         if self.video_open {
             self.video_window();
+            // The picker is a separate process, so its clicks only reach us
+            // through the pipe read above, and only inside ui(). While the
+            // picture plays, the 100 ms clock below keeps ui() coming; paused
+            // with no pointer over this window nothing repaints and every
+            // click made in the picker waits there unread, so ask for frames
+            // ourselves for as long as it is open.
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
 
         drop_overlay(&ctx);
@@ -2089,6 +2200,40 @@ fn percent_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_remote_line_becomes_a_command() {
+        use videowin::VideoCommand;
+        // The picker's own wire language travels unchanged.
+        assert!(matches!(
+            remote_command("deint 2"),
+            Some(RemoteCommand::Video(VideoCommand::Deinterlace(2)))
+        ));
+        assert!(matches!(
+            remote_command("flip 1 0"),
+            Some(RemoteCommand::Video(VideoCommand::Flip {
+                x: true,
+                y: false
+            }))
+        ));
+        assert!(matches!(
+            remote_command("  zoom 1.5  "),
+            Some(RemoteCommand::Video(VideoCommand::Zoom(zoom))) if zoom == 1.5
+        ));
+        // Transport sits on top of it.
+        assert!(matches!(
+            remote_command("toggle"),
+            Some(RemoteCommand::Action(Action::Toggle))
+        ));
+        assert!(matches!(
+            remote_command("seek 900"),
+            Some(RemoteCommand::Action(Action::Seek(seconds))) if seconds == 900.0
+        ));
+        // Lines that mean nothing are ignored, not treated as errors.
+        assert!(remote_command("pause").is_none());
+        assert!(remote_command("seek now").is_none());
+        assert!(remote_command("").is_none());
+    }
 
     #[test]
     fn plain_paths_are_used_verbatim() {

@@ -814,6 +814,23 @@ impl Mpv {
     }
 }
 
+/// The lavfi filter behind each of SMPlayer's *Deinterlace* choices, indexed as
+/// `crate::videowin::DEINTERLACERS` lists them.
+///
+/// The mapping is SMPlayer's own (`mpvoptions.cpp:1494-1512`): `l5` and `lb`
+/// are postprocessing filters mpv no longer carries — a bare `lb` is refused —
+/// so it sends `yadif=mode=1` in their place. Index 0 is *None*, and anything
+/// unrecognised lands there too, which is how the chain gets cleared.
+pub fn deinterlace_filter(choice: usize) -> Option<&'static str> {
+    Some(match choice {
+        1 | 4 => "yadif=mode=1",
+        2 => "yadif=mode=send_frame",
+        3 => "yadif=mode=send_field",
+        5 => "kerndeint=5",
+        _ => return None,
+    })
+}
+
 impl Drop for Mpv {
     fn drop(&mut self) {
         // Shutting the core down would block until every client is gone, and
@@ -1209,5 +1226,25 @@ mod tests {
                 before
             );
         }
+    }
+
+    #[test]
+    fn every_deinterlace_choice_is_mapped_smplayers_way() {
+        use crate::videowin::DEINTERLACERS;
+        // Index 0 is *None* and the only choice that clears the chain, so two
+        // deinterlacers can never be stacked.
+        assert_eq!(deinterlace_filter(0), None);
+        for choice in 1..DEINTERLACERS.len() {
+            assert!(
+                deinterlace_filter(choice).is_some(),
+                "choice {choice} maps to nothing"
+            );
+        }
+        // A bare `lb` is refused by mpv, so Lowpass5 and Linear Blend both
+        // arrive as yadif — this is SMPlayer's own substitution.
+        assert_eq!(deinterlace_filter(1), Some("yadif=mode=1"));
+        assert_eq!(deinterlace_filter(4), Some("yadif=mode=1"));
+        assert_eq!(deinterlace_filter(3), Some("yadif=mode=send_field"));
+        assert_eq!(deinterlace_filter(5), Some("kerndeint=5"));
     }
 }

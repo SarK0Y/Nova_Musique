@@ -208,6 +208,17 @@ mpv. The two ends talk in plain lines over the picker's stdin and stdout — the
 parent sends the streams it read from mpv, the picker sends back the one picked —
 and the picker exits by itself if the main window goes away.
 
+The main window reads the same language from **its own stdin**, one command per
+line, which is how a script, a test or anything else that can write to a pipe
+drives the app without a pointer: `toggle`, `next`, `prev` and `seek <seconds>`
+for the transport, and everything the picker can say for the picture —
+`pick <id>`, `flip <x> <y>`, `zoom`, `pan`, `move <0|1>`, `deint <n>`. Lines
+that do not parse are ignored here just as they are at the picker's end. A
+terminal's stdin is deliberately left alone: run from a shell, nova keeps its
+own keystrokes; run from a launcher, stdin is empty and nothing happens. On a
+named pipe, keep a writer open (`exec 3> cmd`) so the commands do not stop
+after the first one.
+
 **Audio** does nothing yet and is shown greyed out.
 
 ### Video
@@ -226,6 +237,17 @@ toggles. SMPlayer implements both by asking mpv for the `hflip` and `vflip`
 lavfi filters (`MPVProcess::lavfi`); mpv has no property for either, but its
 `vf add` command puts them in the pipeline in the same place, so that is what
 Nova asks for.
+
+The **Deinterlace** box between them and **Zoom** is SMPlayer's
+*Video → Deinterlace* submenu: **None**, **Lowpass5**, **Yadif (normal)**,
+**Yadif (double framerate)**, **Linear Blend**, **Kerndeint**, in its order.
+SMPlayer changes it live rather than restarting playback
+(`Core::changeDeinterlace`): what is already on the chain comes off before the
+new filter goes on, and a removal is matched against the whole parameterised
+string. Its mapping is followed too — `l5` and `lb` are postprocessing filters
+mpv no longer carries and refuses by name, so both arrive as `yadif=mode=1`,
+exactly what `MPVProcess::lavfi` sends. The choice lasts for the session;
+SMPlayer stores `current_deinterlacer` in its settings and Nova does not.
 
 **Zoom** comes from the same submenu: `Zoom −`, **Reset** and `Zoom +`, stepping
 by 5% with a floor of 50%, and the percentage shown beside them. SMPlayer
