@@ -215,6 +215,10 @@ pub struct NovaApp {
     playlist_open: bool,
     /// External video window: picks which video stream mpv should show.
     video_open: bool,
+    /// SMPlayer's *Mirror image* (`hflip`) and *Flip image* (`vflip`), asked of
+    /// mpv as video filters rather than drawn flipped here.
+    flip_x: bool,
+    flip_y: bool,
     /// That window's process, started on demand and killed when dropped.
     video_window: Option<videowin::VideoWindow>,
 }
@@ -286,7 +290,9 @@ impl NovaApp {
             cursor: std::cell::Cell::new(0),
             mpv,
             playlist_open: false,
-            video_open: false,
+            video_open: std::env::var_os("NOVA_TEST_VIDEO").is_some(),
+            flip_x: false,
+            flip_y: false,
             video_window: None,
         };
 
@@ -1546,10 +1552,27 @@ impl NovaApp {
         if let Some(mpv) = self.mpv.clone() {
             window.send_tracks(&mpv.video_tracks());
         }
-        if let Some(id) = window.picked() {
-            if let Some(mpv) = self.mpv.clone() {
-                log::info!("video stream {id} selected");
-                mpv.select_video_track(&id);
+        window.send_flips(self.flip_x, self.flip_y);
+        let commands = window.commands();
+
+        // The window's borrow ends with its last use above, so the app can be
+        // changed here.
+        for command in commands {
+            match command {
+                videowin::VideoCommand::Pick(id) => {
+                    log::info!("video stream {id} selected");
+                    if let Some(mpv) = self.mpv.clone() {
+                        mpv.select_video_track(&id);
+                    }
+                }
+                videowin::VideoCommand::Flip { x, y } => {
+                    self.flip_x = x;
+                    self.flip_y = y;
+                    if let Some(mpv) = self.mpv.clone() {
+                        mpv.set_video_filter("hflip", x);
+                        mpv.set_video_filter("vflip", y);
+                    }
+                }
             }
         }
     }

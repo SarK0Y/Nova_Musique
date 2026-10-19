@@ -715,6 +715,16 @@ impl Mpv {
         self.set_number("volume", level as f64);
     }
 
+    /// Turns one of mpv's video filters on or off.
+    ///
+    /// This is how SMPlayer does *Flip image* and *Mirror image*: it asks mpv for
+    /// the `vflip` and `hflip` lavfi filters. mpv 0.33 has no property for
+    /// either, but the `vf` command puts them in the same place in the pipeline
+    /// SMPlayer's `addVF` did.
+    pub fn set_video_filter(&self, filter: &str, on: bool) {
+        self.command(&["vf", if on { "add" } else { "remove" }, filter]);
+    }
+
     /// Playback position, or zero when nothing is loaded yet.
     pub fn position(&self) -> Duration {
         self.read(|state| state.position)

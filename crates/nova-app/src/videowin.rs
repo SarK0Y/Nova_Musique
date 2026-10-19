@@ -34,6 +34,8 @@ pub struct VideoWindow {
     picks: Receiver<String>,
     /// What the child already knows, so the list is only sent when it changes.
     sent: Vec<VideoTrack>,
+    /// Same, for the mirror/flip state.
+    sent_flips: (bool, bool),
 }
 
 impl VideoWindow {
@@ -79,6 +81,7 @@ impl VideoWindow {
             stdin,
             picks,
             sent: Vec::new(),
+            sent_flips: (false, false),
         })
     }
 
@@ -108,18 +111,30 @@ impl VideoWindow {
         }
     }
 
-    /// The stream picked since the last call, if any.
-    pub fn picked(&mut self) -> Option<String> {
-        let mut picked = None;
+    /// Tells the picker where the picture currently sits.
+    ///
+    /// Only sent when it changes, for the same reason the stream list is.
+    pub fn send_flips(&mut self, x: bool, y: bool) {
+        if (x, y) == self.sent_flips && self.stdin.is_some() {
+            return;
+        }
+        self.sent_flips = (x, y);
+        let Some(stdin) = self.stdin.as_mut() else {
+            return;
+        };
+        if let Err(err) = stdin.write_all(format!("flips {x} {y}\n").as_bytes()) {
+            log::debug!("video window is gone ({err})");
+            self.stdin = None;
+        }
+    }
+
+    /// Everything the picker asked for since the last call.
+    pub fn commands(&mut self) -> Vec<VideoCommand> {
+        let mut commands = Vec::new();
         loop {
             match self.picks.try_recv() {
-                Ok(line) => {
-                    if let Some(id) = line.strip_prefix("pick ") {
-                        picked = Some(id.to_string());
-                    }
-                }
-                Err(TryRecvError::Empty) => return picked,
-                Err(TryRecvError::Disconnected) => return picked,
+                Ok(line) => commands.extend(parse_command(&line)),
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => return commands,
             }
         }
     }
@@ -130,6 +145,29 @@ impl Drop for VideoWindow {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Something the picker asked the main window to do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VideoCommand {
+    /// Show the video stream with this track id.
+    Pick(String),
+    /// Mirror the picture left-right (`x`), flip it top-bottom (`y`).
+    Flip { x: bool, y: bool },
+}
+
+/// Reads one line from the picker. Anything unrecognised is ignored: this is a
+/// pipe, and a line that does not parse is not worth acting on. Both flags are
+/// read as "is it 1", so a garbled one counts as off rather than as an error.
+fn parse_command(line: &str) -> Option<VideoCommand> {
+    if let Some(id) = line.strip_prefix("pick ") {
+        return Some(VideoCommand::Pick(id.to_string()));
+    }
+    let (x, y) = line.strip_prefix("flip ")?.split_once(' ')?;
+    Some(VideoCommand::Flip {
+        x: x == "1",
+        y: y == "1",
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +260,8 @@ pub fn run() -> eframe::Result<()> {
         Box::new(|_cc| {
             Ok(Box::new(Picker {
                 incoming,
+                flip_x: false,
+                flip_y: false,
                 rows: Vec::new(),
                 stdout: std::io::stdout(),
             }))
@@ -232,6 +272,9 @@ pub fn run() -> eframe::Result<()> {
 struct Picker {
     incoming: Arc<Mutex<Vec<String>>>,
     rows: Vec<Row>,
+    /// Whether the picture is mirrored left-right and flipped top-bottom.
+    flip_x: bool,
+    flip_y: bool,
     stdout: std::io::Stdout,
 }
 
@@ -240,16 +283,29 @@ impl Picker {
     fn drain(&mut self) {
         let lines = std::mem::take(&mut *self.incoming.lock().expect("poisoned"));
         for line in lines {
+            if let Some(state) = line.strip_prefix("flips ") {
+                let Some((x, y)) = state.split_once(' ') else {
+                    continue;
+                };
+                self.flip_x = x == "1";
+                self.flip_y = y == "1";
+                continue;
+            }
             decode(&mut self.rows, &line);
         }
     }
 
-    fn pick(&mut self, id: &str) {
+    fn send(&mut self, line: &str) {
         let mut out = &self.stdout;
-        if writeln!(out, "pick {id}").is_err() {
-            // The parent is gone, so there is nothing left to choose for.
+        if writeln!(out, "{line}").is_err() {
+            // The parent is gone, so there is nothing left to control.
             std::process::exit(0);
         }
+    }
+
+    fn flip(&mut self) {
+        let line = format!("flip {} {}", u8::from(self.flip_x), u8::from(self.flip_y));
+        self.send(&line);
     }
 }
 
@@ -268,6 +324,22 @@ impl eframe::App for Picker {
         self.drain();
 
         ui.heading("Video");
+
+        // SMPlayer's *Mirror image* and *Flip image*. There it asks for the
+        // `hflip` and `vflip` lavfi filters; mpv has no property for either, but
+        // the `vf` command puts them in the pipeline exactly the same way.
+        ui.horizontal(|ui| {
+            if ui.selectable_label(self.flip_x, "Mirror").clicked() {
+                self.flip_x = !self.flip_x;
+                self.flip();
+            }
+            if ui.selectable_label(self.flip_y, "Flip").clicked() {
+                self.flip_y = !self.flip_y;
+                self.flip();
+            }
+        });
+        ui.separator();
+
         if self.rows.is_empty() {
             // Same wording as SMPlayer's empty track list.
             ui.add_enabled(false, eframe::egui::Button::new("<empty>"));
@@ -286,7 +358,7 @@ impl eframe::App for Picker {
             let clicked = ui.selectable_label(row.selected, label).clicked();
             if clicked && !row.selected {
                 let id = self.rows[i].id.clone();
-                self.pick(&id);
+                self.send(&format!("pick {id}"));
             }
         }
     }
@@ -352,7 +424,26 @@ mod tests {
     }
 
     #[test]
+    fn commands_from_the_picker_are_read() {
+        assert_eq!(
+            parse_command("pick 2"),
+            Some(VideoCommand::Pick("2".to_string()))
+        );
+        assert_eq!(
+            parse_command("flip 1 0"),
+            Some(VideoCommand::Flip { x: true, y: false })
+        );
+        assert_eq!(
+            parse_command("flip 1 1"),
+            Some(VideoCommand::Flip { x: true, y: true })
+        );
+    }
+
+    #[test]
     fn rubbish_from_the_pipe_is_ignored() {
+        for line in ["", "pick", "flip", "flip x", "nonsense"] {
+            assert_eq!(parse_command(line), None, "{line:?} was not ignored");
+        }
         let mut rows = Vec::new();
         for line in ["", "pick 2", "no tabs here", "tracks not a number"] {
             decode(&mut rows, line);
