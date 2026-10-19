@@ -172,6 +172,10 @@ enum ScanMsg {
 enum RemoteCommand {
     Action(Action),
     Video(videowin::VideoCommand),
+    /// Start this file the way the command line would.
+    Play(PathBuf),
+    /// Open or close the video-stream picker window.
+    Picker(bool),
 }
 
 /// Reads commands from stdin, one per line, waking the frame for each one.
@@ -212,6 +216,22 @@ fn remote_command(line: &str) -> Option<RemoteCommand> {
     if let Some(seconds) = line.strip_prefix("seek ") {
         let seconds = seconds.trim().parse::<f32>().ok()?;
         return Some(RemoteCommand::Action(Action::Seek(seconds)));
+    }
+    if let Some(volume) = line.strip_prefix("volume ") {
+        // Stays inside what the volume slider can set, so a stray number
+        // cannot be saved to the config as something the UI would not offer.
+        let volume = volume.trim().parse::<f32>().ok()?.clamp(0.0, 1.0);
+        return Some(RemoteCommand::Action(Action::SetVolume(volume)));
+    }
+    if let Some(flag) = line.strip_prefix("picker ") {
+        return Some(RemoteCommand::Picker(flag.trim() == "1"));
+    }
+    if let Some(path) = line.strip_prefix("play ") {
+        let path = path.trim();
+        if path.is_empty() {
+            return None;
+        }
+        return Some(RemoteCommand::Play(PathBuf::from(path)));
     }
     videowin::parse_command(line).map(RemoteCommand::Video)
 }
@@ -1770,6 +1790,19 @@ impl NovaApp {
             match remote_command(&line) {
                 Some(RemoteCommand::Action(action)) => actions.push(action),
                 Some(RemoteCommand::Video(command)) => self.apply_video_command(command),
+                Some(RemoteCommand::Play(path)) => {
+                    if !self.play_path(&path) {
+                        self.toast(format!("{} is not in the library", path.display()));
+                    }
+                }
+                Some(RemoteCommand::Picker(open)) => {
+                    self.video_open = open;
+                    if !open {
+                        // Dropping it kills the child, which is what closing
+                        // the window does.
+                        self.video_window = None;
+                    }
+                }
                 None => {}
             }
         }
@@ -2229,9 +2262,33 @@ mod tests {
             remote_command("seek 900"),
             Some(RemoteCommand::Action(Action::Seek(seconds))) if seconds == 900.0
         ));
+        assert!(matches!(
+            remote_command("volume 0.5"),
+            Some(RemoteCommand::Action(Action::SetVolume(volume))) if volume == 0.5
+        ));
+        // Volume stays inside the slider's range, so nothing outside what the
+        // UI can set is ever written to the config.
+        assert!(matches!(
+            remote_command("volume 9"),
+            Some(RemoteCommand::Action(Action::SetVolume(volume))) if volume == 1.0
+        ));
+        assert!(matches!(
+            remote_command("play /tmp/a.mp3"),
+            Some(RemoteCommand::Play(path)) if path == PathBuf::from("/tmp/a.mp3")
+        ));
+        assert!(matches!(
+            remote_command("picker 1"),
+            Some(RemoteCommand::Picker(true))
+        ));
+        assert!(matches!(
+            remote_command("  picker 0"),
+            Some(RemoteCommand::Picker(false))
+        ));
         // Lines that mean nothing are ignored, not treated as errors.
         assert!(remote_command("pause").is_none());
         assert!(remote_command("seek now").is_none());
+        assert!(remote_command("play").is_none());
+        assert!(remote_command("play ").is_none());
         assert!(remote_command("").is_none());
     }
 

@@ -210,14 +210,55 @@ and the picker exits by itself if the main window goes away.
 
 The main window reads the same language from **its own stdin**, one command per
 line, which is how a script, a test or anything else that can write to a pipe
-drives the app without a pointer: `toggle`, `next`, `prev` and `seek <seconds>`
-for the transport, and everything the picker can say for the picture —
-`pick <id>`, `flip <x> <y>`, `zoom`, `pan`, `move <0|1>`, `deint <n>`. Lines
-that do not parse are ignored here just as they are at the picker's end. A
-terminal's stdin is deliberately left alone: run from a shell, nova keeps its
-own keystrokes; run from a launcher, stdin is empty and nothing happens. On a
-named pipe, keep a writer open (`exec 3> cmd`) so the commands do not stop
-after the first one.
+drives the app without a pointer:
+
+| Command | What it does |
+| --- | --- |
+| `toggle` | Pause or resume |
+| `next` / `prev` | Skip to the next or previous track |
+| `seek <seconds>` | Jump there in the current track |
+| `volume <0.0-1.0>` | Set the volume — the same numbers the slider uses |
+| `play <path>` | Start that file, as the command line would |
+| `picker <0\|1>` | Open or close the video-stream picker window |
+| `pick <id>` | Show another video stream, from the list the picker shows |
+| `flip <x> <y>` | Mirror left-right, flip top-bottom |
+| `zoom <n>` / `pan <x> <y>` / `move <0\|1>` | Picture size and position — what the picker's buttons do |
+| `deint <n>` | Which deinterlacer is on the filter chain |
+
+Lines that do not parse are ignored here just as they are at the picker's end,
+and `play` starts only files the library already knows: anything else gets a
+toast saying so while playback carries on. A terminal's stdin is deliberately
+left alone: run from a shell, nova keeps its own keystrokes; run from a
+launcher, stdin is empty and nothing happens.
+
+Starting nova with stdin on a named pipe leaves that channel open for as long
+as it runs. A writer has to stay on the other end — a pipe reports end-of-file
+when its last writer closes, so without one only the first command ever
+arrives:
+
+```sh
+mkfifo /tmp/nova.cmd
+sleep infinity > /tmp/nova.cmd &                 # a writer that never writes
+nova /tmp/videos/cut.mkv < /tmp/nova.cmd > /tmp/nova.log 2>&1 &
+```
+
+and then from any terminal, at any time, while it plays or sits paused:
+
+```sh
+echo "toggle"   > /tmp/nova.cmd                 # pause or resume
+echo "seek 900" > /tmp/nova.cmd                 # jump to 15:00
+echo "volume 0.3" > /tmp/nova.cmd               # quieter
+echo "flip 1 0" > /tmp/nova.cmd                 # mirror, then "flip 0 0" back
+echo "deint 3"  > /tmp/nova.cmd                 # Yadif (double framerate)
+echo "picker 1" > /tmp/nova.cmd                 # open the picker, "picker 0" closes it
+echo "play /tmp/videos/interlaced.mkv" > /tmp/nova.cmd
+{ echo "seek 0"; echo "toggle"; echo "deint 2"; } > /tmp/nova.cmd
+```
+
+`deint <n>` counts the **Deinterlace** box top-down: 0 None, 1 Lowpass5,
+2 Yadif (normal), 3 Yadif (double framerate), 4 Linear Blend, 5 Kerndeint.
+Anything that keeps the write end open works instead of `sleep infinity` —
+a shell left open with `exec 3> /tmp/nova.cmd`, a `coproc`, a socket bridge.
 
 **Audio** does nothing yet and is shown greyed out.
 
