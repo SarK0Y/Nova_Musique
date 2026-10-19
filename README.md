@@ -257,8 +257,57 @@ echo "play /tmp/videos/interlaced.mkv" > /tmp/nova.cmd
 
 `deint <n>` counts the **Deinterlace** box top-down: 0 None, 1 Lowpass5,
 2 Yadif (normal), 3 Yadif (double framerate), 4 Linear Blend, 5 Kerndeint.
-Anything that keeps the write end open works instead of `sleep infinity` —
-a shell left open with `exec 3> /tmp/nova.cmd`, a `coproc`, a socket bridge.
+
+`sleep infinity` is only one way to hold that write end. The rule it satisfies
+is that **a pipe reports end-of-file when its last writer closes**: nova reads
+stdin in a thread, and that reading loop stops at EOF. The failure is silent —
+the window keeps running and the pipe still accepts a write, so a later
+`echo "toggle" > /tmp/nova.cmd` succeeds and the line simply sits in the buffer
+with nobody left to read it. Exactly one writer has to outlive every command,
+and how to get one depends on who is driving.
+
+**A shell left open**, for a human poking at it by hand:
+
+```sh
+exec 3> /tmp/nova.cmd          # open the pipe as fd 3 of this shell, for good
+echo "toggle" >&3              # every later command here writes through it
+echo "seek 900" >&3
+exec 3>&-                      # done: closes the end, nova sees EOF
+```
+
+`exec` without a command edits the shell's own fd table, so fd 3 outlives each
+`echo` instead of opening and closing per command. Opening a named pipe for
+writing blocks until a reader exists, so nova has to be running with stdin on
+that pipe first — otherwise the shell hangs right there in the `exec`. Leaving
+the shell closes the end.
+
+**A `coproc`**, for one script that both starts the app and steers it (bash or
+ksh, not POSIX `sh`):
+
+```sh
+coproc NOVA { nova /tmp/videos/cut.mkv 2>/tmp/nova.log; }
+echo "toggle"  >&"${NOVA[1]}"   # write end
+echo "deint 2" >&"${NOVA[1]}"
+```
+
+The shell holds both ends of the pair it made, so nothing reaches EOF while
+the script lives: no named pipe, no holder process. `"${NOVA[0]}"` is the read
+end, if nova ever has something to say back, and script and app go down
+together.
+
+**A socket**, for senders that are not descendants of the launcher — another
+program, a systemd unit, another machine:
+
+```sh
+socat UNIX-LISTEN:/tmp/nova.sock,fork - > /tmp/nova.cmd &   # bridge onto the pipe
+echo "toggle" | socat - UNIX-CONNECT:/tmp/nova.sock        # from anywhere
+```
+
+A named pipe is local and unidirectional: only whoever can open that path can
+write, and only while the holder is alive. Replacing `UNIX-LISTEN` with
+`TCP-LISTEN:9999` puts it on the network, which also means anyone who can
+reach that port controls playback — keep it on localhost or a trusted
+interface.
 
 **Audio** does nothing yet and is shown greyed out.
 
