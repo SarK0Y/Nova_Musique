@@ -176,6 +176,8 @@ enum RemoteCommand {
     Play(PathBuf),
     /// Open or close the video-stream picker window.
     Picker(bool),
+    /// Open or close the playlist window.
+    Playlist(bool),
 }
 
 /// Reads commands from stdin, one per line, waking the frame for each one.
@@ -225,6 +227,9 @@ fn remote_command(line: &str) -> Option<RemoteCommand> {
     }
     if let Some(flag) = line.strip_prefix("picker ") {
         return Some(RemoteCommand::Picker(flag.trim() == "1"));
+    }
+    if let Some(flag) = line.strip_prefix("playlist ") {
+        return Some(RemoteCommand::Playlist(flag.trim() == "1"));
     }
     if let Some(path) = line.strip_prefix("play ") {
         let path = path.trim();
@@ -1220,7 +1225,9 @@ impl NovaApp {
                 ),
             );
 
-            if index == cursor && !ui.clip_rect().contains_rect(response.rect) {
+            // Same rule as queue_view: follow the cursor only on the frames
+            // the arrow keys move it, or the wheel scroll gets yanked back.
+            if index == cursor && (down || up) && !ui.clip_rect().contains_rect(response.rect) {
                 response.scroll_to_me(Some(Align::Center));
             }
             if response.clicked() {
@@ -1416,7 +1423,11 @@ impl NovaApp {
                             .size(14.0),
                     ),
                 );
-                if index == cursor && !ui.clip_rect().contains_rect(response.rect) {
+                // Follow the cursor only on the frames the arrow keys move
+                // it. Doing this whenever the row merely sits partly outside
+                // the view yanks the list back over any wheel or scrollbar
+                // scroll, which looks like a list that will not move.
+                if index == cursor && (down || up) && !ui.clip_rect().contains_rect(response.rect) {
                     response.scroll_to_me(Some(Align::Center));
                 }
                 if response.clicked() {
@@ -1803,6 +1814,7 @@ impl NovaApp {
                         self.video_window = None;
                     }
                 }
+                Some(RemoteCommand::Playlist(open)) => self.playlist_open = open,
                 None => {}
             }
         }
@@ -2283,6 +2295,10 @@ mod tests {
         assert!(matches!(
             remote_command("  picker 0"),
             Some(RemoteCommand::Picker(false))
+        ));
+        assert!(matches!(
+            remote_command("playlist 1"),
+            Some(RemoteCommand::Playlist(true))
         ));
         // Lines that mean nothing are ignored, not treated as errors.
         assert!(remote_command("pause").is_none());

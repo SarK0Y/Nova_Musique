@@ -220,6 +220,7 @@ drives the app without a pointer:
 | `volume <0.0-1.0>` | Set the volume — the same numbers the slider uses |
 | `play <path>` | Start that file, as the command line would |
 | `picker <0\|1>` | Open or close the video-stream picker window |
+| `playlist <0\|1>` | Open or close the playlist window |
 | `pick <id>` | Show another video stream, from the list the picker shows |
 | `flip <x> <y>` | Mirror left-right, flip top-bottom |
 | `zoom <n>` / `pan <x> <y>` / `move <0\|1>` | Picture size and position — what the picker's buttons do |
@@ -251,6 +252,7 @@ echo "volume 0.3" > /tmp/nova.cmd               # quieter
 echo "flip 1 0" > /tmp/nova.cmd                 # mirror, then "flip 0 0" back
 echo "deint 3"  > /tmp/nova.cmd                 # Yadif (double framerate)
 echo "picker 1" > /tmp/nova.cmd                 # open the picker, "picker 0" closes it
+echo "playlist 1" > /tmp/nova.cmd               # the playlist window, same idea
 echo "play /tmp/videos/interlaced.mkv" > /tmp/nova.cmd
 { echo "seek 0"; echo "toggle"; echo "deint 2"; } > /tmp/nova.cmd
 ```
