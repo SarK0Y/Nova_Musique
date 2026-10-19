@@ -234,6 +234,26 @@ involved — so Nova scales the picture it draws and lets the panel clip it.
 Nova adds a 4× ceiling that SMPlayer has no need for: the picture is drawn
 into a texture that size.
 
+**Left** / **Right** / **Up** / **Down** / **Centre** are SMPlayer's *Move left*,
+*Move right*, *Move up*, *Move down* from the same submenu. It nudges its video
+widget 16 pixels at a time and refuses to push it out of sight;
+`MplayerWindow::moveLeft` tests the edge before it moves. Nova draws the picture
+that much further off centre and clamps it to the panel, so panning does nothing
+until you have zoomed in — the same as SMPlayer's default, where its
+`allow_video_movement` preference is off. Dragging the picture does the same
+thing by hand: it is only offered once there is somewhere left to pan to, and the
+picker is told about it so its buttons keep working from wherever you left it.
+
+The checkbox **Allow moving the video** in the picker is SMPlayer's
+`allow_video_movement` itself, on by default here rather than off. With it off,
+the picture can only be moved while it reaches past the panel, exactly as
+SMPlayer gates it; with it on, it can be pushed around freely but never leaves
+the panel.
+
+It is kept as a process-wide variable seeded from `config.json` rather than a
+field on the app, so it outlives the window: unchecking it, quitting, and
+reopening leaves it unchecked.
+
 There is no decoder in Nova. `crates/nova-app/src/mpv.rs` is a small hand-written
 libmpv binding: libmpv decodes, renders into an OpenGL texture that egui draws as
 an ordinary image, and drives the clock, so audio and video stay in step. Audio

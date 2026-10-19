@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText};
@@ -31,10 +32,39 @@ struct Config {
     music_dir: Option<PathBuf>,
     #[serde(default = "default_volume")]
     volume: f32,
+    #[serde(default = "default_allow_video_movement")]
+    allow_video_movement: bool,
 }
 
 fn default_volume() -> f32 {
     0.8
+}
+
+fn default_allow_video_movement() -> bool {
+    true
+}
+
+/// SMPlayer's `allow_video_movement`, held as a process-wide variable.
+///
+/// A field on `NovaApp` would be rebuilt on every launch, so the checkbox always
+/// came back on. Behind a global that is seeded from [`Config`] on startup and
+/// written back when it changes, it outlives the window and the child process
+/// that asks about it — a setting, not a bit of UI state.
+static ALLOW_VIDEO_MOVEMENT: RwLock<bool> = RwLock::new(true);
+
+pub fn allow_video_movement() -> bool {
+    *ALLOW_VIDEO_MOVEMENT
+        .read()
+        .unwrap_or_else(|err| err.into_inner())
+}
+
+pub fn set_allow_video_movement(allowed: bool) {
+    *ALLOW_VIDEO_MOVEMENT
+        .write()
+        .unwrap_or_else(|err| err.into_inner()) = allowed;
+    let mut config = Config::load();
+    config.allow_video_movement = allowed;
+    config.save();
 }
 
 impl Default for Config {
@@ -42,6 +72,7 @@ impl Default for Config {
         Config {
             music_dir: None,
             volume: default_volume(),
+            allow_video_movement: default_allow_video_movement(),
         }
     }
 }
@@ -223,6 +254,11 @@ pub struct NovaApp {
     /// It scales the video widget and re-centres it, and nothing reaches mpv;
     /// `video_view` does the same by drawing the image that much larger.
     zoom: f32,
+    /// SMPlayer's *Move left/right/up/down*: how far the picture is nudged off
+    /// centre, in points, with +y running down like every other coordinate.
+    /// The buttons in the video window nudge it; dragging the picture does the
+    /// same, which is the only way to move it that feels direct.
+    pan: egui::Vec2,
     /// That window's process, started on demand and killed when dropped.
     video_window: Option<videowin::VideoWindow>,
 }
@@ -240,6 +276,11 @@ impl NovaApp {
         });
 
         let config = Config::load();
+        // Seed the global from the stored setting, so the value the UI acts on
+        // is the one the last session left behind.
+        *ALLOW_VIDEO_MOVEMENT
+            .write()
+            .unwrap_or_else(|err| err.into_inner()) = config.allow_video_movement;
 
         // An optional command-line target: a file, a folder, or a `file://` URL.
         // Pointing at a file scans its folder and starts playing that track.
@@ -294,10 +335,11 @@ impl NovaApp {
             cursor: std::cell::Cell::new(0),
             mpv,
             playlist_open: false,
-            video_open: false,
+            video_open: std::env::var_os("NOVA_TEST_VIDEO").is_some(),
             flip_x: false,
             flip_y: false,
             zoom: 1.0,
+            pan: egui::Vec2::ZERO,
             video_window: None,
         };
 
@@ -623,6 +665,9 @@ impl NovaApp {
                     self.scan_rx = None;
                     self.scan_status = None;
                     self.config.music_dir = self.music_dir.clone();
+                    // Loaded at startup, so it would write back the old value
+                    // and undo any toggle since.
+                    self.config.allow_video_movement = allow_video_movement();
                     self.config.save();
                     if let Some(path) = cache_file() {
                         if let Err(err) = self.library.save_cache(&path) {
@@ -847,6 +892,7 @@ impl NovaApp {
                 Action::SetVolume(volume) => {
                     self.engine.set_volume(volume);
                     self.config.volume = volume;
+                    self.config.allow_video_movement = allow_video_movement();
                     self.config.save();
                 }
                 Action::ToggleShuffle => self.engine.queue_mut().toggle_shuffle(),
@@ -1442,25 +1488,58 @@ impl NovaApp {
     ///
     /// The sidebar is hidden while this runs, so the surface spans the full
     /// width under the top bar.
-    fn video_view(&self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    fn video_view(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let Some(mpv) = self.mpv.clone() else {
             return;
         };
         let aspect = self.video_aspect();
+        let panel = ui.max_rect();
         // Zoom scales the picture past the panel, which clips it — the same
         // effect SMPlayer gets by resizing its video widget and re-centring it.
-        let size = crate::mpv::fit(ui.available_size(), aspect) * self.zoom;
+        let size = crate::mpv::fit(panel.size(), aspect) * self.zoom;
 
-        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-            // Render at the on-screen pixel size so the frame is decoded and
-            // scaled exactly once, at the size it is displayed.
-            let pixels = size * ui.ctx().pixels_per_point();
-            if let Some(texture) = mpv.texture(frame, pixels, aspect) {
-                ui.image(egui::load::SizedTexture::new(texture, size));
-            } else {
+        // How far the picture's centre may travel. SMPlayer gates this on
+        // `allow_video_movement`: with it off, the picture can only be moved
+        // while it reaches past the window, and with it on it can be pushed
+        // around freely. The picture never leaves the panel either way, so it
+        // cannot be lost.
+        let limit = if allow_video_movement() {
+            panel.size() / 2.0
+        } else {
+            egui::vec2(
+                (size.x - panel.width()).max(0.0) / 2.0,
+                (size.y - panel.height()).max(0.0) / 2.0,
+            )
+        };
+        let pan = egui::vec2(
+            self.pan.x.clamp(-limit.x, limit.x),
+            self.pan.y.clamp(-limit.y, limit.y),
+        );
+        let rect = egui::Rect::from_center_size(panel.center() + pan, size);
+
+        // Dragging the picture moves it with the cursor, the same way moving the
+        // video widget by hand does in SMPlayer. It answers to the checkbox:
+        // unchecked, the picture stays where the buttons left it and a drag
+        // writes nothing, so there is no way past the block by hand.
+        if allow_video_movement() {
+            let drag = ui.interact(rect, ui.id().with("video-pan"), egui::Sense::drag());
+            if drag.dragged() {
+                self.pan += drag.drag_delta();
+            }
+        }
+
+        // Render at the on-screen pixel size so the frame is decoded and scaled
+        // exactly once, at the size it is displayed.
+        let pixels = size * ui.ctx().pixels_per_point();
+        match mpv.texture(frame, pixels, aspect) {
+            Some(texture) => {
+                let sized = egui::load::SizedTexture::new(texture, size);
+                egui::Image::new(sized).paint_at(ui, rect);
+            }
+            None => {
                 ui.colored_label(Color32::RED, "video could not be started");
             }
-        });
+        }
     }
 
     /// Render the playlist in its own native OS viewport, separate from the main window.
@@ -1559,7 +1638,13 @@ impl NovaApp {
         if let Some(mpv) = self.mpv.clone() {
             window.send_tracks(&mpv.video_tracks());
         }
-        window.send_state(self.flip_x, self.flip_y, self.zoom);
+        window.send_state(
+            self.flip_x,
+            self.flip_y,
+            self.zoom,
+            self.pan,
+            allow_video_movement(),
+        );
         let commands = window.commands();
 
         // The window's borrow ends with its last use above, so the app can be
@@ -1573,6 +1658,8 @@ impl NovaApp {
                     }
                 }
                 videowin::VideoCommand::Zoom(zoom) => self.zoom = zoom,
+                videowin::VideoCommand::Pan(x, y) => self.pan = egui::vec2(x, y),
+                videowin::VideoCommand::MoveAllowed(allowed) => set_allow_video_movement(allowed),
                 videowin::VideoCommand::Flip { x, y } => {
                     self.flip_x = x;
                     self.flip_y = y;

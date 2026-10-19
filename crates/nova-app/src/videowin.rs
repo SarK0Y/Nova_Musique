@@ -25,6 +25,8 @@ const ZOOM_MIN: f32 = 0.5;
 /// SMPlayer has no ceiling. One is needed here: the picture is drawn into a
 /// texture this big, so an unbounded zoom would ask for an unbounded one.
 const ZOOM_MAX: f32 = 4.0;
+/// SMPlayer's nudge step, `MplayerWindow::moveLayer(±16, ±16)`.
+const PAN_STEP: f32 = 16.0;
 
 /// The flag that turns this same binary into the picker window.
 pub const FLAG: &str = "--video-window";
@@ -41,8 +43,8 @@ pub struct VideoWindow {
     picks: Receiver<String>,
     /// What the child already knows, so the list is only sent when it changes.
     sent: Vec<VideoTrack>,
-    /// Same, for the mirror/flip/zoom state.
-    sent_state: (bool, bool, f32),
+    /// Same, for the mirror/flip/zoom/pan/move-allowed state.
+    sent_state: (bool, bool, f32, eframe::egui::Vec2, bool),
 }
 
 impl VideoWindow {
@@ -88,7 +90,7 @@ impl VideoWindow {
             stdin,
             picks,
             sent: Vec::new(),
-            sent_state: (false, false, 1.0),
+            sent_state: (false, false, 1.0, eframe::egui::Vec2::ZERO, true),
         })
     }
 
@@ -121,8 +123,15 @@ impl VideoWindow {
     /// Tells the picker where the picture currently sits.
     ///
     /// Only sent when it changes, for the same reason the stream list is.
-    pub fn send_state(&mut self, x: bool, y: bool, zoom: f32) {
-        let state = (x, y, zoom);
+    pub fn send_state(
+        &mut self,
+        x: bool,
+        y: bool,
+        zoom: f32,
+        pan: eframe::egui::Vec2,
+        move_allowed: bool,
+    ) {
+        let state = (x, y, zoom, pan, move_allowed);
         if state == self.sent_state && self.stdin.is_some() {
             return;
         }
@@ -130,7 +139,13 @@ impl VideoWindow {
         let Some(stdin) = self.stdin.as_mut() else {
             return;
         };
-        if let Err(err) = stdin.write_all(format!("state {x} {y} {zoom}\n").as_bytes()) {
+        let line = format!(
+            "state {x} {y} {zoom} {:.2} {:.2} {}\n",
+            pan.x,
+            pan.y,
+            u8::from(move_allowed)
+        );
+        if let Err(err) = stdin.write_all(line.as_bytes()) {
             log::debug!("video window is gone ({err})");
             self.stdin = None;
         }
@@ -164,6 +179,10 @@ pub enum VideoCommand {
     Flip { x: bool, y: bool },
     /// Scale the picture by this factor; 1.0 is the size that fits.
     Zoom(f32),
+    /// Nudge the picture off centre, in points, with +y running down.
+    Pan(f32, f32),
+    /// Whether the picture may be moved at all.
+    MoveAllowed(bool),
 }
 
 /// Reads one line from the picker. Anything unrecognised is ignored: this is a
@@ -172,6 +191,16 @@ pub enum VideoCommand {
 fn parse_command(line: &str) -> Option<VideoCommand> {
     if let Some(id) = line.strip_prefix("pick ") {
         return Some(VideoCommand::Pick(id.to_string()));
+    }
+    if let Some(flag) = line.strip_prefix("move ") {
+        return Some(VideoCommand::MoveAllowed(flag.trim() == "1"));
+    }
+    if let Some(pan) = line.strip_prefix("pan ") {
+        let (x, y) = pan.trim().split_once(' ')?;
+        return Some(VideoCommand::Pan(
+            x.parse().unwrap_or(0.0),
+            y.parse().unwrap_or(0.0),
+        ));
     }
     if let Some(zoom) = line.strip_prefix("zoom ") {
         return Some(VideoCommand::Zoom(zoom.trim().parse().unwrap_or(1.0)));
@@ -276,6 +305,8 @@ pub fn run() -> eframe::Result<()> {
                 flip_x: false,
                 flip_y: false,
                 zoom: 1.0,
+                pan: eframe::egui::Vec2::ZERO,
+                allow_video_movement: true,
                 rows: Vec::new(),
                 stdout: std::io::stdout(),
             }))
@@ -291,6 +322,10 @@ struct Picker {
     flip_y: bool,
     /// How far the picture is scaled up from the size that fits.
     zoom: f32,
+    /// How far the picture is nudged off centre, with +y running down.
+    pan: eframe::egui::Vec2,
+    /// Whether the picture may be moved at all.
+    allow_video_movement: bool,
     stdout: std::io::Stdout,
 }
 
@@ -305,9 +340,23 @@ impl Picker {
                 else {
                     continue;
                 };
+                // Tokens follow `VideoWindow::send_state`: x y zoom pan.x pan.y
+                // move. Reading the flag before the pan values puts pan.x where
+                // the flag belongs, and every state line then reports movement
+                // as forbidden — which quietly un-ticks the checkbox.
+                let number =
+                    |value: Option<&str>| value.and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                let pan_x = number(parts.next());
+                let pan_y = number(parts.next());
+                let move_allowed = match parts.next() {
+                    Some(flag) => flag == "1",
+                    None => self.allow_video_movement,
+                };
                 self.flip_x = x == "1";
                 self.flip_y = y == "1";
                 self.zoom = zoom.parse().unwrap_or(1.0);
+                self.pan = eframe::egui::vec2(pan_x, pan_y);
+                self.allow_video_movement = move_allowed;
                 continue;
             }
             decode(&mut self.rows, &line);
@@ -325,6 +374,12 @@ impl Picker {
     fn flip(&mut self) {
         let line = format!("flip {} {}", u8::from(self.flip_x), u8::from(self.flip_y));
         self.send(&line);
+    }
+
+    /// SMPlayer nudges the video widget 16 pixels at a time.
+    fn pan_by(&mut self, dx: f32, dy: f32) {
+        self.pan += eframe::egui::vec2(dx, dy) * PAN_STEP;
+        self.send(&format!("pan {:.2} {:.2}", self.pan.x, self.pan.y));
     }
 
     fn zoom_by(&mut self, step: f32) {
@@ -378,6 +433,42 @@ impl eframe::App for Picker {
             }
             ui.label(format!("{:.0}%", self.zoom * 100.0));
         });
+        // SMPlayer's *Move left/right/up/down*, under the same Zoom menu. The
+        // main window clamps these so the picture cannot leave the panel; that
+        // is the check MplayerWindow::moveLeft does before moving.
+        ui.horizontal(|ui| {
+            // Words, not arrows: egui's bundled font has no glyph for U+2190
+            // and friends, and SMPlayer's own labels are words too.
+            if ui.button("Left").clicked() {
+                self.pan_by(-1.0, 0.0);
+            }
+            if ui.button("Right").clicked() {
+                self.pan_by(1.0, 0.0);
+            }
+            if ui.button("Up").clicked() {
+                self.pan_by(0.0, -1.0);
+            }
+            if ui.button("Down").clicked() {
+                self.pan_by(0.0, 1.0);
+            }
+            if ui.button("Centre").clicked() {
+                self.pan = eframe::egui::Vec2::ZERO;
+                self.send("pan 0.00 0.00");
+            }
+        });
+        // SMPlayer's `allow_video_movement`, which decides whether the picture
+        // may be pushed around at all or only while it reaches past the panel.
+        let allow = ui
+            .checkbox(&mut self.allow_video_movement, "Allow moving the video")
+            .on_hover_text(
+                "Off: the video can only be moved while it is bigger than the \
+                 panel. On: it can be moved freely, and never leaves the panel.",
+            );
+        // The parent owns the setting, so the click has to travel: without it
+        // this box only flips a local copy and the next state line puts it back.
+        if allow.changed() {
+            self.send(&format!("move {}", self.allow_video_movement as u8));
+        }
         ui.separator();
 
         if self.rows.is_empty() {
@@ -449,6 +540,33 @@ mod tests {
     }
 
     #[test]
+    fn a_state_line_lands_field_by_field() {
+        // The exact line `send_state` writes: x y zoom pan.x pan.y move.
+        let mut picker = Picker {
+            incoming: Arc::new(Mutex::new(
+                vec!["state 1 0 1.50 -16.00 32.00 1".to_string()],
+            )),
+            rows: Vec::new(),
+            flip_x: false,
+            flip_y: false,
+            zoom: 1.0,
+            pan: eframe::egui::Vec2::ZERO,
+            allow_video_movement: false,
+            stdout: std::io::stdout(),
+        };
+
+        picker.drain();
+
+        assert!(picker.flip_x, "mirror");
+        assert!(!picker.flip_y, "flip");
+        assert_eq!(picker.zoom, 1.5, "zoom");
+        assert_eq!(picker.pan, eframe::egui::vec2(-16.0, 32.0), "pan");
+        // The flag is the last token. Read one place early it becomes pan.x == "1",
+        // which is false for every real pan, so the checkbox always came back off.
+        assert!(picker.allow_video_movement, "allow moving");
+    }
+
+    #[test]
     fn a_new_list_replaces_the_old_one() {
         let mut rows = Vec::new();
         for line in encode(&[track("1", "h264", Some((640, 360)), true)]).lines() {
@@ -487,8 +605,22 @@ mod tests {
     }
 
     #[test]
+    fn pan_comes_back_as_a_pair() {
+        assert_eq!(
+            parse_command("pan -16.00 32.50"),
+            Some(VideoCommand::Pan(-16.0, 32.5))
+        );
+        assert_eq!(
+            parse_command("pan 0.00 0.00"),
+            Some(VideoCommand::Pan(0.0, 0.0))
+        );
+    }
+
+    #[test]
     fn rubbish_from_the_pipe_is_ignored() {
-        for line in ["", "pick", "flip", "flip x", "state", "nonsense"] {
+        for line in [
+            "", "pick", "flip", "flip x", "pan", "pan 1", "state", "nonsense",
+        ] {
             assert_eq!(parse_command(line), None, "{line:?} was not ignored");
         }
         let mut rows = Vec::new();
