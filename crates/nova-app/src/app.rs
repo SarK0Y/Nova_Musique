@@ -353,6 +353,8 @@ pub struct NovaApp {
     /// The playlist shown in place of the whole library: its file name plus
     /// the track ids it lists, in playlist order. `None` shows everything.
     loaded_playlist: Option<(String, Vec<TrackId>)>,
+    /// Which menu is open this frame, for the /dev/shm/nova state dump.
+    dbg_menu: std::cell::Cell<&'static str>,
     /// Floating playlist window, opened from the Nova menu in the top bar.
     playlist_open: bool,
     /// External video window: picks which video stream mpv should show.
@@ -453,6 +455,7 @@ impl NovaApp {
             search_report: None,
             search_report_fresh: false,
             loaded_playlist: None,
+            dbg_menu: std::cell::Cell::new(""),
             playlist_open: false,
             video_open: std::env::var_os("NOVA_TEST_VIDEO").is_some(),
             flip_x: false,
@@ -1379,6 +1382,7 @@ impl NovaApp {
     /// current playlist file, `as…` picks a new one and makes it current.
     fn save_menu(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.menu_button("Save", |ui| {
+            self.dbg_menu.set("save");
             if ui.button("as is").clicked() {
                 actions.push(Action::SavePlaylist(None));
                 ui.close();
@@ -1401,6 +1405,33 @@ impl NovaApp {
     /// place of the whole library; `all songs` goes back.
     fn load_menu(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.menu_button("Load", |ui| {
+            self.dbg_menu.set("load");
+            // The menu is as wide as its longest entry: names stay on one
+            // line and the hovered highlight cannot poke out of the panel.
+            let mut labels: Vec<String> = Vec::new();
+            if self.loaded_playlist.is_some() {
+                labels.push("all songs".to_owned());
+            }
+            for path in &self.config.playlists {
+                labels.push(file_label(path));
+            }
+            if labels.is_empty() {
+                labels.push("No playlists yet.".to_owned());
+            }
+            labels.push("new…".to_owned());
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let widest = labels
+                .iter()
+                .map(|label| {
+                    ui.ctx().fonts_mut(|f| {
+                        f.layout_no_wrap(label.clone(), font.clone(), egui::Color32::WHITE)
+                            .size()
+                            .x
+                    })
+                })
+                .fold(0.0, f32::max);
+            ui.set_min_width(widest + 24.0);
+
             if self.loaded_playlist.is_some() && ui.button("all songs").clicked() {
                 actions.push(Action::UnloadPlaylist);
                 ui.close();
@@ -1409,11 +1440,7 @@ impl NovaApp {
                 ui.label(RichText::new("No playlists yet.").weak());
             }
             for path in &self.config.playlists {
-                let label = path
-                    .file_name()
-                    .unwrap_or(path.as_os_str())
-                    .to_string_lossy()
-                    .into_owned();
+                let label = file_label(path);
                 if ui
                     .button(&label)
                     .on_hover_text(path.display().to_string())
@@ -2158,6 +2185,21 @@ impl NovaApp {
     }
 }
 
+/// States mirrored into `/dev/shm/nova` as tiny files, so a script can watch
+/// what the app is doing without screenshots. Only written on change; an
+/// idle app does no I/O.
+fn dbg_dump(states: &[(&str, String)]) {
+    let dir = std::path::Path::new("/dev/shm/nova");
+    let _ = std::fs::create_dir_all(dir);
+    for (name, body) in states {
+        let path = dir.join(format!("{name}.out"));
+        let same = std::fs::read_to_string(&path).is_ok_and(|old| old == *body);
+        if !same {
+            let _ = std::fs::write(path, body);
+        }
+    }
+}
+
 impl eframe::App for NovaApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -2252,6 +2294,36 @@ impl eframe::App for NovaApp {
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             ctx.request_repaint();
         }
+
+        let playing = match self.engine.state() {
+            PlaybackState::Playing => "playing",
+            PlaybackState::Paused => "paused",
+            PlaybackState::Stopped => "stopped",
+        };
+        let now_playing = match self.engine.current_track(&self.library) {
+            Some(track) => format!("{playing}: {}", track.title),
+            None => playing.to_string(),
+        };
+        dbg_dump(&[
+            (
+                "playlist",
+                match &self.loaded_playlist {
+                    Some((name, ids)) => format!("{name}: {} track(s)", ids.len()),
+                    None => "none".to_string(),
+                },
+            ),
+            ("menu_state", self.dbg_menu.replace("").to_string()),
+            (
+                "toast",
+                self.toast
+                    .as_ref()
+                    .map(|(message, _)| message.clone())
+                    .unwrap_or_default(),
+            ),
+            ("search", self.search.clone()),
+            ("queue", format!("{} track(s)", self.engine.queue().len())),
+            ("now_playing", now_playing),
+        ]);
     }
 }
 
@@ -2598,6 +2670,13 @@ fn expand_to_audio(paths: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
         }
     }
     (files, skipped)
+}
+
+/// A playlist entry's label: its file name, or the whole path if it has none.
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn truncate(text: &str, width: usize) -> String {

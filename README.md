@@ -26,6 +26,10 @@ but for music you already own on disk.
   title, artist and album.
 - **Queue** — click any track to replace the queue with the current list and
   start there; shuffle (every item exactly once) and repeat-off/all/one.
+- **Playlists** — **Load** and **Save** beside the Songs list: a loaded `.m3u8`
+  shows in place of the whole library, and saving writes back exactly what is
+  on screen. The current playlist comes back at startup. See
+  [Playlists](#playlists).
 - **Transport** — play/pause, previous/next, a seek bar, and volume.
 - **Resilient audio** — playback goes through rust-`rodio`; if no output device
   can be opened, Nova transparently falls back to a silent backend so the rest
@@ -35,7 +39,8 @@ but for music you already own on disk.
   instant.
 - **Drag and drop** — drop files to play them (indexed on the spot from their
   tags) or a folder to scan it; files can also be passed on the command line as
-  a path or `file://` URL.
+  a path or `file://` URL. With a playlist loaded, drops (and the **Folder**
+  row) add to that playlist instead — see [Playlists](#playlists).
 - **No_FFT codecs** — `.no_fft` (polynomial fit), `.nadc` (NFA1–NFA6 DPCM /
   basket) and `.nfm` (a container wrapping any codec with metadata and a cover)
   are indexed and played in-process through the vendored upstream codecs. See
@@ -48,13 +53,14 @@ but for music you already own on disk.
 
 ## Repository layout
 
-Nova is a Cargo workspace with four crates:
+Nova is a Cargo workspace with five crates:
 
 | Crate | What it is |
 | --- | --- |
 | `crates/nova-core`  | The library and playback engine. UI-agnostic, fully unit-tested. |
 | `crates/nova-codec` | `unsafe` FFI bindings to the vendored No_FFT C++ codecs. |
 | `crates/nova-cli`   | A tiny headless CLI used to verify scanning and playback. |
+| `crates/nova-faav`  | Process-wide get/set cells (`static mut`, no locks) — the search box's text, in the style of TAM's `faav.rs`. |
 | `crates/nova-app`   | The egui/eframe desktop application (binary: `nova`). |
 
 `no_fft/` holds a pristine copy of the upstream No_FFT codec
@@ -169,12 +175,19 @@ nova-cli play   <dir> [--index N] [--volume V] [--null] [--seconds S]
 4. Use <kbd>↑</kbd>/<kbd>↓</kbd> to move the cursor through any track list and
    <kbd>Enter</kbd> to play it. The playing track is marked ▶ in the first
    column, so the cursor and now-playing never look the same.
-4. Use the transport bar for play/pause, previous/next, seek, volume, shuffle
+5. Press <kbd>Enter</kbd> in the search box for a message window with how many
+   tracks match; <kbd>Enter</kbd> or **OK** dismisses it.
+6. Use the transport bar for play/pause, previous/next, seek, volume, shuffle
    and repeat.
-5. Press <kbd>I</kbd> (or the **ℹ Info** button) to open the track info panel.
-6. Click **Nova** in the top bar to open its menu; **Playlist** opens a floating
+7. Press <kbd>I</kbd> (or the **ℹ Info** button) to open the track info panel.
+8. Click **Nova** in the top bar to open its menu; **Playlist** opens a floating
    playlist window and **Video** opens the video-stream picker. **Audio** is a
    placeholder for now.
+
+**Clear all**, **Save** and **Load** sit beside the Songs title and keep
+working with a search typed in; **Clear all** ignores the search entirely (it
+hides tracks — see [Hiding songs](#hiding-songs)). **Save** and **Load** are
+the playlist buttons, described next.
 
 ### The Nova menu
 
@@ -414,6 +427,8 @@ has no tags at all.
   the library hasn't indexed yet are read straight from their tags, so no rescan
   is needed.
 - Drop a **folder** to scan and open it.
+- With a playlist loaded, drops of either kind are **added to that playlist**
+  instead of playing or scanning — see [Playlists](#playlists).
 - While dragging, an overlay shows how many items are in flight.
 
 ### The queue
@@ -424,6 +439,53 @@ has no tags at all.
   stops when the track you were listening to is the one removed, so audio never
   outlives the queue.
 - **Clear all** empties the queue and stops playback.
+
+### Playlists
+
+The Songs title carries two more buttons, **Save** and **Load**, for plain
+`.m3u8` files (with `.m3u` accepted on load). Both menus are sized to their
+longest entry, so file names never wrap.
+
+**Load** offers:
+
+- the playlists recently opened or saved, newest first (up to ten; hovering
+  one shows its full path);
+- **all songs**, to unload the playlist and get the whole library back;
+- **new…**, a file picker for any other `.m3u8` / `.m3u` on disk.
+
+A loaded playlist shows **in place of the whole library** — only its tracks, in
+its own order, with the file name beside the Songs title. The search box still
+narrows within it. Files the library has never indexed are read from their tags
+on the spot and joined, so a playlist of files from another disk simply works;
+files that cannot be read at all are counted in the load toast.
+
+**Save** has two entries:
+
+- **as is** — writes the playlist on screen to the current file, which is the
+  one **Load** last opened (or the default `~/.config/nova/playlist.m3u8` for
+  the first save);
+- **as…** — a file picker to write a new file.
+
+What is on screen is what gets written, search filter included — a filtered
+save writes the filtered list. The playlist keeps its own order.
+
+Both the list of used playlists and the current one live in `config.json`, so
+the Load menu remembers and **the current playlist is reloaded at startup**,
+exactly as it was left.
+
+Adding to the loaded playlist does not need the Save round-trip first:
+
+- **drop files or a folder** onto the window — they are appended (folders are
+  walked for audio, junk is counted and reported); drop targets the playlist
+  only while one is loaded, otherwise drops play files and scan folders as
+  usual;
+- the **Folder** row — with a playlist loaded its button reads **Add** instead
+  of **Scan**, and Enter / **Browse…** add that folder's files the same way.
+
+Duplicates of tracks already in the playlist are skipped, tracks the library
+has not seen get their tags read on the spot, and a toast reports what was
+added. The file on disk is only written by **Save** — adding is in-memory
+until then.
 
 ### Hiding songs
 
@@ -524,11 +586,25 @@ cargo build -p nova-app                           # codecs + audio (default)
 
 | Path | Contents |
 | --- | --- |
-| `~/.config/nova/config.json` | Last music folder and volume. |
+| `~/.config/nova/config.json` | Last music folder, volume, the used-playlist list and the current playlist. |
+| `~/.config/nova/playlist.m3u8` | Where **Save → as is** writes before **as…** has picked a file. |
 | `~/.cache/nova/library.json`  | Cached library index for the last folder. |
+| `~/.cache/nova/hidden.json`   | Track ids hidden from the library. |
 
-Both honour `XDG_CONFIG_HOME` / `XDG_CACHE_HOME`. The cache is only used when it
-was built from the currently configured folder.
+All of these honour `XDG_CONFIG_HOME` / `XDG_CACHE_HOME`. The cache is only
+used when it was built from the currently configured folder.
+
+While it runs, Nova also mirrors a few states into `/dev/shm/nova/*.out` as
+tiny text files — `playlist` (the loaded file and its track count),
+`menu_state` (`load` / `save` while one of those menus is open),
+`now_playing` (`playing` / `paused` / `stopped` and the track), `queue`,
+`search` and `toast`. They are only rewritten when a value changes, and exist
+so a script can watch what the app is doing without screenshots:
+
+```sh
+cat /dev/shm/nova/now_playing.out
+watch -n1 cat /dev/shm/nova/playlist.out
+```
 
 ## Testing
 
@@ -550,14 +626,14 @@ cargo test --workspace
 
 Deliberately out of scope for this first pass — the natural next steps:
 
-- Playlists (create, edit, persist) and import/export.
+- Playlist editing beyond append/save (reordering, removing single tracks).
 - MPRIS integration so desktop media keys and shell widgets work.
 - Gapless/crossfade, ReplayGain, an equaliser.
 - File-watching so the library updates as folders change.
 - Virtualised lists for very large libraries (views currently rebuild their row
   list each frame).
 - Richer now-playing (waveform/visualiser, lyrics).
-- Drag-and-drop import and reordering of the queue.
+- Drag-and-drop reordering of the queue.
 
 ## Project has been assisted by awesome OpenCode (Big Pickle, LongCat, Space Bunny) / ChatGPT 🙂
 
