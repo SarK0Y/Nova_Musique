@@ -561,7 +561,13 @@ impl NovaApp {
 
     /// A dropped folder is scanned; dropped audio files start playing. A mix
     /// prefers the files (the common case is dragging an album's tracks).
+    /// With a playlist open the drop adds to it instead of starting playback.
     fn accept_drop(&mut self, paths: Vec<PathBuf>) {
+        if self.loaded_playlist.is_some() {
+            self.add_to_playlist(paths);
+            return;
+        }
+
         let (dirs, files, skipped) = classify_drop(paths);
 
         if !files.is_empty() {
@@ -593,31 +599,7 @@ impl NovaApp {
             return;
         }
 
-        let missing: Vec<PathBuf> = files
-            .iter()
-            .filter(|path| self.find_track_by_path(path).is_none())
-            .cloned()
-            .collect();
-
-        let mut added = 0usize;
-        if !missing.is_empty() {
-            let mut tracks = self.library.tracks().to_vec();
-            for path in &missing {
-                match metadata::read_track(path) {
-                    Ok(track) => {
-                        if !tracks.iter().any(|known| known.path == track.path) {
-                            tracks.push(track);
-                            added += 1;
-                        }
-                    }
-                    Err(err) => self.toast(format!("Could not read {}: {err}", path.display())),
-                }
-            }
-            if added > 0 {
-                let root = self.library.root().map(Path::to_path_buf);
-                self.library = Library::from_tracks(root, tracks);
-            }
-        }
+        self.import_missing(&files);
 
         let ids: Vec<TrackId> = files
             .iter()
@@ -639,6 +621,85 @@ impl NovaApp {
         } else {
             self.toast(format!("Added {count} track(s) to the playlist"));
         }
+    }
+
+    /// Reads tags for files the library has not seen yet and adds them, so a
+    /// drop or an add works without rescanning the folder.
+    fn import_missing(&mut self, files: &[PathBuf]) {
+        let missing: Vec<PathBuf> = files
+            .iter()
+            .filter(|path| self.find_track_by_path(path).is_none())
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let mut tracks = self.library.tracks().to_vec();
+        let mut added = 0usize;
+        for path in &missing {
+            match metadata::read_track(path) {
+                Ok(track) => {
+                    if !tracks.iter().any(|known| known.path == track.path) {
+                        tracks.push(track);
+                        added += 1;
+                    }
+                }
+                Err(err) => self.toast(format!("Could not read {}: {err}", path.display())),
+            }
+        }
+        if added > 0 {
+            let root = self.library.root().map(Path::to_path_buf);
+            self.library = Library::from_tracks(root, tracks);
+        }
+    }
+
+    /// Adds dropped or picked files to the open playlist, walking folders for
+    /// audio. Tracks already listed are not duplicated; new files get their
+    /// tags read first so they show up even if never scanned.
+    fn add_to_playlist(&mut self, paths: Vec<PathBuf>) {
+        if self.loaded_playlist.is_none() {
+            return;
+        }
+        let (files, skipped) = expand_to_audio(paths);
+        if files.is_empty() {
+            self.toast(if skipped > 0 {
+                format!("Skipped {skipped} unsupported file(s)")
+            } else {
+                "Nothing to add to the playlist".to_string()
+            });
+            return;
+        }
+
+        self.import_missing(&files);
+
+        let ids: Vec<TrackId> = files
+            .iter()
+            .filter_map(|path| self.find_track_by_path(path))
+            .collect();
+        let mut added = 0usize;
+        if let Some((_, list)) = self.loaded_playlist.as_mut() {
+            for id in ids {
+                if !list.contains(&id) {
+                    list.push(id);
+                    added += 1;
+                }
+            }
+        }
+        let name = self
+            .loaded_playlist
+            .as_ref()
+            .map(|(name, _)| name.clone())
+            .unwrap_or_default();
+        if added == 0 {
+            self.toast(format!("Nothing new to add to {name}"));
+            return;
+        }
+        let skipped_note = if skipped > 0 {
+            format!(", skipped {skipped} unsupported")
+        } else {
+            String::new()
+        };
+        self.toast(format!("Added {added} track(s) to {name}{skipped_note}"));
     }
 
     /// Queues and plays a set of files, reading tags for any the library has
@@ -701,6 +762,12 @@ impl NovaApp {
     /// the folder alone, which is the difference between adding a video and
     /// indexing whatever else happens to sit beside it.
     fn select_path(&mut self, path: PathBuf) {
+        // With a playlist open, the Folder row adds to it instead of
+        // scanning — that is the whole point of keeping the list on screen.
+        if self.loaded_playlist.is_some() {
+            self.add_to_playlist(vec![path]);
+            return;
+        }
         if path.is_dir() {
             self.start_scan(path);
         } else if path.is_file() {
@@ -1246,13 +1313,18 @@ impl NovaApp {
             self.toast(format!("Load failed: {}", path.display()));
             return;
         };
+        // The library hashed canonical paths at scan time, so resolve the
+        // same way a scan would — and read tags for files it never indexed:
+        // a playlist is a list of files, not of library entries.
+        let listed: Vec<PathBuf> = listed
+            .into_iter()
+            .map(|file| std::fs::canonicalize(&file).unwrap_or(file))
+            .collect();
+        self.import_missing(&listed);
         let mut ids = Vec::with_capacity(listed.len());
         let mut missing = 0usize;
-        for file in listed {
-            // The library hashed canonical paths at scan time, so resolve
-            // the same way a scan would.
-            let canonical = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
-            match self.library.track(track_id(&canonical)) {
+        for file in &listed {
+            match self.library.track(track_id(file)) {
                 Some(track) => ids.push(track.id),
                 None => missing += 1,
             }
@@ -2504,6 +2576,30 @@ fn classify_drop(paths: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>, usize) {
     (dirs, files, skipped)
 }
 
+/// The audio files behind a drop or a folder pick: files matched by
+/// extension, folders walked recursively. Returns them plus the count of
+/// unsupported files that were skipped.
+fn expand_to_audio(paths: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
+    let (dirs, files, skipped) = classify_drop(paths);
+    let mut files = files;
+    let mut skipped = skipped;
+    for dir in dirs {
+        for entry in walkdir::WalkDir::new(&dir)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+        {
+            if metadata::is_supported(entry.path()) {
+                files.push(entry.path().to_path_buf());
+            } else {
+                skipped += 1;
+            }
+        }
+    }
+    (files, skipped)
+}
+
 fn truncate(text: &str, width: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= width {
@@ -2692,6 +2788,33 @@ mod tests {
         assert_eq!(skipped, 2);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A dropped folder is walked recursively; its audio comes back in file
+    /// name order and its junk is counted, not silently kept.
+    #[test]
+    fn a_folder_expands_to_its_audio_in_order() {
+        let base = std::env::temp_dir().join(format!("nova-expand-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("b.mp3"), b"x").unwrap();
+        std::fs::write(base.join("a.flac"), b"x").unwrap();
+        std::fs::write(base.join("cover.jpg"), b"x").unwrap();
+        std::fs::write(base.join("sub").join("c.ogg"), b"x").unwrap();
+        std::fs::write(base.join("sub").join("notes.txt"), b"x").unwrap();
+
+        let (files, skipped) = expand_to_audio(vec![base.clone()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            files,
+            vec![
+                base.join("a.flac"),
+                base.join("b.mp3"),
+                base.join("sub").join("c.ogg"),
+            ]
+        );
+        assert_eq!(skipped, 2);
     }
 
     #[test]

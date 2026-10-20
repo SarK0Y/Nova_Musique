@@ -16,6 +16,7 @@ nova-faav = { workspace = true }
 eframe = { workspace = true }
 image = { workspace = true }
 rfd = { workspace = true }
+walkdir = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
