@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 nova-core = { workspace = true, features = ["nofft"] }
+nova-faav = { workspace = true }
 eframe = { workspace = true }
 image = { workspace = true }
 rfd = { workspace = true }

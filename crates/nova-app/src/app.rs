@@ -116,6 +116,12 @@ fn hidden_file() -> Option<PathBuf> {
     cache_file().map(|path| path.with_file_name("hidden.json"))
 }
 
+/// Where `Save → as is` writes before `as…` has picked a file: one playlist
+/// beside the config, like the hidden-tracks list beside the cache.
+fn default_playlist_file() -> Option<PathBuf> {
+    xdg_dir("XDG_CONFIG_HOME", ".config").map(|dir| dir.join("nova").join("playlist.m3u8"))
+}
+
 // ---------------------------------------------------------------------------
 // Views and actions
 // ---------------------------------------------------------------------------
@@ -154,6 +160,9 @@ enum Action {
     SetVolume(f32),
     ToggleShuffle,
     CycleRepeat,
+    /// Save the song list as it is on screen to a playlist file.
+    /// `None` keeps the current file ("as is"), `Some` names a new one.
+    SavePlaylist(Option<PathBuf>),
 }
 
 /// Messages sent by the scanner thread.
@@ -320,8 +329,19 @@ pub struct NovaApp {
     /// libmpv, when it could be started. `None` means video plays through the
     /// audio backend only, which works for songs and not much else.
     mpv: Option<Arc<Mpv>>,
+    /// How many tracks the last Enter in the Search box reported; the count
+    /// stays up as an in-window message until OK clears it.
+    search_report: Option<usize>,
+    /// Take keyboard focus for the message's OK button, once, on the frame
+    /// the window opens — so Enter dismisses it without the mouse.
+    search_report_fresh: bool,
     /// Floating playlist window, opened from the Nova menu in the top bar.
     playlist_open: bool,
+    /// The file `Save → as is` last wrote this session; `None` until the first
+    /// save, which then falls back to the default playlist beside the config.
+    /// Session-only on purpose: "as…" points it at a new file, and no save
+    /// should ever overwrite something without the user naming it first.
+    playlist_file: Option<PathBuf>,
     /// External video window: picks which video stream mpv should show.
     video_open: bool,
     /// SMPlayer's *Mirror image* (`hflip`) and *Flip image* (`vflip`), asked of
@@ -417,7 +437,10 @@ impl NovaApp {
             hidden,
             cursor: std::cell::Cell::new(0),
             mpv,
+            search_report: None,
+            search_report_fresh: false,
             playlist_open: false,
+            playlist_file: None,
             video_open: std::env::var_os("NOVA_TEST_VIDEO").is_some(),
             flip_x: false,
             flip_y: false,
@@ -982,6 +1005,29 @@ impl NovaApp {
                 }
                 Action::ToggleShuffle => self.engine.queue_mut().toggle_shuffle(),
                 Action::CycleRepeat => self.engine.queue_mut().cycle_repeat(),
+                Action::SavePlaylist(path) => {
+                    // "as is" keeps last save's file (or the default one);
+                    // "as…" hands over the path the dialog returned.
+                    let target = path
+                        .or_else(|| self.playlist_file.clone())
+                        .or_else(default_playlist_file);
+                    let Some(target) = target else {
+                        self.toast("Nowhere to save the playlist".to_string());
+                        continue;
+                    };
+                    let saved = {
+                        let tracks = self.visible_songs();
+                        let count = tracks.len();
+                        write_playlist(&target, &tracks).map(|()| count)
+                    };
+                    match saved {
+                        Ok(count) => {
+                            self.playlist_file = Some(target.clone());
+                            self.toast(format!("Saved {count} track(s) to {}", target.display()));
+                        }
+                        Err(err) => self.toast(format!("Save failed: {err}")),
+                    }
+                }
             }
         }
     }
@@ -1033,14 +1079,27 @@ impl NovaApp {
 
             ui.separator();
             ui.label("Search");
-            ui.add(
+            let search_field = ui.add(
                 egui::TextEdit::singleline(&mut self.search)
                     .desired_width(220.0)
                     .hint_text("title, artist, album"),
             );
+            // Enter reports how many tracks the filter kept, the same way the
+            // Folder field's Enter commits: a one-line field drops focus on
+            // Enter, so `lost_focus` is where the key is still visible. An
+            // empty box never searched anything, so it has nothing to report.
+            let searched =
+                search_field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if searched && !self.search.trim().is_empty() {
+                self.search_report = Some(self.visible_songs().len());
+                self.search_report_fresh = true;
+            }
             if ui.button("✕").on_hover_text("Clear search").clicked() {
                 self.search.clear();
             }
+            // Mirror the box into the faav cell so any crate depending on
+            // nova-faav sees the filter; the field itself lives in this binary.
+            nova_faav::search(Some(self.search.clone()));
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
@@ -1145,11 +1204,55 @@ impl NovaApp {
         track_info_body(ui, track, self.covers.get(track.id));
     }
 
+    /// The song list as it is on screen: the library narrowed by the search
+    /// box. What `Save` writes, so a saved file always matches the view.
+    fn visible_songs(&self) -> Vec<&Track> {
+        let query = self.search.trim().to_lowercase();
+        if query.is_empty() {
+            self.library.tracks().iter().collect()
+        } else {
+            self.library.search(&query, 500)
+        }
+    }
+
+    /// The Save menu over the list as it is on screen: `as is` overwrites the
+    /// current playlist file, `as…` picks a new one and makes it current.
+    fn save_menu(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        ui.menu_button("Save", |ui| {
+            if ui.button("as is").clicked() {
+                actions.push(Action::SavePlaylist(None));
+                ui.close();
+            }
+            if ui.button("as…").clicked() {
+                let mut dialog = rfd::FileDialog::new().set_file_name("playlist.m3u8");
+                if let Some(dir) = self.music_dir.as_deref() {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(path) = dialog.save_file() {
+                    actions.push(Action::SavePlaylist(Some(path)));
+                }
+                ui.close();
+            }
+        });
+    }
+
+    /// The row above the song list. Drawn identically with and without a
+    /// search filter, so `Clear all` never disappears behind a typed query.
+    fn songs_header(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
+            ui.heading("Songs");
+            if ui.button("Clear all").clicked() {
+                actions.push(Action::HideAll);
+            }
+            self.save_menu(ui, actions);
+        });
+    }
+
     fn center(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let query = self.search.trim().to_lowercase();
         if !query.is_empty() {
-            let results = self.library.search(&query, 500);
-            ui.heading(format!("Search · {} result(s)", results.len()));
+            let results = self.visible_songs();
+            self.songs_header(ui, actions);
             ui.add_space(4.0);
             egui::ScrollArea::vertical().show(ui, |ui| {
                 self.track_list(ui, &results, actions);
@@ -1159,12 +1262,7 @@ impl NovaApp {
 
         match self.view {
             View::Songs => {
-                ui.horizontal(|ui| {
-                    ui.heading("Songs");
-                    if ui.button("Clear all").clicked() {
-                        actions.push(Action::HideAll);
-                    }
-                });
+                self.songs_header(ui, actions);
                 ui.label(RichText::new("Click a track to play it.").weak().size(12.0));
                 ui.add_space(4.0);
                 let tracks: Vec<&Track> = self.library.tracks().iter().collect();
@@ -1634,6 +1732,38 @@ impl NovaApp {
     }
 
     /// Render the playlist in its own native OS viewport, separate from the main window.
+    /// The "N item(s) found" message, drawn as a window inside the main
+    /// viewport so it shares this window's GL context instead of blocking on
+    /// a native dialog.
+    fn search_report_window(&mut self, ctx: &egui::Context) {
+        let Some(found) = self.search_report else {
+            return;
+        };
+        let fresh = std::mem::take(&mut self.search_report_fresh);
+        let mut open = true;
+        let mut ok = false;
+        egui::Window::new("Search")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!("{found} item(s) found"));
+                let button = ui.button("OK");
+                // Only the opening frame: egui treats Enter/Space as a click
+                // on the focused button, so this alone makes Enter dismiss
+                // the message; re-taking focus every frame would trap the
+                // keyboard here until the window closes.
+                if fresh {
+                    button.request_focus();
+                }
+                ok = button.clicked();
+            });
+        if !open || ok {
+            self.search_report = None;
+        }
+    }
+
     fn playlist_window(&mut self, ctx: &egui::Context) {
         let viewport_id = egui::ViewportId::from_hash_of("nova-playlist-window");
         let builder = egui::ViewportBuilder::default()
@@ -1887,6 +2017,9 @@ impl eframe::App for NovaApp {
         self.apply(actions);
         self.ensure_covers(&ctx);
 
+        if self.search_report.is_some() {
+            self.search_report_window(&ctx);
+        }
         if self.playlist_open {
             self.playlist_window(&ctx);
         }
@@ -1956,6 +2089,29 @@ fn save_hidden(hidden: &HashSet<TrackId>) {
     if let Ok(json) = serde_json::to_vec_pretty(hidden) {
         let _ = std::fs::write(path, json);
     }
+}
+
+/// The playlist as UTF-8 M3U8 — the one format mpv, VLC and friends all read.
+///
+/// An `#EXTINF` line names each track so other players show titles rather
+/// than file names; `-1` is the format's "duration unknown".
+fn write_playlist(path: &Path, tracks: &[&Track]) -> std::io::Result<()> {
+    let mut body = String::from("#EXTM3U\n");
+    for track in tracks {
+        let name = if track.artist.is_empty() {
+            track.title.clone()
+        } else {
+            format!("{} - {}", track.artist, track.title)
+        };
+        let seconds = track.duration.map(|d| d.round() as i64).unwrap_or(-1);
+        body.push_str(&format!("#EXTINF:{seconds},{name}\n"));
+        body.push_str(&track.path.to_string_lossy());
+        body.push('\n');
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, body)
 }
 
 fn format_clock(duration: Duration) -> String {
@@ -2444,6 +2600,29 @@ mod tests {
             has_cover: true,
             video: None,
         }
+    }
+
+    /// A saved playlist names every track and stays playable elsewhere.
+    #[test]
+    fn playlists_are_written_as_m3u8() {
+        let mut bare = sample_track("/music/b.flac");
+        bare.artist = String::new();
+        bare.duration = None;
+        let owned = [sample_track("/music/a.mp3"), bare];
+        let tracks: Vec<&Track> = owned.iter().collect();
+
+        let dir = std::env::temp_dir().join(format!("nova-m3u8-{}", std::process::id()));
+        let path = dir.join("nested").join("list.m3u8");
+        write_playlist(&path, &tracks).expect("write");
+
+        let body = std::fs::read_to_string(&path).expect("read back");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            body,
+            "#EXTM3U\n\
+             #EXTINF:236,Test Artist - Test NFM Track\n/music/a.mp3\n\
+             #EXTINF:-1,Test NFM Track\n/music/b.flac\n"
+        );
     }
 
     /// Draws the info panel headlessly. This cannot assert on content, but it

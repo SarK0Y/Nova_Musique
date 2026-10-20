@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/nova-core",
     "crates/nova-codec",
+    "crates/nova-faav",
     "crates/nova-cli",
     "crates/nova-app",
 ]
@@ -20,6 +21,7 @@ repository = "https://github.com/SarK0Y/Nova_Musique.git"
 [workspace.dependencies]
 nova-core = { path = "crates/nova-core" }
 nova-codec = { path = "crates/nova-codec" }
+nova-faav = { path = "crates/nova-faav" }
 
 # Shared
 serde = { version = "1.0", features = ["derive"] }

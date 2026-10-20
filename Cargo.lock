@@ -2027,6 +2027,7 @@ dependencies = [
  "image",
  "log",
  "nova-core",
+ "nova-faav",
  "rfd",
  "serde",
  "serde_json",
@@ -2061,6 +2062,10 @@ dependencies = [
  "thiserror 2.0.21",
  "walkdir",
 ]
+
+[[package]]
+name = "nova-faav"
+version = "0.1.0"
 
 [[package]]
 name = "num-bigint"
