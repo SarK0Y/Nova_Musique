@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::mpv::{deinterlace_filter, Mpv, VideoBackend};
 use crate::videowin;
 use nova_core::metadata;
-use nova_core::{AlbumKey, Library, PlaybackEngine, PlaybackState, ScanReport, Track, TrackId};
+use nova_core::{
+    track_id, AlbumKey, Library, PlaybackEngine, PlaybackState, ScanReport, Track, TrackId,
+};
 
 /// How long a transient message stays on screen.
 const TOAST_TTL: Duration = Duration::from_secs(6);
@@ -34,6 +36,13 @@ struct Config {
     volume: f32,
     #[serde(default = "default_allow_video_movement")]
     allow_video_movement: bool,
+    /// Playlists the user opened or saved, newest first — the Load menu.
+    #[serde(default)]
+    playlists: Vec<PathBuf>,
+    /// The playlist `Save → as is` writes and `Load` last opened. Kept in the
+    /// config so the same file stays current across restarts.
+    #[serde(default)]
+    current_playlist: Option<PathBuf>,
 }
 
 fn default_volume() -> f32 {
@@ -73,6 +82,8 @@ impl Default for Config {
             music_dir: None,
             volume: default_volume(),
             allow_video_movement: default_allow_video_movement(),
+            playlists: Vec::new(),
+            current_playlist: None,
         }
     }
 }
@@ -163,6 +174,10 @@ enum Action {
     /// Save the song list as it is on screen to a playlist file.
     /// `None` keeps the current file ("as is"), `Some` names a new one.
     SavePlaylist(Option<PathBuf>),
+    /// Show the playlist file's tracks in place of the whole library.
+    LoadPlaylist(PathBuf),
+    /// Go back from a loaded playlist to the whole library.
+    UnloadPlaylist,
 }
 
 /// Messages sent by the scanner thread.
@@ -335,13 +350,11 @@ pub struct NovaApp {
     /// Take keyboard focus for the message's OK button, once, on the frame
     /// the window opens — so Enter dismisses it without the mouse.
     search_report_fresh: bool,
+    /// The playlist shown in place of the whole library: its file name plus
+    /// the track ids it lists, in playlist order. `None` shows everything.
+    loaded_playlist: Option<(String, Vec<TrackId>)>,
     /// Floating playlist window, opened from the Nova menu in the top bar.
     playlist_open: bool,
-    /// The file `Save → as is` last wrote this session; `None` until the first
-    /// save, which then falls back to the default playlist beside the config.
-    /// Session-only on purpose: "as…" points it at a new file, and no save
-    /// should ever overwrite something without the user naming it first.
-    playlist_file: Option<PathBuf>,
     /// External video window: picks which video stream mpv should show.
     video_open: bool,
     /// SMPlayer's *Mirror image* (`hflip`) and *Flip image* (`vflip`), asked of
@@ -439,8 +452,8 @@ impl NovaApp {
             mpv,
             search_report: None,
             search_report_fresh: false,
+            loaded_playlist: None,
             playlist_open: false,
-            playlist_file: None,
             video_open: std::env::var_os("NOVA_TEST_VIDEO").is_some(),
             flip_x: false,
             flip_y: false,
@@ -456,6 +469,14 @@ impl NovaApp {
             if app.play_path(&path) {
                 app.pending_play = None;
                 app.view = View::Songs;
+            }
+        }
+
+        // The current playlist comes back on screen where last session left
+        // it; a file that has since vanished just stays unloaded.
+        if let Some(path) = app.config.current_playlist.clone() {
+            if path.exists() {
+                app.open_playlist(&path);
             }
         }
 
@@ -1006,10 +1027,10 @@ impl NovaApp {
                 Action::ToggleShuffle => self.engine.queue_mut().toggle_shuffle(),
                 Action::CycleRepeat => self.engine.queue_mut().cycle_repeat(),
                 Action::SavePlaylist(path) => {
-                    // "as is" keeps last save's file (or the default one);
+                    // "as is" keeps the current playlist (or the default one);
                     // "as…" hands over the path the dialog returned.
                     let target = path
-                        .or_else(|| self.playlist_file.clone())
+                        .or_else(|| self.config.current_playlist.clone())
                         .or_else(default_playlist_file);
                     let Some(target) = target else {
                         self.toast("Nowhere to save the playlist".to_string());
@@ -1022,12 +1043,16 @@ impl NovaApp {
                     };
                     match saved {
                         Ok(count) => {
-                            self.playlist_file = Some(target.clone());
+                            self.config.current_playlist = Some(target.clone());
+                            // Persists the config, current playlist included.
+                            self.remember_playlist(&target);
                             self.toast(format!("Saved {count} track(s) to {}", target.display()));
                         }
                         Err(err) => self.toast(format!("Save failed: {err}")),
                     }
                 }
+                Action::LoadPlaylist(path) => self.open_playlist(&path),
+                Action::UnloadPlaylist => self.loaded_playlist = None,
             }
         }
     }
@@ -1204,14 +1229,77 @@ impl NovaApp {
         track_info_body(ui, track, self.covers.get(track.id));
     }
 
-    /// The song list as it is on screen: the library narrowed by the search
-    /// box. What `Save` writes, so a saved file always matches the view.
+    /// Keep `path` at the head of the Load menu's list, newest first, and
+    /// write the list back to the config.
+    fn remember_playlist(&mut self, path: &Path) {
+        self.config.playlists.retain(|p| p != path);
+        self.config.playlists.insert(0, path.to_path_buf());
+        self.config.playlists.truncate(10); // shortcut: fixed menu length; raise the cap if the list feels short
+        self.config.save();
+    }
+
+    /// Show `path`'s tracks in place of the whole library and make it the
+    /// current playlist. Shared by the Load menu and by startup, which
+    /// replays the config's current playlist.
+    fn open_playlist(&mut self, path: &Path) {
+        let Ok(listed) = read_playlist(path) else {
+            self.toast(format!("Load failed: {}", path.display()));
+            return;
+        };
+        let mut ids = Vec::with_capacity(listed.len());
+        let mut missing = 0usize;
+        for file in listed {
+            // The library hashed canonical paths at scan time, so resolve
+            // the same way a scan would.
+            let canonical = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+            match self.library.track(track_id(&canonical)) {
+                Some(track) => ids.push(track.id),
+                None => missing += 1,
+            }
+        }
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        let found = ids.len();
+        self.loaded_playlist = Some((name, ids));
+        // The loaded file becomes the one "as is" writes.
+        self.config.current_playlist = Some(path.to_path_buf());
+        self.remember_playlist(path);
+        let skipped = if missing > 0 {
+            format!(", {missing} not in the library")
+        } else {
+            String::new()
+        };
+        self.toast(format!("Loaded {found} track(s){skipped}"));
+    }
+
+    /// The song list as it is on screen: the loaded playlist (or the whole
+    /// library) narrowed by the search box. What `Save` writes, so a saved
+    /// file always matches the view.
     fn visible_songs(&self) -> Vec<&Track> {
         let query = self.search.trim().to_lowercase();
-        if query.is_empty() {
-            self.library.tracks().iter().collect()
-        } else {
-            self.library.search(&query, 500)
+        match &self.loaded_playlist {
+            None if query.is_empty() => self.library.tracks().iter().collect(),
+            None => self.library.search(&query, 500),
+            // A loaded playlist keeps its own order; the search box only
+            // narrows within it, reusing the library's matcher.
+            Some((_, ids)) => {
+                let hits: HashSet<TrackId> = if query.is_empty() {
+                    HashSet::new()
+                } else {
+                    self.library
+                        .search(&query, usize::MAX)
+                        .iter()
+                        .map(|t| t.id)
+                        .collect()
+                };
+                ids.iter()
+                    .filter_map(|id| self.library.track(*id))
+                    .filter(|t| query.is_empty() || hits.contains(&t.id))
+                    .collect()
+            }
         }
     }
 
@@ -1236,15 +1324,62 @@ impl NovaApp {
         });
     }
 
+    /// The Load menu over the playlists this install has opened or saved,
+    /// plus `new…` to pick any other file. Loading shows that playlist in
+    /// place of the whole library; `all songs` goes back.
+    fn load_menu(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        ui.menu_button("Load", |ui| {
+            if self.loaded_playlist.is_some() && ui.button("all songs").clicked() {
+                actions.push(Action::UnloadPlaylist);
+                ui.close();
+            }
+            if self.config.playlists.is_empty() {
+                ui.label(RichText::new("No playlists yet.").weak());
+            }
+            for path in &self.config.playlists {
+                let label = path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy()
+                    .into_owned();
+                if ui
+                    .button(&label)
+                    .on_hover_text(path.display().to_string())
+                    .clicked()
+                {
+                    actions.push(Action::LoadPlaylist(path.clone()));
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui.button("new…").clicked() {
+                let mut dialog = rfd::FileDialog::new().add_filter("Playlist", &["m3u8", "m3u"]);
+                if let Some(dir) = self.music_dir.as_deref() {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(path) = dialog.pick_file() {
+                    actions.push(Action::LoadPlaylist(path));
+                }
+                ui.close();
+            }
+        })
+        .response
+        .on_hover_text("playlist");
+    }
+
     /// The row above the song list. Drawn identically with and without a
     /// search filter, so `Clear all` never disappears behind a typed query.
     fn songs_header(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
             ui.heading("Songs");
+            if let Some((name, _)) = &self.loaded_playlist {
+                ui.label(RichText::new(name).weak());
+            }
             if ui.button("Clear all").clicked() {
                 actions.push(Action::HideAll);
             }
             self.save_menu(ui, actions);
+            self.load_menu(ui, actions);
         });
     }
 
@@ -1265,7 +1400,7 @@ impl NovaApp {
                 self.songs_header(ui, actions);
                 ui.label(RichText::new("Click a track to play it.").weak().size(12.0));
                 ui.add_space(4.0);
-                let tracks: Vec<&Track> = self.library.tracks().iter().collect();
+                let tracks = self.visible_songs();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     self.track_list(ui, &tracks, actions);
                 });
@@ -2114,6 +2249,27 @@ fn write_playlist(path: &Path, tracks: &[&Track]) -> std::io::Result<()> {
     std::fs::write(path, body)
 }
 
+/// The file paths an M3U8 playlist lists, in order. Comment lines (`#EXTM3U`,
+/// `#EXTINF`, …) are skipped; a relative line is read against the playlist's
+/// own folder, the way mpv and VLC do.
+fn read_playlist(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let body = std::fs::read_to_string(path)?;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    Ok(body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let file = PathBuf::from(line);
+            if file.is_relative() {
+                dir.join(file)
+            } else {
+                file
+            }
+        })
+        .collect())
+}
+
 fn format_clock(duration: Duration) -> String {
     let total = duration.as_secs();
     format!("{:02}:{:02}", total / 60, total % 60)
@@ -2622,6 +2778,33 @@ mod tests {
             "#EXTM3U\n\
              #EXTINF:236,Test Artist - Test NFM Track\n/music/a.mp3\n\
              #EXTINF:-1,Test NFM Track\n/music/b.flac\n"
+        );
+    }
+
+    /// A saved playlist reads back as the paths it listed, in order, with the
+    /// format's comments dropped and relative lines resolved against the
+    /// playlist's own folder.
+    #[test]
+    fn playlists_are_read_back_in_order() {
+        let dir = std::env::temp_dir().join(format!("nova-m3u8-read-{}", std::process::id()));
+        let path = dir.join("nested").join("list.m3u8");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &path,
+            "#EXTM3U\n#EXTINF:236,Test Artist - Test NFM Track\n\
+             /music/a.mp3\n\nsub/b.flac\n#EXTINF:-1,skipped\n\n/music/c.ogg\n",
+        )
+        .expect("write fixture");
+
+        let files = read_playlist(&path).expect("read");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("/music/a.mp3"),
+                dir.join("nested").join("sub/b.flac"),
+                PathBuf::from("/music/c.ogg"),
+            ]
         );
     }
 
