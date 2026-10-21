@@ -235,6 +235,12 @@ Err acpcm_encode5_auto(const char* path, const pcm_buf* p, uint16_t bits,
 
 Err acpcm_decode(const char* path, pcm_buf* out);
 
+/* Streams the decode to a sample sink (see nofft_sink in nofft.h): begin() is
+   called once with the format and total sample count, then write() per chunk.
+   Produces exactly the samples acpcm_decode returns, without holding the whole
+   clip in memory first. */
+Err acpcm_decode_sink(const char* path, const nofft_sink* sink);
+
 /* ---- in-memory buffer API ----
  *
  * The same containers the path based calls read and write, but handed back in a

@@ -9,6 +9,8 @@ use rodio::{Decoder, MixerDeviceSink, Player, Source as _};
 
 #[cfg(all(feature = "audio", feature = "nofft"))]
 use std::num::NonZero;
+#[cfg(all(feature = "audio", feature = "nofft"))]
+use std::sync::mpsc;
 
 use crate::error::{CoreError, Result};
 use crate::library::Library;
@@ -120,6 +122,171 @@ fn temp_payload_path(ext: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("nova-nfm-{}-{}.{}", std::process::id(), n, ext))
 }
 
+/// One decoded chunk on its way to the audio thread.
+#[cfg(all(feature = "audio", feature = "nofft"))]
+enum Chunk {
+    /// Interleaved samples.
+    Samples(Vec<f32>),
+    /// The decoder stopped early; carries its message for the log.
+    Failed(String),
+}
+
+/// Streams a codec payload through rodio as it decodes, so playback starts on
+/// the first chunk instead of after the whole clip has been unpacked.
+///
+/// A background thread runs the codec's sink decoder into a bounded channel, so
+/// it stays a chunk or two ahead of the audio thread and never holds the whole
+/// clip. `format` arrives once, before the first sample, so the
+/// [`Source`] methods answer correctly from the start.
+#[cfg(all(feature = "audio", feature = "nofft"))]
+struct StreamedPcm {
+    format: nova_codec::StreamFormat,
+    rx: mpsc::Receiver<Chunk>,
+    /// Samples of the current chunk not yet handed out.
+    pending: std::collections::VecDeque<f32>,
+    /// The extracted payload file, removed when this source is dropped.
+    temp: Option<std::path::PathBuf>,
+    /// The path being decoded, so a seek can restart the decode from it.
+    path: std::path::PathBuf,
+}
+
+#[cfg(all(feature = "audio", feature = "nofft"))]
+impl StreamedPcm {
+    /// Starts decoding `path` on a background thread and blocks only until the
+    /// header has been read.
+    fn open(path: &Path, temp: Option<std::path::PathBuf>) -> Result<Self> {
+        let (format, rx) = spawn_decode(path, 0)?;
+        Ok(StreamedPcm {
+            format,
+            rx,
+            pending: std::collections::VecDeque::new(),
+            temp,
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+/// Starts the sink decoder on `path` in a thread, skipping the first
+/// `skip_samples` interleaved samples, and returns the format plus the channel
+/// the samples arrive on.
+///
+/// The codec sink walks the stream forwards only, so a seek is a fresh decode
+/// that drops everything before the target.
+#[cfg(all(feature = "audio", feature = "nofft"))]
+fn spawn_decode(
+    path: &Path,
+    skip_samples: usize,
+) -> Result<(nova_codec::StreamFormat, mpsc::Receiver<Chunk>)> {
+    // A bounded queue: the decoder runs ahead, but no more than this many
+    // chunks, so a long clip costs a fixed few hundred kB.
+    let (tx, rx) = mpsc::sync_channel::<Chunk>(8);
+    let (fmt_tx, fmt_rx) = mpsc::channel::<std::result::Result<nova_codec::StreamFormat, String>>();
+
+    let owned = path.to_path_buf();
+    std::thread::spawn(move || {
+        let begin = |format: nova_codec::StreamFormat| {
+            let _ = fmt_tx.send(Ok(format));
+        };
+        let write = |samples: &[f32]| tx.send(Chunk::Samples(samples.to_vec())).is_ok();
+        let mut skip = skip_samples;
+        // Drop the samples before the seek target as they arrive.
+        let write = move |samples: &[f32]| -> bool {
+            if skip >= samples.len() {
+                skip -= samples.len();
+                return true;
+            }
+            let tail = if skip > 0 { &samples[skip..] } else { samples };
+            skip = 0;
+            write(tail)
+        };
+        if let Err(err) = nova_codec::decode_streaming(&owned, begin, write) {
+            // The format message is only still unsent when `begin` never ran.
+            let _ = tx.send(Chunk::Failed(err.to_string()));
+        }
+    });
+
+    let format = match fmt_rx.recv() {
+        Ok(Ok(format)) => format,
+        Ok(Err(message)) => return Err(CoreError::Audio(message)),
+        Err(_) => {
+            // `begin` never ran: the header could not be read. The decoder
+            // thread has already finished, so read its error if it left one.
+            return match rx.recv() {
+                Ok(Chunk::Failed(message)) => Err(CoreError::Audio(message)),
+                _ => Err(CoreError::Audio(format!(
+                    "cannot decode {}: no stream header",
+                    path.display()
+                ))),
+            };
+        }
+    };
+    Ok((format, rx))
+}
+
+#[cfg(all(feature = "audio", feature = "nofft"))]
+impl Iterator for StreamedPcm {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        loop {
+            if let Some(sample) = self.pending.pop_front() {
+                return Some(sample);
+            }
+            match self.rx.recv() {
+                Ok(Chunk::Samples(samples)) => self.pending.extend(samples),
+                Ok(Chunk::Failed(message)) => {
+                    log::warn!("streaming decode stopped early: {message}");
+                    return None;
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "audio", feature = "nofft"))]
+impl rodio::Source for StreamedPcm {
+    fn current_span_len(&self) -> Option<usize> {
+        Some(self.pending.len())
+    }
+
+    fn channels(&self) -> rodio::ChannelCount {
+        NonZero::<u16>::new(self.format.channels).unwrap_or(NonZero::<u16>::MIN)
+    }
+
+    fn sample_rate(&self) -> rodio::SampleRate {
+        NonZero::<u32>::new(self.format.sample_rate).unwrap_or(NonZero::<u32>::MIN)
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        Some(self.format.duration())
+    }
+
+    fn try_seek(&mut self, pos: Duration) -> std::result::Result<(), rodio::source::SeekError> {
+        // The codec sink decodes forwards only, so a seek restarts the decode
+        // and drops the samples before `pos`.
+        let per_frame = usize::from(self.format.channels.max(1));
+        let skip = (pos.as_secs_f64() * f64::from(self.format.sample_rate)) as usize * per_frame;
+        let (format, rx) =
+            spawn_decode(&self.path, skip).map_err(|_| rodio::source::SeekError::NotSupported {
+                underlying_source: std::any::type_name::<Self>(),
+            })?;
+        self.format = format;
+        self.rx = rx;
+        self.pending.clear();
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "audio", feature = "nofft"))]
+impl Drop for StreamedPcm {
+    fn drop(&mut self) {
+        if let Some(temp) = self.temp.take() {
+            let _ = std::fs::remove_file(temp);
+        }
+    }
+}
+
 /// Plays audio through the operating system's default output device.
 #[cfg(feature = "audio")]
 pub struct RodioBackend {
@@ -134,6 +301,32 @@ pub struct RodioBackend {
     paused: bool,
 }
 
+/// Removes payload files left behind by an earlier run.
+///
+/// A streamed NFM payload lives in the temp dir for as long as the track plays,
+/// so a crash or a kill leaves it there. The name carries the writing process
+/// id, so anything that is not from this process is stale.
+#[cfg(all(feature = "audio", feature = "nofft"))]
+fn remove_stale_payloads() {
+    let Ok(dir) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("nova-nfm-") else {
+            continue;
+        };
+        let Some(pid) = rest.split('-').next() else {
+            continue;
+        };
+        if pid.parse::<u32>() == Ok(std::process::id()) {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
 #[cfg(feature = "audio")]
 impl RodioBackend {
     /// Opens the default output device.
@@ -141,6 +334,8 @@ impl RodioBackend {
     /// Fails with [`CoreError::Audio`] when no device is available, which the
     /// engine turns into a fallback to [`NullBackend`].
     pub fn new() -> Result<Self> {
+        #[cfg(feature = "nofft")]
+        remove_stale_payloads();
         let mut sink = rodio::DeviceSinkBuilder::open_default_sink()
             .map_err(|e| CoreError::Audio(format!("could not open output device: {e}")))?;
         sink.log_on_drop(false);
@@ -163,9 +358,10 @@ impl AudioBackend for RodioBackend {
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
-        // NFM containers wrap an inner codec payload.  Extract the payload to a
+        // NFM containers wrap an inner codec payload. Extract the payload to a
         // temp file whose extension tells the codec branch below which decoder
-        // to use, then decode it normally.
+        // to use, then stream it. The temp file outlives this call — the source
+        // that owns it removes it when playback moves on.
         #[cfg(feature = "nofft")]
         if crate::metadata::is_nfm(path) {
             let nfm = nova_codec::nfm_read(path).map_err(|e| {
@@ -178,27 +374,32 @@ impl AudioBackend for RodioBackend {
             let tmp = temp_payload_path(ext);
             std::fs::write(&tmp, &nfm.payload)
                 .map_err(|e| CoreError::Audio(format!("cannot extract NFM payload: {e}")))?;
-            let result = self.load(&tmp);
-            let _ = std::fs::remove_file(&tmp);
-            return result;
+            let source = match StreamedPcm::open(&tmp, Some(tmp.clone())) {
+                Ok(source) => source,
+                Err(err) => {
+                    // Nothing owns the temp file yet, so remove it here.
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(err);
+                }
+            };
+            self.duration = Some(source.format.duration());
+            // `clear` also pauses, so we always resume explicitly below.
+            self.player.clear();
+            self.player.append(source);
+            self.player.set_volume(self.volume);
+            self.player.play();
+            self.paused = false;
+            self.clock.start(Duration::ZERO);
+            return Ok(());
         }
 
         // Files from the vendored No_FFT codecs are not something symphonia
-        // (and therefore `Decoder`) can read, so decode them ourselves and feed
-        // the samples to rodio as an in-memory buffer.
+        // (and therefore `Decoder`) can read, so stream them through the
+        // codec's own sink decoder.
         #[cfg(feature = "nofft")]
         if crate::metadata::is_codec(path) {
-            let pcm = nova_codec::decode(path)
-                .map_err(|e| CoreError::Audio(format!("cannot decode {}: {e}", path.display())))?;
-            let channels = NonZero::new(pcm.channels).ok_or_else(|| {
-                CoreError::Audio(format!("{} reports no channels", path.display()))
-            })?;
-            let sample_rate = NonZero::new(pcm.sample_rate).ok_or_else(|| {
-                CoreError::Audio(format!("{} reports no sample rate", path.display()))
-            })?;
-
-            self.duration = Some(pcm.duration());
-            let source = rodio::buffer::SamplesBuffer::new(channels, sample_rate, pcm.samples);
+            let source = StreamedPcm::open(path, None)?;
+            self.duration = Some(source.format.duration());
             // `clear` also pauses, so we always resume explicitly below.
             self.player.clear();
             self.player.append(source);

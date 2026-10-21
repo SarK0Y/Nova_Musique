@@ -85,6 +85,43 @@ Err nofft_decode_buf(const uint8_t* data, size_t len, pcm_buf* out);
 /* Releases a buffer returned by nofft_encode_buf. */
 void nofft_buf_free(void* p);
 
+/* ---- streaming decode via a sample sink ----
+ *
+ * A sink receives samples as the decoder produces them instead of after the
+ * whole clip has been unpacked into a pcm_buf, so output can start flowing
+ * before the decode finishes.  begin() is called once with the format and the
+ * total sample count (both known from the header); write() is then called once
+ * per decoded frame with interleaved samples.  Either callback may be NULL.
+ * Both return ERR_OK to continue; anything else aborts the decode and is
+ * returned to the caller. */
+typedef struct nofft_sink {
+    void* user;
+    Err (*begin)(void* user, uint32_t sample_rate, uint16_t channels,
+                 size_t total_samples);
+    Err (*write)(void* user, const float* samples, size_t count);
+} nofft_sink;
+
+Err nofft_decode_sink(const char* path, const nofft_sink* sink);
+
+/* Streams a byte buffer produced by nofft_encode_buf / nofft_encode. */
+Err nofft_decode_buf_sink(const uint8_t* data, size_t len, const nofft_sink* sink);
+
+/* A ready-made nofft_sink that writes a WAV file as samples arrive.  Zero the
+   struct, call nofft_wav_sink_init, hand &s.sink to a decode_sink call, then
+   call nofft_wav_sink_fini.  channels / sample_rate / total are filled in by
+   begin and are handy for a summary line once decoding returns. */
+typedef struct nofft_wav_sink {
+    nofft_sink  sink;        /* pass this to a decode_sink call */
+    const char* path;        /* output path, read when begin runs */
+    void*       handle;      /* private: the open writer */
+    uint16_t    channels;    /* set by begin */
+    uint32_t    sample_rate; /* set by begin */
+    size_t      total;       /* total samples, set by begin */
+} nofft_wav_sink;
+
+void nofft_wav_sink_init(nofft_wav_sink* s, const char* path);
+void nofft_wav_sink_fini(nofft_wav_sink* s);
+
 /* Reads only the header of a .no_fft file and reports which fit was used.
    Version 2 and 3 files report NOFFT_FIT_INTERP. */
 Err nofft_file_fit(const char* path, nofft_fit* out_fit);

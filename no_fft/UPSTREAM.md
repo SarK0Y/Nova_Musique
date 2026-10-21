@@ -11,8 +11,8 @@ pinned to the `trunk` branch (dev mode).
 | Repo    | `https://github.com/SarK0Y/No_FFT_v0.git` |
 | Mode    | `dev` |
 | Branch  | `trunk` |
-| Commit  | `7c20bf2bbad94395b5cfc27bc81a9bb048b32299` |
-| Date    | `2026-10-15T12:50:14+03:00` |
+| Commit  | `166c1bdcb3b950d45b7048c6adfe2819c024ea67` |
+| Date    | `2026-10-21T20:45:56+03:00` |
 
 ## Vendored files
 

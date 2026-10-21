@@ -61,6 +61,12 @@ void read_u16le(const uint8_t* d, uint16_t* out) {
 
 }  // namespace
 
+// Callback shapes for `nova_decode_sink`, matching the `nofft_sink` fields in
+// nofft.h. Declared at file scope so Rust can name them.
+typedef Err (*nova_sink_begin_fn)(void* user, uint32_t sample_rate, uint16_t channels,
+                                  size_t total_samples);
+typedef Err (*nova_sink_write_fn)(void* user, const float* samples, size_t count);
+
 extern "C" {
 
 // 0 for a polynomial `.no_fft` ("NOFF"), 1 for a `.nadc` (NFA1..NFA6), 2 for
@@ -167,6 +173,32 @@ int nova_decode(const char* path, float** out_samples, size_t* out_count,
     *out_rate = buf.sample_rate;
     *out_channels = buf.channels;
     return (int)ERR_OK;
+}
+
+// Streaming decode: hands samples to the caller as the decoder produces them
+// instead of assembling the whole clip first (upstream `nofft_sink`). `begin`
+// runs once with the format and total sample count, `write` once per chunk of
+// interleaved samples. Either may be NULL. `user` is passed straight through.
+// A non-zero return from a callback aborts the decode and comes back to the
+// caller unchanged.
+int nova_decode_sink(const char* path, void* user, nova_sink_begin_fn begin,
+                     nova_sink_write_fn write) {
+    if (path == nullptr) {
+        return (int)ERR_BAD_ARGS;
+    }
+
+    const int kind = nova_codec_kind(path);
+    if (kind < 0) {
+        return (int)ERR_BAD_NOFFT;
+    }
+
+    nofft_sink sink;
+    sink.user = user;
+    sink.begin = begin;
+    sink.write = write;
+
+    const Err e = (kind == 0) ? nofft_decode_sink(path, &sink) : acpcm_decode_sink(path, &sink);
+    return (int)e;
 }
 
 // Releases a buffer handed out by nova_decode.

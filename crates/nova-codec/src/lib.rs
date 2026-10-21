@@ -1,7 +1,7 @@
 //! Safe Rust bindings to the vendored **No_FFT** codecs.
 //!
 //! Nova links the upstream C++ codec sources
-//! ([`SarK0Y/No_FFT_v0`](https://github.com/SarK0Y/No_FFT_v0), the `main`
+//! ([`SarK0Y/No_FFT_v0`](https://github.com/SarK0Y/No_FFT_v0), the `trunk`
 //! branch) into the binary via `build.rs` and talks to them through a tiny C
 //! ABI shim (`shim/nova_nofft_shim.cpp`). This crate is the only place that
 //! touches that `unsafe` surface; everything above it is plain Rust.
@@ -18,6 +18,9 @@
 //! Detection is by the magic bytes, not the file name, so a renamed file
 //! still decodes. [`info`] reads only the header (cheap enough for a library
 //! scan) and [`decode`] produces interleaved `f32` PCM ready for playback.
+//! [`decode_streaming`] does the same through the upstream sample sink, handing
+//! samples over as they are produced, so playback need not wait for the whole
+//! clip.
 //! NFM files are unwrapped transparently: [`nfm_read`] extracts the inner
 //! payload, metadata and cover image. Both the current container layout and the
 //! older v1 layout are accepted.
@@ -45,6 +48,11 @@ pub const CODEC_EXTENSIONS: &[&str] = &["no_fft", "nadc"];
 mod ffi {
     //! The C ABI exported by `shim/nova_nofft_shim.cpp`.
     use std::ffi::{c_char, c_int};
+
+    /// `Err (*)(void*, uint32_t, uint16_t, size_t)` from `nofft_sink.begin`.
+    pub type SinkBegin = unsafe extern "C" fn(*mut std::ffi::c_void, u32, u16, usize) -> c_int;
+    /// `Err (*)(void*, const float*, size_t)` from `nofft_sink.write`.
+    pub type SinkWrite = unsafe extern "C" fn(*mut std::ffi::c_void, *const f32, usize) -> c_int;
 
     extern "C" {
         pub fn nova_codec_kind(path: *const c_char) -> c_int;
@@ -90,6 +98,13 @@ mod ffi {
         ) -> c_int;
         pub fn nova_free(samples: *mut f32);
         pub fn nova_err_str(code: c_int) -> *const c_char;
+
+        pub fn nova_decode_sink(
+            path: *const c_char,
+            user: *mut std::ffi::c_void,
+            begin: SinkBegin,
+            write: SinkWrite,
+        ) -> c_int;
 
         pub fn nova_gen_wav(path: *const c_char, seconds: f64, channels: u32, rate: u32) -> c_int;
         pub fn nova_encode_nofft(
@@ -302,6 +317,120 @@ pub fn decode(path: &Path) -> Result<Pcm, CodecError> {
         sample_rate: rate,
         channels,
     })
+}
+
+/// Format reported by [`decode_streaming`] before the first sample arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamFormat {
+    /// Samples per second per channel.
+    pub sample_rate: u32,
+    /// Channel count (interleaved).
+    pub channels: u16,
+    /// Total interleaved samples the decoder will produce.
+    pub total_samples: usize,
+}
+
+impl StreamFormat {
+    /// Frames (one sample per channel) implied by the header.
+    pub fn frames(&self) -> usize {
+        if self.channels == 0 {
+            0
+        } else {
+            self.total_samples / self.channels as usize
+        }
+    }
+
+    /// Playback length implied by the header.
+    pub fn duration(&self) -> Duration {
+        if self.sample_rate == 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_secs_f64(self.frames() as f64 / f64::from(self.sample_rate))
+    }
+}
+
+/// Decodes a codec file, handing chunks of interleaved `f32` samples to `write`
+/// as the decoder produces them, so playback can start before the whole clip is
+/// unpacked (upstream `nofft_sink`).
+///
+/// `begin` runs once with the stream format and total sample count, both known
+/// from the container header. Both callbacks return `true` to continue; `false`
+/// aborts the decode and makes this return [`CodecError`].
+pub fn decode_streaming<B, W>(path: &Path, begin: B, write: W) -> Result<StreamFormat, CodecError>
+where
+    B: FnMut(StreamFormat),
+    W: FnMut(&[f32]) -> bool,
+{
+    /// Carries the Rust closures across the C callback boundary.
+    struct Callbacks<B: FnMut(StreamFormat), W: FnMut(&[f32]) -> bool> {
+        begin: B,
+        write: W,
+        format: StreamFormat,
+        aborted: bool,
+    }
+
+    unsafe extern "C" fn on_begin<B: FnMut(StreamFormat), W: FnMut(&[f32]) -> bool>(
+        user: *mut std::ffi::c_void,
+        sample_rate: u32,
+        channels: u16,
+        total_samples: usize,
+    ) -> c_int {
+        // SAFETY: `user` is the `&mut Callbacks` passed to `nova_decode_sink`
+        // below, still alive for the whole call.
+        let state = unsafe { &mut *(user as *mut Callbacks<B, W>) };
+        state.format = StreamFormat {
+            sample_rate,
+            channels,
+            total_samples,
+        };
+        (state.begin)(state.format);
+        0
+    }
+
+    unsafe extern "C" fn on_write<B: FnMut(StreamFormat), W: FnMut(&[f32]) -> bool>(
+        user: *mut std::ffi::c_void,
+        samples: *const f32,
+        count: usize,
+    ) -> c_int {
+        // SAFETY: as above; `samples` points to `count` initialised floats that
+        // stay valid for the duration of this call.
+        let state = unsafe { &mut *(user as *mut Callbacks<B, W>) };
+        let slice = unsafe { std::slice::from_raw_parts(samples, count) };
+        if (state.write)(slice) {
+            0
+        } else {
+            state.aborted = true;
+            -1
+        }
+    }
+
+    let c_path = c_path(path)?;
+    let mut state = Callbacks {
+        begin,
+        write,
+        format: StreamFormat {
+            sample_rate: 0,
+            channels: 0,
+            total_samples: 0,
+        },
+        aborted: false,
+    };
+    let code = unsafe {
+        ffi::nova_decode_sink(
+            c_path.as_ptr(),
+            &mut state as *mut _ as *mut std::ffi::c_void,
+            on_begin::<B, W>,
+            on_write::<B, W>,
+        )
+    };
+    if state.aborted {
+        return Err(CodecError {
+            code: -1,
+            message: "decode stopped by the caller".to_string(),
+        });
+    }
+    check(code)?;
+    Ok(state.format)
 }
 
 /// Text metadata extracted from an NFM container.
@@ -903,6 +1032,69 @@ mod tests {
         // The inner payload still probes and decodes as its own codec.
         let kind = kind_from_bytes(&read.payload).expect("inner kind");
         assert_eq!(kind, CodecKind::Nfa);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn streaming_decode_matches_the_buffered_one() {
+        let dir = tmpdir("stream");
+        let wav = test_wav(&dir);
+        let nfa = dir.join("signal.nfa5.nadc");
+        encode_nadc(&wav, &nfa, 6, NadcVariant::Nfa5).expect("encode");
+        let poly = dir.join("signal.poly.no_fft");
+        encode_nofft(&wav, &poly, 256, 8).expect("encode poly");
+
+        for path in [&nfa, &poly] {
+            let buffered = decode(path).expect("buffered decode");
+
+            let mut format = None;
+            let mut streamed: Vec<f32> = Vec::new();
+            let mut chunks = 0usize;
+            let reported = decode_streaming(
+                path,
+                |f| format = Some(f),
+                |samples| {
+                    chunks += 1;
+                    streamed.extend_from_slice(samples);
+                    true
+                },
+            )
+            .expect("streaming decode");
+
+            let format = format.expect("begin ran");
+            assert_eq!(format.sample_rate, buffered.sample_rate);
+            assert_eq!(format.channels, buffered.channels);
+            assert_eq!(format.total_samples, buffered.samples.len());
+            assert_eq!(format.frames(), buffered.frames());
+            assert_eq!(reported, format);
+            assert!(chunks > 0, "no chunks arrived");
+            assert_eq!(streamed, buffered.samples, "streamed samples differ");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn streaming_decode_stops_when_the_writer_says_so() {
+        let dir = tmpdir("stream_stop");
+        let wav = test_wav(&dir);
+        let nfa = dir.join("signal.nfa1.nadc");
+        encode_nadc(&wav, &nfa, 6, NadcVariant::Nfa1).expect("encode");
+
+        let mut seen = 0usize;
+        let err = decode_streaming(
+            &nfa,
+            |_| {},
+            |samples| {
+                seen += samples.len();
+                // Refuse after the first chunk.
+                false
+            },
+        )
+        .expect_err("writer refusal aborts the decode");
+        assert!(err.to_string().contains("stopped by the caller"));
+        assert!(seen > 0, "the first chunk should have arrived");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

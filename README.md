@@ -47,8 +47,9 @@ but for music you already own on disk.
   row) add to that playlist instead — see [Playlists](#playlists).
 - **No_FFT codecs** — `.no_fft` (polynomial fit), `.nadc` (NFA1–NFA6 DPCM /
   basket) and `.nfm` (a container wrapping any codec with metadata and a cover)
-  are indexed and played in-process through the vendored upstream codecs. See
-  [Codecs](#codecs).
+  are indexed and played in-process through the vendored upstream codecs, which
+  decode through a sample sink so playback starts before the file is fully
+  unpacked. See [Codecs](#codecs).
 - **Video** — video files are indexed alongside music and play **in the main
   window**: the picture takes over the sidebar and the playlist, with the top
   bar and transport bar still around it. libmpv decodes straight into an
@@ -571,6 +572,22 @@ unwrapped first: its text metadata (title/artist/album) and optional cover image
 are read for indexing, and the inner codec payload is decoded for playback
 (via a short-lived temp file). There are no external tools.
 
+### Streaming playback
+
+Codec files are decoded through the upstream **sample sink** API, so the
+decoder hands samples to the player as it produces them instead of unpacking
+the whole clip first:
+
+- the first audio starts after the header is read, not after the full decode —
+  a 60 s file goes from ~700 ms of silence to ~17 ms;
+- memory stays flat: only a few chunks are in flight, not the whole clip;
+- the seek bar still works: a seek restarts the decode and drops the samples
+  before the target, because the sink decodes forwards only.
+
+An `.nfm` is unwrapped to its inner payload first, which needs a temp file; the
+file is removed when playback moves on, and any left behind by a killed run is
+cleaned up at the next start.
+
 Both NFM container revisions are read: the current layout (mandatory image
 block before the text fields) and the older v1 layout (text fields, then an
 optional image block) — including header-only v1 files with `header_len == 0`.
@@ -579,7 +596,7 @@ optional image block) — including header-only v1 files with `header_len == 0`.
 
 | Path | Role |
 | --- | --- |
-| `no_fft/` | Pristine, unmodified copy of the upstream `main` sources. |
+| `no_fft/` | Pristine, unmodified copy of the upstream `trunk` sources. |
 | `crates/nova-codec/` | The C ABI shim (`shim/nova_nofft_shim.cpp`), `build.rs`, and safe Rust wrappers. |
 | `scripts/sync-nofft.sh` | Re-vendors the sources from upstream `main`/trunk. |
 
@@ -649,7 +666,8 @@ The test suite needs no audio hardware and no external tools:
   search, queue semantics (shuffle/repeat/insert) and engine advance/pause/seek.
 - `crates/nova-codec` tests round-trip a generated signal through the polynomial
   codec and all six NFA variants, and round-trip NFM containers (with and
-  without metadata/cover), so no binary fixtures are needed.
+  without metadata/cover), so no binary fixtures are needed. The streaming
+  decoder is checked against the buffered one: same samples, same order.
 - `crates/nova-core/tests/library_integration.rs` synthesises WAV files into a
   temporary directory and exercises the real scan → cache → play loop.
 

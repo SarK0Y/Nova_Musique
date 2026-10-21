@@ -2128,6 +2128,76 @@ Err acpcm_decode_buf(const uint8_t* data, size_t len, pcm_buf* out)
     return e;
 }
 
+Err acpcm_decode_sink(const char* path, const nofft_sink* sink)
+{
+    if (path == NULL || sink == NULL)
+        return ERR_BAD_ARGS;
+
+    AcpcmDecoder* d = NULL;
+    Err e = acpcm_dec_open(path, &d);
+    if (e != ERR_OK)
+        return e;
+
+    size_t ch = d->info.channels;
+    size_t frames = d->frames;
+    if (frames > (SIZE_MAX / sizeof(float)) / (ch == 0 ? 1 : ch)) {
+        acpcm_dec_close(d);
+        return ERR_NO_MEMORY;
+    }
+
+    if (sink->begin != NULL) {
+        e = sink->begin(sink->user, d->info.sample_rate, (uint16_t)ch,
+                        frames * ch);
+        if (e != ERR_OK) {
+            acpcm_dec_close(d);
+            return e;
+        }
+    }
+
+    if (frames == 0) {
+        acpcm_dec_close(d);
+        return ERR_OK;
+    }
+
+    /* Pull a bounded number of frames at a time and hand each chunk straight to
+       the sink, so the clip is never assembled in memory first. */
+    size_t cap = 4096;
+    if (cap > frames)
+        cap = frames;
+    float* scratch = (float*)malloc(cap * ch * sizeof(float));
+    if (scratch == NULL) {
+        acpcm_dec_close(d);
+        return ERR_NO_MEMORY;
+    }
+
+    size_t done = 0;
+    while (done < frames) {
+        size_t want = frames - done;
+        size_t got = 0;
+        if (want > cap)
+            want = cap;
+        e = acpcm_dec_read(d, scratch, want, &got);
+        if (e != ERR_OK || got == 0) {
+            free(scratch);
+            acpcm_dec_close(d);
+            return (e == ERR_OK) ? ERR_BAD_NOFFT : e;
+        }
+        if (sink->write != NULL) {
+            e = sink->write(sink->user, scratch, got * ch);
+            if (e != ERR_OK) {
+                free(scratch);
+                acpcm_dec_close(d);
+                return e;
+            }
+        }
+        done += got;
+    }
+
+    free(scratch);
+    acpcm_dec_close(d);
+    return ERR_OK;
+}
+
 
 #ifdef HAVE_ALSA
 #include <alsa/asoundlib.h>

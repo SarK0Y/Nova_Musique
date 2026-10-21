@@ -309,6 +309,95 @@ Err wav_save(const char* path, const pcm_buf* p)
     return ERR_OK;
 }
 
+/* ---- streaming WAV sink ----
+ *
+ * A nofft_sink that opens a WAV file in begin() and appends frames in write().
+ * drwav patches the RIFF/data sizes when the writer is released, so a partial
+ * decode still leaves a readable (short) file rather than a corrupt one. */
+static Err nofft_wav_sink_begin(void* user, uint32_t sr, uint16_t ch,
+                                size_t total)
+{
+    nofft_wav_sink* s = (nofft_wav_sink*)user;
+    drwav_data_format fmt;
+    drwav* w;
+    FILE* probe;
+
+    if (s == NULL || s->handle != NULL || s->path == NULL)
+        return ERR_BAD_ARGS;
+
+    /* Create the file up front so an unwritable path fails before any work. */
+    probe = fopen(s->path, "wb");
+    if (probe == NULL)
+        return ERR_OPEN;
+    fclose(probe);
+
+    w = (drwav*)malloc(sizeof(drwav));
+    if (w == NULL)
+        return ERR_NO_MEMORY;
+
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.container = drwav_container_riff;
+    fmt.format = DR_WAVE_FORMAT_IEEE_FLOAT;
+    fmt.channels = ch;
+    fmt.sampleRate = sr;
+    fmt.bitsPerSample = 32;
+
+    if (!drwav_init_file_write(w, s->path, &fmt, nullptr)) {
+        free(w);
+        return ERR_OPEN;
+    }
+
+    s->handle = w;
+    s->channels = ch;
+    s->sample_rate = sr;
+    s->total = total;
+    return ERR_OK;
+}
+
+static Err nofft_wav_sink_write(void* user, const float* samples, size_t count)
+{
+    nofft_wav_sink* s = (nofft_wav_sink*)user;
+    drwav* w = (s != NULL) ? (drwav*)s->handle : NULL;
+    drwav_uint64 frames;
+
+    if (w == NULL || samples == NULL || s->channels == 0)
+        return ERR_BAD_ARGS;
+    if (count % (size_t)s->channels != 0)
+        return ERR_BAD_ARGS;
+
+    frames = (drwav_uint64)(count / (size_t)s->channels);
+    if (frames == 0)
+        return ERR_OK;
+    if (drwav_write_pcm_frames(w, frames, samples) != frames)
+        return ERR_IO;
+    return ERR_OK;
+}
+
+void nofft_wav_sink_init(nofft_wav_sink* s, const char* path)
+{
+    if (s == NULL)
+        return;
+    s->sink.user = s;
+    s->sink.begin = nofft_wav_sink_begin;
+    s->sink.write = nofft_wav_sink_write;
+    s->path = path;
+    s->handle = NULL;
+    s->channels = 0;
+    s->sample_rate = 0;
+    s->total = 0;
+}
+
+void nofft_wav_sink_fini(nofft_wav_sink* s)
+{
+    if (s == NULL)
+        return;
+    if (s->handle != NULL) {
+        drwav_uninit((drwav*)s->handle);
+        free(s->handle);
+        s->handle = NULL;
+    }
+}
+
 uint16_t nofft_effective_degree(uint16_t degree, uint32_t len)
 {
     if (len <= 1)
@@ -1175,7 +1264,7 @@ static int src_read(byte_source* s, void* dst, size_t n)
     return 1;
 }
 
-static Err decode_impl(byte_source* src, pcm_buf* out)
+static Err decode_impl(byte_source* src, pcm_buf* out, const nofft_sink* sink)
 {
     uint8_t hdr[NOFFT_HEADER_SIZE];
     uint32_t version, sr, frame_len, n_frames, last_len;
@@ -1185,11 +1274,13 @@ static Err decode_impl(byte_source* src, pcm_buf* out)
     uint64_t total_frames, total_samples;
     uint32_t fi;
     float* buf = NULL;
+    float* frame = NULL;
     double* coefs = NULL;
     size_t used = 0;
     Err rc = ERR_OK;
 
-    memset(out, 0, sizeof(*out));
+    if (out != NULL)
+        memset(out, 0, sizeof(*out));
 
     /* validate magic, version and the version-dependent format bytes first */
     if (!src_read(src, hdr, NOFFT_HEADER_SIZE))
@@ -1219,13 +1310,32 @@ static Err decode_impl(byte_source* src, pcm_buf* out)
     if (total_samples > (uint64_t)((SIZE_MAX / sizeof(float)) - 1))
         return ERR_NO_MEMORY;
 
-    buf = (float*)malloc((size_t)total_samples * sizeof(float));
-    if (buf == NULL)
-        return ERR_NO_MEMORY;
+    if (sink != NULL) {
+        /* Streaming: no whole-clip buffer, just one frame-sized scratch to hand
+           to the sink, so nothing waits for the complete unpack. */
+        if ((uint64_t)frame_len * (uint64_t)ch >
+            (uint64_t)((SIZE_MAX / sizeof(float)) - 1))
+            return ERR_NO_MEMORY;
+        frame = (float*)malloc((size_t)frame_len * (size_t)ch * sizeof(float));
+        if (frame == NULL)
+            return ERR_NO_MEMORY;
+        if (sink->begin != NULL) {
+            rc = sink->begin(sink->user, sr, ch, (size_t)total_samples);
+            if (rc != ERR_OK) {
+                free(frame);
+                return rc;
+            }
+        }
+    } else {
+        buf = (float*)malloc((size_t)total_samples * sizeof(float));
+        if (buf == NULL)
+            return ERR_NO_MEMORY;
+    }
 
     coefs = (double*)malloc(sizeof(double) * (size_t)(nofft_effective_degree(degree, frame_len) + 1) * ch);
     if (coefs == NULL) {
         free(buf);
+        free(frame);
         return ERR_NO_MEMORY;
     }
 
@@ -1237,6 +1347,9 @@ static Err decode_impl(byte_source* src, pcm_buf* out)
         uint16_t ci;
         uint8_t fill_q = 0;
         uint8_t bnd_q[2] = { 0, 0 };
+        /* Streaming feeds a reusable frame scratch; collecting writes straight
+           into the clip buffer at `used`, exactly as before. */
+        float* dst = (sink != NULL) ? frame : (buf + used);
 
         if (version >= 6) {
             if (!src_read(src, bnd_q, 2)) {
@@ -1312,23 +1425,32 @@ static Err decode_impl(byte_source* src, pcm_buf* out)
                                 v -= (v - lo) * r;
                         }
                     }
-                    buf[used + (size_t)k * ch + ci] = (float)v;
+                    dst[(size_t)k * ch + ci] = (float)v;
                 }
             }
+        }
+
+        if (sink != NULL && sink->write != NULL) {
+            rc = sink->write(sink->user, dst, (size_t)len * ch);
+            if (rc != ERR_OK)
+                goto done;
         }
 
         used += (size_t)len * ch;
     }
 
-    out->samples = buf;
-    out->count = used;
-    out->sample_rate = sr;
-    out->channels = ch;
-    buf = NULL;
+    if (out != NULL) {
+        out->samples = buf;
+        out->count = used;
+        out->sample_rate = sr;
+        out->channels = ch;
+        buf = NULL;
+    }
 
 done:
     free(coefs);
     free(buf);
+    free(frame);
     return rc;
 }
 
@@ -1350,7 +1472,7 @@ Err nofft_decode(const char* path, pcm_buf* out)
     src.len = 0;
     src.pos = 0;
 
-    rc = decode_impl(&src, out);
+    rc = decode_impl(&src, out, NULL);
     fclose(f);
     return rc;
 }
@@ -1367,7 +1489,45 @@ Err nofft_decode_buf(const uint8_t* data, size_t len, pcm_buf* out)
     src.len = len;
     src.pos = 0;
 
-    return decode_impl(&src, out);
+    return decode_impl(&src, out, NULL);
+}
+
+Err nofft_decode_sink(const char* path, const nofft_sink* sink)
+{
+    byte_source src;
+    FILE* f;
+    Err rc;
+
+    if (path == NULL || sink == NULL)
+        return ERR_BAD_ARGS;
+
+    f = fopen(path, "rb");
+    if (f == NULL)
+        return ERR_OPEN;
+
+    src.f = f;
+    src.mem = NULL;
+    src.len = 0;
+    src.pos = 0;
+
+    rc = decode_impl(&src, NULL, sink);
+    fclose(f);
+    return rc;
+}
+
+Err nofft_decode_buf_sink(const uint8_t* data, size_t len, const nofft_sink* sink)
+{
+    byte_source src;
+
+    if (data == NULL || sink == NULL)
+        return ERR_BAD_ARGS;
+
+    src.f = NULL;
+    src.mem = data;
+    src.len = len;
+    src.pos = 0;
+
+    return decode_impl(&src, NULL, sink);
 }
 
 float nofft_decode_snr_db(const float* a, const float* b, size_t n)
