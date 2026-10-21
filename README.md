@@ -508,11 +508,13 @@ until then.
   live and shows `Converting n/total…`; a toast reports the result and the
   failure count when it finishes.
 
-It converts **the current playlist** when one is loaded, otherwise the whole
-library. Each source file is decoded in-process, re-encoded to NFA5 and wrapped
-with its tags and embedded cover (PNG or JPEG). Codec sources (`.nadc` /
-`.no_fft` / `.nfm`) are already No_FFT, so converting those is not the point —
-this is for the ordinary MP3/FLAC/etc. in the library.
+The files are split into one group per CPU core and the groups convert in
+parallel (never more groups than files). It converts **the current playlist**
+when one is loaded, otherwise the whole library. Each source file is decoded
+in-process, re-encoded to NFA5 and wrapped with its tags and embedded cover
+(PNG or JPEG). Codec sources (`.nadc` / `.no_fft` / `.nfm`) are already No_FFT,
+so converting those is not the point — this is for the ordinary
+MP3/FLAC/etc. in the library.
 
 ### Hiding songs
 

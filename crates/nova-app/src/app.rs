@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -2137,6 +2138,13 @@ impl NovaApp {
         }
 
         let total = paths.len();
+        // One thread per group: the files are split into as many contiguous
+        // groups as there are cores (never more groups than files).
+        let groups = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, total);
+        let chunk = total.div_ceil(groups);
         let (tx, rx) = mpsc::channel();
         self.nfm_rx = Some(rx);
         self.nfm_progress = Some((0, total));
@@ -2144,21 +2152,35 @@ impl NovaApp {
         // NFA5 stores `bits` in its header but the grid is what matters; the
         // rate control is what the user dials.
         let bits = 6u16;
-        std::thread::spawn(move || {
-            for (index, src) in paths.iter().enumerate() {
-                let error = metadata::convert_to_nfm(src, &dir, rate, bits)
-                    .err()
-                    .map(|err| err.to_string());
-                let message = NfmMsg::Progress {
-                    done: index + 1,
-                    total,
-                    error,
-                };
-                if tx.send(message).is_err() {
-                    break;
+        // Shared across the group threads, so `done` counts the whole run
+        // rather than one group, and the last message to arrive is the only
+        // one that reads `total`.
+        let done = Arc::new(AtomicUsize::new(0));
+        for group in paths.chunks(chunk) {
+            let group = group.to_vec();
+            let tx = tx.clone();
+            let done = Arc::clone(&done);
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                for src in group {
+                    // A codec panic must not strand the run: count the file
+                    // as a failure and keep going, so `done` still reaches
+                    // `total` and the window finishes.
+                    let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        metadata::convert_to_nfm(&src, &dir, rate, bits)
+                    }))
+                    .map_err(|_| format!("panic while converting {}", src.display()))
+                    .and_then(|result| result.map_err(|err| err.to_string()))
+                    .err();
+                    let done = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if tx.send(NfmMsg::Progress { done, total, error }).is_err() {
+                        return;
+                    }
                 }
-            }
-        });
+            });
+        }
+        // The receivers' end closes only once every group's sender is gone.
+        drop(tx);
         self.toast(format!("Converting {total} track(s) to NFM…"));
     }
 
@@ -2181,7 +2203,12 @@ impl NovaApp {
 
         for msg in messages {
             let NfmMsg::Progress { done, total, error } = msg;
-            self.nfm_progress = Some((done, total));
+            // Out-of-order arrivals: keep the highest count, so the display
+            // only ever moves forward.
+            if self.nfm_progress.is_some_and(|(seen, _)| done > seen) || self.nfm_progress.is_none()
+            {
+                self.nfm_progress = Some((done, total));
+            }
             if let Some(err) = error {
                 self.nfm_errors += 1;
                 log::warn!("NFM conversion failed: {err}");

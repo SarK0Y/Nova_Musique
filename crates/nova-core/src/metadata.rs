@@ -270,9 +270,12 @@ pub fn convert_to_nfm(src: &Path, out_dir: &Path, rate: f64, bits: u16) -> Resul
         )));
     }
 
-    // Sequential conversion, so one pid-scoped temp pair is enough; both are
-    // removed whatever the outcome.
-    let temp = format!(".nova-convert-{}", std::process::id());
+    // A pid- and counter-scoped temp pair, so concurrent conversions (one
+    // thread per group) never share a path; both are removed whatever the
+    // outcome.
+    static TEMP_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = format!(".nova-convert-{}-{seq}", std::process::id());
     let wav = out_dir.join(format!("{temp}.wav"));
     let nadc = out_dir.join(format!("{temp}.nadc"));
 
@@ -411,14 +414,48 @@ mod tests {
         assert_eq!(track.channels, Some(2));
 
         let temp = format!(".nova-convert-{}", std::process::id());
-        assert!(
-            !dir.join(format!("{temp}.wav")).exists(),
-            "temp wav removed"
-        );
-        assert!(
-            !dir.join(format!("{temp}.nadc")).exists(),
-            "temp nadc removed"
-        );
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&temp))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files removed: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(all(feature = "audio", feature = "nofft"))]
+    #[test]
+    fn concurrent_conversions_do_not_share_temp_files() {
+        let dir = std::env::temp_dir().join(format!("nova-nfm-par-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let sources: Vec<PathBuf> = (0..8)
+            .map(|i| {
+                let wav = dir.join(format!("src{i}.wav"));
+                nova_codec::generate_wav(&wav, 0.3, 2, 44_100).expect("generate wav");
+                wav
+            })
+            .collect();
+
+        // One thread per file, exactly the shape "To NFM" now uses.
+        let handles: Vec<_> = sources
+            .iter()
+            .cloned()
+            .map(|src| {
+                let dir = dir.clone();
+                std::thread::spawn(move || convert_to_nfm(&src, &dir, 4.0, 6))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("thread").expect("convert");
+        }
+
+        for i in 0..8 {
+            assert!(dir.join(format!("src{i}.nfm")).exists(), "src{i} converted");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
