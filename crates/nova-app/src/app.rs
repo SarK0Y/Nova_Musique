@@ -194,9 +194,11 @@ enum ScanMsg {
     Failed(String),
 }
 
-/// Messages sent by the "To NFM" conversion thread. One per file, so the
-/// window can show progress and count the failures.
+/// Messages sent by the "To NFM" conversion threads. One per file, so the
+/// window can show progress and count the failures, plus one per file as it
+/// starts, so it can show what is running now.
 enum NfmMsg {
+    Started(String),
     Progress {
         done: usize,
         total: usize,
@@ -379,8 +381,22 @@ pub struct NovaApp {
     /// The "Save to" folder as typed, so the field stays editable; written to
     /// the config when Go is pressed.
     nfm_dir: String,
+    /// How many groups to split the playlist into, as typed. Defaults to one
+    /// per core.
+    nfm_threads: String,
     nfm_progress: Option<(usize, usize)>,
     nfm_errors: usize,
+    /// When the running conversion started, for the elapsed clock; the run's
+    /// duration is kept here (instead of cleared with the rest) so the window
+    /// can show it after the run ends.
+    nfm_started: Option<Instant>,
+    nfm_elapsed: Option<Duration>,
+    /// Which files the threads have started, so the window can name what is
+    /// running right now. Cleared per file on completion.
+    nfm_active: Vec<String>,
+    /// Set by the Cancel button and read by every group thread, so the whole
+    /// run stops at the next file boundary.
+    nfm_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     nfm_rx: Option<Receiver<NfmMsg>>,
     /// Which menu is open this frame, for the /dev/shm/nova state dump.
     dbg_menu: std::cell::Cell<&'static str>,
@@ -494,8 +510,13 @@ impl NovaApp {
             nfm_open: false,
             nfm_rate: "4".to_string(),
             nfm_dir,
+            nfm_threads: default_nfm_threads(),
             nfm_progress: None,
             nfm_errors: 0,
+            nfm_started: None,
+            nfm_elapsed: None,
+            nfm_active: Vec::new(),
+            nfm_cancel: None,
             nfm_rx: None,
             dbg_menu: std::cell::Cell::new(""),
             playlist_open: false,
@@ -2075,17 +2096,42 @@ impl NovaApp {
                     );
                 });
 
+                ui.horizontal(|ui| {
+                    ui.label("threads");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.nfm_threads)
+                            .desired_width(60.0)
+                            .hint_text("cores"),
+                    );
+                });
+
                 let running = self.nfm_rx.is_some();
                 let ready = !self.nfm_dir.trim().is_empty();
-                if ui
-                    .add_enabled(!running && ready, egui::Button::new("Go"))
-                    .clicked()
-                {
-                    self.start_nfm_conversion();
-                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!running && ready, egui::Button::new("Go"))
+                        .clicked()
+                    {
+                        self.start_nfm_conversion();
+                    }
+                    if ui
+                        .add_enabled(running, egui::Button::new("Cancel"))
+                        .clicked()
+                    {
+                        self.cancel_nfm_conversion();
+                    }
+                });
 
                 if let Some((done, total)) = self.nfm_progress {
-                    ui.label(format!("Converting {done}/{total}…"));
+                    ui.label(format!(
+                        "Converting {done}/{total}…  {}",
+                        format_elapsed(self.nfm_started.map_or(Duration::ZERO, |at| at.elapsed()))
+                    ));
+                } else if let Some(elapsed) = self.nfm_elapsed {
+                    ui.label(format!("Last run took {}", format_elapsed(elapsed)));
+                }
+                if !self.nfm_active.is_empty() {
+                    ui.label(RichText::new(self.nfm_active.join(", ")).weak());
                 }
             });
         if !open {
@@ -2117,6 +2163,13 @@ impl NovaApp {
                 return;
             }
         };
+        let threads = match self.nfm_threads.trim().parse::<usize>() {
+            Ok(threads) if threads > 0 => threads,
+            _ => {
+                self.toast("threads must be a whole number greater than 0");
+                return;
+            }
+        };
 
         // With a playlist loaded, "current playlist" is exactly its tracks;
         // otherwise the whole library. Reading tags happens on the thread.
@@ -2139,16 +2192,18 @@ impl NovaApp {
 
         let total = paths.len();
         // One thread per group: the files are split into as many contiguous
-        // groups as there are cores (never more groups than files).
-        let groups = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .clamp(1, total);
+        // groups as the user asked for (never more groups than files).
+        let groups = threads.clamp(1, total);
         let chunk = total.div_ceil(groups);
         let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.nfm_rx = Some(rx);
         self.nfm_progress = Some((0, total));
         self.nfm_errors = 0;
+        self.nfm_started = Some(Instant::now());
+        self.nfm_elapsed = None;
+        self.nfm_active.clear();
+        self.nfm_cancel = Some(Arc::clone(&cancel));
         // NFA5 stores `bits` in its header but the grid is what matters; the
         // rate control is what the user dials.
         let bits = 6u16;
@@ -2160,9 +2215,23 @@ impl NovaApp {
             let group = group.to_vec();
             let tx = tx.clone();
             let done = Arc::clone(&done);
+            let cancel = Arc::clone(&cancel);
             let dir = dir.clone();
             std::thread::spawn(move || {
                 for src in group {
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if tx
+                        .send(NfmMsg::Started(
+                            src.file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| src.display().to_string()),
+                        ))
+                        .is_err()
+                    {
+                        return;
+                    }
                     // A codec panic must not strand the run: count the file
                     // as a failure and keep going, so `done` still reaches
                     // `total` and the window finishes.
@@ -2184,6 +2253,15 @@ impl NovaApp {
         self.toast(format!("Converting {total} track(s) to NFM…"));
     }
 
+    /// Asks the running conversion to stop: the group threads stand down at
+    /// the next file boundary, so a file mid-conversion is still written.
+    fn cancel_nfm_conversion(&mut self) {
+        if let Some(cancel) = &self.nfm_cancel {
+            cancel.store(true, Ordering::Relaxed);
+            self.toast("Stopping the conversion…");
+        }
+    }
+
     /// Drains the conversion thread's messages, updating the progress shown in
     /// the To NFM window and toasting when the run finishes.
     fn drain_nfm(&mut self) {
@@ -2202,42 +2280,73 @@ impl NovaApp {
         }
 
         for msg in messages {
-            let NfmMsg::Progress { done, total, error } = msg;
-            // Out-of-order arrivals: keep the highest count, so the display
-            // only ever moves forward.
-            if self.nfm_progress.is_some_and(|(seen, _)| done > seen) || self.nfm_progress.is_none()
-            {
-                self.nfm_progress = Some((done, total));
-            }
-            if let Some(err) = error {
-                self.nfm_errors += 1;
-                log::warn!("NFM conversion failed: {err}");
-            }
-            if done == total {
-                let errors = self.nfm_errors;
-                self.nfm_progress = None;
-                self.nfm_errors = 0;
-                self.nfm_rx = None;
-                self.toast(if errors == 0 {
-                    format!("Converted {total} track(s) to NFM")
-                } else {
-                    format!(
-                        "Converted {} of {total} to NFM, {errors} failed",
-                        total - errors
-                    )
-                });
+            match msg {
+                NfmMsg::Started(name) => {
+                    self.nfm_active.push(name);
+                }
+                NfmMsg::Progress { done, total, error } => {
+                    // Out-of-order arrivals: keep the highest count, so the
+                    // display only ever moves forward.
+                    if self.nfm_progress.is_some_and(|(seen, _)| done > seen)
+                        || self.nfm_progress.is_none()
+                    {
+                        self.nfm_progress = Some((done, total));
+                    }
+                    if let Some(err) = error {
+                        self.nfm_errors += 1;
+                        log::warn!("NFM conversion failed: {err}");
+                    }
+                    self.nfm_active.pop();
+                    if done == total {
+                        let errors = self.nfm_errors;
+                        let cancelled = self
+                            .nfm_cancel
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(Ordering::Relaxed));
+                        self.nfm_elapsed = self.nfm_started.map(|at| at.elapsed());
+                        self.nfm_finish();
+                        self.toast(if cancelled {
+                            format!("Conversion cancelled ({errors} failure(s))")
+                        } else if errors == 0 {
+                            format!("Converted {total} track(s) to NFM")
+                        } else {
+                            format!(
+                                "Converted {} of {total} to NFM, {errors} failed",
+                                total - errors
+                            )
+                        });
+                    }
+                }
             }
         }
 
-        // The thread ended without a last message (it panicked): stop showing
-        // progress rather than leaving the window stuck on "Converting".
+        // The threads ended without a last message (cancelled or panicked):
+        // stop showing progress rather than leaving the window stuck on
+        // "Converting".
         if disconnected && self.nfm_rx.is_some() {
             let errors = self.nfm_errors;
-            self.nfm_progress = None;
-            self.nfm_errors = 0;
-            self.nfm_rx = None;
-            self.toast(format!("Conversion stopped early ({errors} failure(s))"));
+            let cancelled = self
+                .nfm_cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed));
+            self.nfm_elapsed = self.nfm_started.map(|at| at.elapsed());
+            self.nfm_finish();
+            self.toast(if cancelled {
+                format!("Conversion cancelled ({errors} failure(s))")
+            } else {
+                format!("Conversion stopped early ({errors} failure(s))")
+            });
         }
+    }
+
+    /// Clears everything a finished (or cancelled) conversion leaves behind.
+    fn nfm_finish(&mut self) {
+        self.nfm_progress = None;
+        self.nfm_errors = 0;
+        self.nfm_started = None;
+        self.nfm_active.clear();
+        self.nfm_cancel = None;
+        self.nfm_rx = None;
     }
 
     fn playlist_window(&mut self, ctx: &egui::Context) {
@@ -2538,6 +2647,10 @@ impl eframe::App for NovaApp {
         if self.nfm_rx.is_some() {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
+        // The "To NFM" window shows an elapsed clock while it is open.
+        if self.nfm_open {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
         if self.engine.state() == PlaybackState::Playing {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -2590,6 +2703,27 @@ impl eframe::App for NovaApp {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The "threads" field's default: one group per core, as before the field
+/// existed.
+fn default_nfm_threads() -> String {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .to_string()
+}
+
+/// A short duration for the conversion window: `12s`, `1m03s`, `1h02m`.
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h{:02}m", seconds / 3600, seconds % 3600 / 60)
+    }
+}
 
 fn load_cached_library(expected_root: Option<&Path>) -> Option<Library> {
     let path = cache_file()?;
@@ -2992,6 +3126,19 @@ fn percent_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elapsed_reads_as_seconds_minutes_hours() {
+        assert_eq!(format_elapsed(Duration::from_secs(0)), "0s");
+        assert_eq!(format_elapsed(Duration::from_secs(59)), "59s");
+        assert_eq!(format_elapsed(Duration::from_secs(63)), "1m03s");
+        assert_eq!(format_elapsed(Duration::from_secs(3720)), "1h02m");
+    }
+
+    #[test]
+    fn default_thread_count_is_one_or_more() {
+        assert!(default_nfm_threads().parse::<usize>().unwrap() >= 1);
+    }
 
     #[test]
     fn a_remote_line_becomes_a_command() {

@@ -504,16 +504,22 @@ until then.
 - **-set-rate** — the target **bits per sample** for the rate-controlled NFA5
   encoder. Quiet material stays fine and cheap, loud material coarsens to hold
   the budget, so the number is a quality/size dial rather than a fixed quantum.
-- **Go** — starts the conversion on a background thread, so the window stays
-  live and shows `Converting n/total…`; a toast reports the result and the
-  failure count when it finishes.
+- **threads** — how many groups to split the playlist into, one thread each.
+  Defaults to one per CPU core; a lower number leaves the machine some room.
+- **Go** — starts the conversion on background threads, so the window stays
+  live. While it runs it shows `Converting n/total…` with the elapsed time and
+  the files being converted now; a toast reports the result, the failure count
+  and the duration when it finishes.
+- **Cancel** — asks the run to stop. The threads stand down at the next file
+  boundary, so a file already being converted is still written; the toast says
+  how many failed.
 
-The files are split into one group per CPU core and the groups convert in
-parallel (never more groups than files). It converts **the current playlist**
-when one is loaded, otherwise the whole library. Each source file is decoded
-in-process, re-encoded to NFA5 and wrapped with its tags and embedded cover
-(PNG or JPEG). Codec sources (`.nadc` / `.no_fft` / `.nfm`) are already No_FFT,
-so converting those is not the point — this is for the ordinary
+The files are split into as many contiguous groups as the **threads** field, and
+the groups convert in parallel (never more groups than files). It converts **the
+current playlist** when one is loaded, otherwise the whole library. Each source
+file is decoded in-process, re-encoded to NFA5 and wrapped with its tags and
+embedded cover (PNG or JPEG). Codec sources (`.nadc` / `.no_fft` / `.nfm`) are
+already No_FFT, so converting those is not the point — this is for the ordinary
 MP3/FLAC/etc. in the library.
 
 ### Hiding songs
