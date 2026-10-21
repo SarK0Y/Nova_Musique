@@ -248,6 +248,24 @@ int nova_encode_nadc(const char* in_wav, const char* out_path, uint16_t bits,
     return (int)e;
 }
 
+// Encodes a WAV to rate-controlled NFA5 (`acpcm_encode5_auto`).  The stream is
+// plain NFA5, but the encoder auto-dials each chunk's `err` so the encoded file
+// meets `rate` bits per sample: quiet chunks stay fine and cheap, loud ones
+// coarsen to hold the budget.  `e` is the fixed log grid base (>1); `bits` only
+// lands in the header.  `rate` must be finite and > 0, else ERR_RANGE.
+int nova_encode_nadc5_rate(const char* in_wav, const char* out_path, uint16_t bits,
+                           double rate) {
+    pcm_buf p;
+    std::memset(&p, 0, sizeof(p));
+    Err e = wav_load(in_wav, &p);
+    if (e != ERR_OK) {
+        return (int)e;
+    }
+    e = acpcm_encode5_auto(out_path, &p, bits, 2.0, rate);
+    pcm_free(&p);
+    return (int)e;
+}
+
 // --- NFM container ---------------------------------------------------------
 
 // Reads an NFM file and extracts the inner codec payload, text metadata and

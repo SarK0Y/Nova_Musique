@@ -104,6 +104,12 @@ mod ffi {
             bits: u16,
             variant: u32,
         ) -> c_int;
+        pub fn nova_encode_nadc5_rate(
+            in_wav: *const c_char,
+            out: *const c_char,
+            bits: u16,
+            rate: f64,
+        ) -> c_int;
     }
 }
 
@@ -633,6 +639,17 @@ pub fn encode_nadc(
     let output = c_path(out)?;
     let code =
         unsafe { ffi::nova_encode_nadc(input.as_ptr(), output.as_ptr(), bits, variant.as_raw()) };
+    check(code)
+}
+
+/// Encodes a WAV to rate-controlled NFA5: the output is plain NFA5, but the
+/// encoder auto-dials each chunk's error to hold `rate` bits per sample (quiet
+/// material stays fine and cheap, loud material coarsens to budget).  `rate`
+/// must be finite and > 0.
+pub fn encode_nadc5_rate(wav: &Path, out: &Path, bits: u16, rate: f64) -> Result<(), CodecError> {
+    let input = c_path(wav)?;
+    let output = c_path(out)?;
+    let code = unsafe { ffi::nova_encode_nadc5_rate(input.as_ptr(), output.as_ptr(), bits, rate) };
     check(code)
 }
 

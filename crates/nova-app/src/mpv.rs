@@ -682,8 +682,12 @@ impl Mpv {
         self.mutate(|state| {
             state.position = Duration::ZERO;
             state.finished = false;
+            state.paused = false;
         });
         self.command(&["loadfile", &path, "replace"]);
+        // `keep-open` holds a finished file by pausing it, and that flag
+        // survives `loadfile` — without this the next track loads paused.
+        self.set_flag("pause", false);
     }
 
     pub fn play(&self) {
@@ -953,7 +957,12 @@ fn control_loop(handle: &SharedHandle, state: &Mutex<State>) {
             state.duration = (duration > 0.0).then(|| Duration::from_secs_f64(duration));
             state.volume = (volume / 100.0).clamp(0.0, 1.0) as f32;
             state.paused = paused != 0;
-            state.finished = finished != 0;
+            // `eof-reached` alone is not enough: right after a `loadfile` mpv
+            // can still report the previous file's end for a poll or two, which
+            // made the engine skip past the track it had just started. Requiring
+            // the clock to be at the end too means a stale flag is ignored, and
+            // a real end is caught even while `keep-open` holds the file.
+            state.finished = (finished != 0 || position >= duration) && position > 0.0;
             if refresh_tracks {
                 // Outside the lock: this walks an mpv-owned tree.
                 state.video_tracks = read_video_tracks(handle.0);

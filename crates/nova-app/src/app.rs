@@ -43,6 +43,9 @@ struct Config {
     /// config so the same file stays current across restarts.
     #[serde(default)]
     current_playlist: Option<PathBuf>,
+    /// Folder `Songs → To NFM` writes converted files to.
+    #[serde(default)]
+    path_to_save_converted_files: Option<PathBuf>,
 }
 
 fn default_volume() -> f32 {
@@ -84,6 +87,7 @@ impl Default for Config {
             allow_video_movement: default_allow_video_movement(),
             playlists: Vec::new(),
             current_playlist: None,
+            path_to_save_converted_files: None,
         }
     }
 }
@@ -178,6 +182,8 @@ enum Action {
     LoadPlaylist(PathBuf),
     /// Go back from a loaded playlist to the whole library.
     UnloadPlaylist,
+    /// Open the "Songs → To NFM" conversion window.
+    OpenNfm,
 }
 
 /// Messages sent by the scanner thread.
@@ -185,6 +191,17 @@ enum ScanMsg {
     Progress(usize),
     Done(Box<(Library, ScanReport)>),
     Failed(String),
+}
+
+/// Messages sent by the "To NFM" conversion thread. One per file, so the
+/// window can show progress and count the failures.
+enum NfmMsg {
+    Progress {
+        done: usize,
+        total: usize,
+        /// The conversion error text, when this file failed.
+        error: Option<String>,
+    },
 }
 
 /// One line of the stdin remote control.
@@ -353,6 +370,17 @@ pub struct NovaApp {
     /// The playlist shown in place of the whole library: its file name plus
     /// the track ids it lists, in playlist order. `None` shows everything.
     loaded_playlist: Option<(String, Vec<TrackId>)>,
+    /// "Songs → To NFM": the conversion window, the `-set-rate` value typed in
+    /// it, the running conversion's (done, total) progress and failure count,
+    /// and the per-file messages coming back from the conversion thread.
+    nfm_open: bool,
+    nfm_rate: String,
+    /// The "Save to" folder as typed, so the field stays editable; written to
+    /// the config when Go is pressed.
+    nfm_dir: String,
+    nfm_progress: Option<(usize, usize)>,
+    nfm_errors: usize,
+    nfm_rx: Option<Receiver<NfmMsg>>,
     /// Which menu is open this frame, for the /dev/shm/nova state dump.
     dbg_menu: std::cell::Cell<&'static str>,
     /// Floating playlist window, opened from the Nova menu in the top bar.
@@ -432,6 +460,13 @@ impl NovaApp {
             .map(|d| d.display().to_string())
             .unwrap_or_default();
 
+        // Read the saved conversion folder before `config` is moved into the app.
+        let nfm_dir = config
+            .path_to_save_converted_files
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+
         let mut app = NovaApp {
             library,
             engine,
@@ -455,6 +490,12 @@ impl NovaApp {
             search_report: None,
             search_report_fresh: false,
             loaded_playlist: None,
+            nfm_open: false,
+            nfm_rate: "4".to_string(),
+            nfm_dir,
+            nfm_progress: None,
+            nfm_errors: 0,
+            nfm_rx: None,
             dbg_menu: std::cell::Cell::new(""),
             playlist_open: false,
             video_open: std::env::var_os("NOVA_TEST_VIDEO").is_some(),
@@ -1123,6 +1164,7 @@ impl NovaApp {
                 }
                 Action::LoadPlaylist(path) => self.open_playlist(&path),
                 Action::UnloadPlaylist => self.loaded_playlist = None,
+                Action::OpenNfm => self.nfm_open = true,
             }
         }
     }
@@ -1479,6 +1521,9 @@ impl NovaApp {
             }
             self.save_menu(ui, actions);
             self.load_menu(ui, actions);
+            if ui.button("To NFM").clicked() {
+                actions.push(Action::OpenNfm);
+            }
         });
     }
 
@@ -1998,6 +2043,176 @@ impl NovaApp {
         }
     }
 
+    /// "Songs → To NFM": picks a folder, takes the `-set-rate` value and, on
+    /// Go, converts every file of the current playlist (or the whole library)
+    /// to `.nfm` on a background thread.
+    fn nfm_window(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        egui::Window::new("To NFM")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("NFA5").strong().size(18.0));
+
+                ui.horizontal(|ui| {
+                    ui.label("Save to");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.nfm_dir)
+                            .desired_width(320.0)
+                            .hint_text("folder for the .nfm files"),
+                    );
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("-set-rate");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.nfm_rate)
+                            .desired_width(80.0)
+                            .hint_text("bits/sample"),
+                    );
+                });
+
+                let running = self.nfm_rx.is_some();
+                let ready = !self.nfm_dir.trim().is_empty();
+                if ui
+                    .add_enabled(!running && ready, egui::Button::new("Go"))
+                    .clicked()
+                {
+                    self.start_nfm_conversion();
+                }
+
+                if let Some((done, total)) = self.nfm_progress {
+                    ui.label(format!("Converting {done}/{total}…"));
+                }
+            });
+        if !open {
+            self.nfm_open = false;
+        }
+    }
+
+    /// Converts the current playlist (every visible track's file) to `.nfm` in
+    /// the chosen folder, on a thread so the window stays live.
+    fn start_nfm_conversion(&mut self) {
+        let typed = self.nfm_dir.trim().to_string();
+        if typed.is_empty() {
+            self.toast("Set a folder in Save to first");
+            return;
+        }
+        let dir = PathBuf::from(&typed);
+        if !dir.is_dir() {
+            self.toast(format!("Not a folder: {typed}"));
+            return;
+        }
+        if self.config.path_to_save_converted_files.as_deref() != Some(dir.as_path()) {
+            self.config.path_to_save_converted_files = Some(dir.clone());
+            self.config.save();
+        }
+        let rate = match self.nfm_rate.trim().parse::<f64>() {
+            Ok(rate) if rate.is_finite() && rate > 0.0 => rate,
+            _ => {
+                self.toast("-set-rate must be a number greater than 0");
+                return;
+            }
+        };
+
+        // With a playlist loaded, "current playlist" is exactly its tracks;
+        // otherwise the whole library. Reading tags happens on the thread.
+        let paths: Vec<PathBuf> = match &self.loaded_playlist {
+            Some((_, ids)) => ids
+                .iter()
+                .filter_map(|id| self.library.track(*id).map(|t| t.path.clone()))
+                .collect(),
+            None => self
+                .library
+                .tracks()
+                .iter()
+                .map(|track| track.path.clone())
+                .collect(),
+        };
+        if paths.is_empty() {
+            self.toast("Nothing to convert");
+            return;
+        }
+
+        let total = paths.len();
+        let (tx, rx) = mpsc::channel();
+        self.nfm_rx = Some(rx);
+        self.nfm_progress = Some((0, total));
+        self.nfm_errors = 0;
+        // NFA5 stores `bits` in its header but the grid is what matters; the
+        // rate control is what the user dials.
+        let bits = 6u16;
+        std::thread::spawn(move || {
+            for (index, src) in paths.iter().enumerate() {
+                let error = metadata::convert_to_nfm(src, &dir, rate, bits)
+                    .err()
+                    .map(|err| err.to_string());
+                let message = NfmMsg::Progress {
+                    done: index + 1,
+                    total,
+                    error,
+                };
+                if tx.send(message).is_err() {
+                    break;
+                }
+            }
+        });
+        self.toast(format!("Converting {total} track(s) to NFM…"));
+    }
+
+    /// Drains the conversion thread's messages, updating the progress shown in
+    /// the To NFM window and toasting when the run finishes.
+    fn drain_nfm(&mut self) {
+        let Some(rx) = &self.nfm_rx else { return };
+        let mut messages = Vec::new();
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => messages.push(msg),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        for msg in messages {
+            let NfmMsg::Progress { done, total, error } = msg;
+            self.nfm_progress = Some((done, total));
+            if let Some(err) = error {
+                self.nfm_errors += 1;
+                log::warn!("NFM conversion failed: {err}");
+            }
+            if done == total {
+                let errors = self.nfm_errors;
+                self.nfm_progress = None;
+                self.nfm_errors = 0;
+                self.nfm_rx = None;
+                self.toast(if errors == 0 {
+                    format!("Converted {total} track(s) to NFM")
+                } else {
+                    format!(
+                        "Converted {} of {total} to NFM, {errors} failed",
+                        total - errors
+                    )
+                });
+            }
+        }
+
+        // The thread ended without a last message (it panicked): stop showing
+        // progress rather than leaving the window stuck on "Converting".
+        if disconnected && self.nfm_rx.is_some() {
+            let errors = self.nfm_errors;
+            self.nfm_progress = None;
+            self.nfm_errors = 0;
+            self.nfm_rx = None;
+            self.toast(format!("Conversion stopped early ({errors} failure(s))"));
+        }
+    }
+
     fn playlist_window(&mut self, ctx: &egui::Context) {
         let viewport_id = egui::ViewportId::from_hash_of("nova-playlist-window");
         let builder = egui::ViewportBuilder::default()
@@ -2204,6 +2419,8 @@ impl eframe::App for NovaApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        self.drain_nfm();
+
         if let Some((_, at)) = &self.toast {
             if at.elapsed() > TOAST_TTL {
                 self.toast = None;
@@ -2269,6 +2486,9 @@ impl eframe::App for NovaApp {
         if self.search_report.is_some() {
             self.search_report_window(&ctx);
         }
+        if self.nfm_open {
+            self.nfm_window(&ctx);
+        }
         if self.playlist_open {
             self.playlist_window(&ctx);
         }
@@ -2286,6 +2506,9 @@ impl eframe::App for NovaApp {
         drop_overlay(&ctx);
 
         if self.scan_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
+        if self.nfm_rx.is_some() {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
         if self.engine.state() == PlaybackState::Playing {
@@ -2322,6 +2545,16 @@ impl eframe::App for NovaApp {
             ),
             ("search", self.search.clone()),
             ("queue", format!("{} track(s)", self.engine.queue().len())),
+            (
+                "nfm",
+                if let Some((done, total)) = self.nfm_progress {
+                    format!("converting {done}/{total}")
+                } else if self.nfm_open {
+                    "open".to_string()
+                } else {
+                    String::new()
+                },
+            ),
             ("now_playing", now_playing),
         ]);
     }

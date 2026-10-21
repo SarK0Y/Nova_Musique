@@ -30,6 +30,10 @@ but for music you already own on disk.
   shows in place of the whole library, and saving writes back exactly what is
   on screen. The current playlist comes back at startup. See
   [Playlists](#playlists).
+- **Converting to NFM** — **To NFM** beside the Songs list turns the current
+  playlist (or the whole library) into `.nfm` files with rate-controlled NFA5,
+  audio-only and on a background thread. See
+  [Converting to NFM](#converting-to-nfm).
 - **Transport** — play/pause, previous/next, a seek bar, and volume.
 - **Resilient audio** — playback goes through rust-`rodio`; if no output device
   can be opened, Nova transparently falls back to a silent backend so the rest
@@ -184,10 +188,11 @@ nova-cli play   <dir> [--index N] [--volume V] [--null] [--seconds S]
    playlist window and **Video** opens the video-stream picker. **Audio** is a
    placeholder for now.
 
-**Clear all**, **Save** and **Load** sit beside the Songs title and keep
-working with a search typed in; **Clear all** ignores the search entirely (it
-hides tracks — see [Hiding songs](#hiding-songs)). **Save** and **Load** are
-the playlist buttons, described next.
+**Clear all**, **Save**, **Load** and **To NFM** sit beside the Songs title and
+keep working with a search typed in; **Clear all** ignores the search entirely
+(it hides tracks — see [Hiding songs](#hiding-songs)). **Save** and **Load** are
+the playlist buttons, described next; **To NFM** turns the current playlist into
+`.nfm` files — see [Converting to NFM](#converting-to-nfm).
 
 ### The Nova menu
 
@@ -487,6 +492,28 @@ has not seen get their tags read on the spot, and a toast reports what was
 added. The file on disk is only written by **Save** — adding is in-memory
 until then.
 
+### Converting to NFM
+
+**To NFM**, beside **Load**, turns audio into `.nfm` containers (see
+[Codecs](#codecs) for what an `.nfm` is). It opens a small window:
+
+- **Save to** — the folder the `.nfm` files are written to. It is a plain text
+  field, so type or paste a path; it is remembered in the config as
+  `path_to_save_converted_files`.
+- **NFA5** — the codec written inside the container.
+- **-set-rate** — the target **bits per sample** for the rate-controlled NFA5
+  encoder. Quiet material stays fine and cheap, loud material coarsens to hold
+  the budget, so the number is a quality/size dial rather than a fixed quantum.
+- **Go** — starts the conversion on a background thread, so the window stays
+  live and shows `Converting n/total…`; a toast reports the result and the
+  failure count when it finishes.
+
+It converts **the current playlist** when one is loaded, otherwise the whole
+library. Each source file is decoded in-process, re-encoded to NFA5 and wrapped
+with its tags and embedded cover (PNG or JPEG). Codec sources (`.nadc` /
+`.no_fft` / `.nfm`) are already No_FFT, so converting those is not the point —
+this is for the ordinary MP3/FLAC/etc. in the library.
+
 ### Hiding songs
 
 <kbd>Del</kbd> in the **Songs** view hides the highlighted track instead: it
@@ -586,7 +613,7 @@ cargo build -p nova-app                           # codecs + audio (default)
 
 | Path | Contents |
 | --- | --- |
-| `~/.config/nova/config.json` | Last music folder, volume, the used-playlist list and the current playlist. |
+| `~/.config/nova/config.json` | Last music folder, volume, the used-playlist list, the current playlist and the NFM output folder. |
 | `~/.config/nova/playlist.m3u8` | Where **Save → as is** writes before **as…** has picked a file. |
 | `~/.cache/nova/library.json`  | Cached library index for the last folder. |
 | `~/.cache/nova/hidden.json`   | Track ids hidden from the library. |

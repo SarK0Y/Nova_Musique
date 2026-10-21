@@ -1,6 +1,6 @@
 //! Reading audio metadata with [`lofty`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use lofty::file::{AudioFile, TaggedFileExt};
@@ -245,6 +245,121 @@ pub fn read_cover(path: &Path) -> Result<Option<CoverArt>> {
     }))
 }
 
+/// Converts one source audio file (mp3/flac/wav/...) to an `.nfm` container
+/// wrapping a rate-controlled NFA5 payload.
+///
+/// The file is decoded in-process to PCM, written to a temporary PCM16 WAV,
+/// encoded to NFA5 with `rate` bits/sample, then wrapped into `.nfm` together
+/// with the source's tags and embedded cover (PNG/JPEG only). Returns the
+/// written path.
+#[cfg(all(feature = "audio", feature = "nofft"))]
+pub fn convert_to_nfm(src: &Path, out_dir: &Path, rate: f64, bits: u16) -> Result<PathBuf> {
+    use rodio::{Decoder, Source};
+    use std::fs::File;
+
+    let file = File::open(src)?;
+    let decoder = Decoder::try_from(file)
+        .map_err(|e| CoreError::Audio(format!("cannot decode {}: {e}", src.display())))?;
+    let channels = decoder.channels().get() as u32;
+    let sample_rate = decoder.sample_rate().get() as u32;
+    let samples: Vec<f32> = decoder.collect();
+    if samples.is_empty() {
+        return Err(CoreError::Audio(format!(
+            "{} decoded to no samples",
+            src.display()
+        )));
+    }
+
+    // Sequential conversion, so one pid-scoped temp pair is enough; both are
+    // removed whatever the outcome.
+    let temp = format!(".nova-convert-{}", std::process::id());
+    let wav = out_dir.join(format!("{temp}.wav"));
+    let nadc = out_dir.join(format!("{temp}.nadc"));
+
+    let result = (|| {
+        write_wav_pcm16(&wav, &samples, channels, sample_rate)?;
+        nova_codec::encode_nadc5_rate(&wav, &nadc, bits, rate)
+            .map_err(|e| CoreError::metadata(src, e))?;
+        let payload = std::fs::read(&nadc)?;
+
+        let track = read_track(src)?;
+        let meta = nova_codec::NfmMeta {
+            title: (!track.title.is_empty()).then_some(track.title),
+            artist: (!track.artist.is_empty()).then_some(track.artist),
+            album: (!track.album.is_empty()).then_some(track.album),
+        };
+        let cover = read_cover(src).ok().flatten().and_then(|c| {
+            nfm_img_type(&c.data).map(|img_type| nova_codec::NfmCover {
+                data: c.data,
+                img_type,
+            })
+        });
+
+        let out = out_dir.join(format!("{}.nfm", file_stem(src)));
+        nova_codec::nfm_write(&out, &payload, &meta, cover.as_ref())
+            .map_err(|e| CoreError::metadata(src, e))?;
+        Ok(out)
+    })();
+
+    let _ = std::fs::remove_file(&wav);
+    let _ = std::fs::remove_file(&nadc);
+    result
+}
+
+/// Writes interleaved `f32` samples as a canonical 16-bit PCM WAV — the format
+/// the codec's `wav_load` (drwav) reads back.
+#[cfg(all(feature = "audio", feature = "nofft"))]
+fn write_wav_pcm16(path: &Path, samples: &[f32], channels: u32, sample_rate: u32) -> Result<()> {
+    use std::io::Write;
+
+    let channels = channels.max(1);
+    let data_len = u32::try_from(samples.len() * 2)
+        .map_err(|_| CoreError::Audio("audio too long for a WAV".to_string()))?;
+    let byte_rate = sample_rate * channels * 2;
+    let block_align = (channels * 2) as u16;
+
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(b"RIFF")?;
+    file.write_all(&(36 + data_len).to_le_bytes())?;
+    file.write_all(b"WAVE")?;
+    file.write_all(b"fmt ")?;
+    file.write_all(&16u32.to_le_bytes())?;
+    file.write_all(&1u16.to_le_bytes())?; // PCM
+    file.write_all(&(channels as u16).to_le_bytes())?;
+    file.write_all(&sample_rate.to_le_bytes())?;
+    file.write_all(&byte_rate.to_le_bytes())?;
+    file.write_all(&block_align.to_le_bytes())?;
+    file.write_all(&16u16.to_le_bytes())?; // bits per sample
+    file.write_all(b"data")?;
+    file.write_all(&data_len.to_le_bytes())?;
+    for &sample in samples {
+        let value = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+        file.write_all(&value.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+/// NFM only carries PNG or JPEG covers; anything else is dropped.
+#[cfg(all(feature = "audio", feature = "nofft"))]
+fn nfm_img_type(data: &[u8]) -> Option<u8> {
+    if data.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        Some(nova_codec::NFM_IMG_PNG)
+    } else if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some(nova_codec::NFM_IMG_JPEG)
+    } else {
+        None
+    }
+}
+
+/// A file name without its extension, used for the `.nfm` output name.
+#[cfg(all(feature = "audio", feature = "nofft"))]
+fn file_stem(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "track".to_string())
+}
+
 fn fallback_title(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -273,6 +388,39 @@ mod tests {
         assert_eq!(parse_year("1999-04-01"), Some(1999));
         assert_eq!(parse_year("rec 2007"), Some(2007));
         assert_eq!(parse_year("nope"), None);
+    }
+
+    #[cfg(all(feature = "audio", feature = "nofft"))]
+    #[test]
+    fn converts_a_wav_to_a_rate_controlled_nfm() {
+        let dir = std::env::temp_dir().join(format!("nova-nfm-convert-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let wav = dir.join("source.wav");
+        nova_codec::generate_wav(&wav, 0.3, 2, 44_100).expect("generate wav");
+
+        let out = convert_to_nfm(&wav, &dir, 4.0, 6).expect("convert");
+        assert_eq!(out.file_name().unwrap(), "source.nfm");
+
+        let nfm = nova_codec::nfm_read(&out).expect("read nfm");
+        assert!(nfm.payload.starts_with(b"NFA5"), "payload is NFA5");
+
+        let track = read_track(&out).expect("read converted track");
+        assert_eq!(track.sample_rate, Some(44_100));
+        assert_eq!(track.channels, Some(2));
+
+        let temp = format!(".nova-convert-{}", std::process::id());
+        assert!(
+            !dir.join(format!("{temp}.wav")).exists(),
+            "temp wav removed"
+        );
+        assert!(
+            !dir.join(format!("{temp}.nadc")).exists(),
+            "temp nadc removed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
