@@ -416,6 +416,8 @@ pub struct NovaApp {
     /// It scales the video widget and re-centres it, and nothing reaches mpv;
     /// `video_view` does the same by drawing the image that much larger.
     zoom: f32,
+    /// Optional display aspect ratio override selected from Nova → Video.
+    aspect_ratio_override: Option<f32>,
     /// SMPlayer's *Move left/right/up/down*: how far the picture is nudged off
     /// centre, in points, with +y running down like every other coordinate.
     /// The buttons in the video window nudge it; dragging the picture does the
@@ -528,6 +530,7 @@ impl NovaApp {
             flip_x: false,
             flip_y: false,
             zoom: 1.0,
+            aspect_ratio_override: None,
             pan: egui::Vec2::ZERO,
             deinterlace: 0,
             video_window: None,
@@ -1207,10 +1210,35 @@ impl NovaApp {
                     self.playlist_open = true;
                     ui.close();
                 }
-                if ui.button("Video").clicked() {
-                    self.video_open = true;
-                    ui.close();
-                }
+                ui.menu_button("Video", |ui| {
+                    if ui.button("Video tracks and controls…").clicked() {
+                        self.video_open = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.menu_button("Aspect ratio", |ui| {
+                        let choices: [(&str, Option<f32>); 6] = [
+                            ("Auto (source)", None),
+                            ("16:9", Some(16.0 / 9.0)),
+                            ("4:3", Some(4.0 / 3.0)),
+                            ("16:10", Some(16.0 / 10.0)),
+                            ("1:1", Some(1.0)),
+                            ("2.35:1", Some(2.35)),
+                        ];
+                        for (label, ratio) in choices {
+                            let selected = match (self.aspect_ratio_override, ratio) {
+                                (None, None) => true,
+                                (Some(a), Some(b)) => (a - b).abs() < 0.001,
+                                _ => false,
+                            };
+                            if ui.selectable_label(selected, label).clicked() {
+                                self.aspect_ratio_override = ratio;
+                                self.pan = egui::Vec2::ZERO;
+                                ui.close();
+                            }
+                        }
+                    });
+                });
                 ui.separator();
                 // Not wired up yet, so shown disabled rather than pretending.
                 ui.add_enabled(false, egui::Label::new("Audio"));
@@ -2041,6 +2069,9 @@ impl NovaApp {
 
     /// Aspect ratio of the video on screen, from its declared frame size.
     fn video_aspect(&self) -> f32 {
+        if let Some(aspect) = self.aspect_ratio_override {
+            return aspect;
+        }
         self.engine
             .current_track(&self.library)
             .and_then(|track| track.video)
