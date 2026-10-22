@@ -56,7 +56,7 @@ pub struct VideoWindow {
     /// What the child already knows, so the list is only sent when it changes.
     sent: Vec<VideoTrack>,
     /// Same, for the mirror/flip/zoom/pan/move-allowed state.
-    sent_state: (bool, bool, f32, eframe::egui::Vec2, bool, usize, Option<f32>),
+    sent_state: (bool, bool, f32, eframe::egui::Vec2, bool, usize, Option<f32>, i32, bool, bool, bool),
 }
 
 impl VideoWindow {
@@ -102,7 +102,7 @@ impl VideoWindow {
             stdin,
             picks,
             sent: Vec::new(),
-            sent_state: (false, false, 1.0, eframe::egui::Vec2::ZERO, true, 0, None),
+            sent_state: (false, false, 1.0, eframe::egui::Vec2::ZERO, true, 0, None, 0, false, false, false),
         })
     }
 
@@ -144,8 +144,12 @@ impl VideoWindow {
         move_allowed: bool,
         deinterlace: usize,
         aspect_ratio: Option<f32>,
+        rotation: i32,
+        hqdn3d: bool,
+        deband: bool,
+        nlmeans: bool,
     ) {
-        let state = (x, y, zoom, pan, move_allowed, deinterlace, aspect_ratio);
+        let state = (x, y, zoom, pan, move_allowed, deinterlace, aspect_ratio, rotation, hqdn3d, deband, nlmeans);
         if state == self.sent_state && self.stdin.is_some() {
             return;
         }
@@ -154,12 +158,16 @@ impl VideoWindow {
             return;
         };
         let line = format!(
-            "state {x} {y} {zoom} {:.2} {:.2} {} {} {}\n",
+            "state {x} {y} {zoom} {:.2} {:.2} {} {} {} {} {} {} {}\n",
             pan.x,
             pan.y,
             u8::from(move_allowed),
             deinterlace,
-            aspect_ratio.unwrap_or(0.0)
+            aspect_ratio.unwrap_or(0.0),
+            rotation,
+            u8::from(hqdn3d),
+            u8::from(deband),
+            u8::from(nlmeans)
         );
         if let Err(err) = stdin.write_all(line.as_bytes()) {
             log::debug!("video window is gone ({err})");
@@ -203,6 +211,9 @@ pub enum VideoCommand {
     Deinterlace(usize),
     /// Set display aspect ratio; zero on the wire means use the source ratio.
     AspectRatio(Option<f32>),
+    /// Set the video rotation in degrees.
+    Rotate(i32),
+    NoiseFilter { kind: usize, enabled: bool },
 }
 
 /// Reads one line from the pipe, whether that is the picker's end or nova's
@@ -219,6 +230,17 @@ pub(crate) fn parse_command(line: &str) -> Option<VideoCommand> {
     if let Some(value) = line.strip_prefix("aspect ") {
         let value = value.trim().parse::<f32>().ok()?;
         return Some(VideoCommand::AspectRatio((value > 0.0).then_some(value)));
+    }
+    if let Some(value) = line.strip_prefix("rotate ") {
+        let value = value.trim().parse::<i32>().ok()?;
+        return Some(VideoCommand::Rotate(value.rem_euclid(360)));
+    }
+    if let Some(value) = line.strip_prefix("noise ") {
+        let mut parts = value.split_whitespace();
+        let kind = parts.next()?.parse::<usize>().ok()?;
+        let enabled = parts.next()? == "1";
+        if kind < 3 { return Some(VideoCommand::NoiseFilter { kind, enabled }); }
+        return None;
     }
     if let Some(choice) = line.strip_prefix("deint ") {
         let choice = choice.trim().parse::<usize>().ok()?;
@@ -338,6 +360,10 @@ pub fn run() -> eframe::Result<()> {
                 allow_video_movement: true,
                 deinterlace: 0,
                 aspect_ratio: None,
+                rotation: 0,
+                hqdn3d: false,
+                deband: false,
+                nlmeans: false,
                 rows: Vec::new(),
                 stdout: std::io::stdout(),
             }))
@@ -361,6 +387,11 @@ struct Picker {
     deinterlace: usize,
     /// Display ratio selected in the main window; `None` means source ratio.
     aspect_ratio: Option<f32>,
+    /// Clockwise rotation, shared with the main window.
+    rotation: i32,
+    hqdn3d: bool,
+    deband: bool,
+    nlmeans: bool,
     stdout: std::io::Stdout,
 }
 
@@ -376,7 +407,7 @@ impl Picker {
                     continue;
                 };
                 // Tokens follow `VideoWindow::send_state`: x y zoom pan.x pan.y
-                // move deinterlace aspect. Reading the flag before the pan values puts pan.x where
+                // move deinterlace aspect rotation. Reading the flag before the pan values puts pan.x where
                 // the flag belongs, and every state line then reports movement
                 // as forbidden — which quietly un-ticks the checkbox.
                 let number =
@@ -402,6 +433,12 @@ impl Picker {
                 if let Some(value) = parts.next().and_then(|v| v.parse::<f32>().ok()) {
                     self.aspect_ratio = (value > 0.0).then_some(value);
                 }
+                if let Some(value) = parts.next().and_then(|v| v.parse::<i32>().ok()) {
+                    self.rotation = value.rem_euclid(360);
+                }
+                self.hqdn3d = parts.next().is_some_and(|v| v == "1");
+                self.deband = parts.next().is_some_and(|v| v == "1");
+                self.nlmeans = parts.next().is_some_and(|v| v == "1");
                 continue;
             }
             decode(&mut self.rows, &line);
@@ -480,36 +517,67 @@ impl eframe::App for Picker {
                 });
         });
 
-        // SMPlayer's *Mirror image* and *Flip image*. There it asks for the
-        // `hflip` and `vflip` lavfi filters; mpv has no property for either, but
-        // the `vf` command puts them in the pipeline exactly the same way.
         ui.horizontal(|ui| {
-            if ui.selectable_label(self.flip_x, "Mirror").clicked() {
-                self.flip_x = !self.flip_x;
-                self.flip();
-            }
-            if ui.selectable_label(self.flip_y, "Flip").clicked() {
-                self.flip_y = !self.flip_y;
-                self.flip();
-            }
-        });
-        // SMPlayer's *Deinterlace* submenu, as a picker over the same six
-        // choices. Choosing one replaces whatever was on the chain rather than
-        // adding to it, which is what `Core::changeDeinterlace` does for mpv.
-        ui.horizontal(|ui| {
-            ui.label("Deinterlace:");
-            let previous = self.deinterlace;
-            eframe::egui::ComboBox::from_id_salt("deinterlace")
-                .selected_text(DEINTERLACERS[self.deinterlace])
+            ui.label("Rotate:");
+            let rotations = [("0°", 0), ("90° clockwise", 90), ("180°", 180), ("270° clockwise", 270)];
+            eframe::egui::ComboBox::from_id_salt("video_rotation")
+                .selected_text(rotations.iter().find(|(_, value)| *value == self.rotation).map_or("0°", |(label, _)| *label))
                 .show_ui(ui, |ui| {
-                    for (index, name) in DEINTERLACERS.iter().enumerate() {
-                        ui.selectable_value(&mut self.deinterlace, index, *name);
+                    for (label, value) in rotations {
+                        if ui.selectable_label(self.rotation == value, label).clicked() {
+                            self.rotation = value;
+                            self.send(&format!("rotate {value}"));
+                        }
                     }
                 });
-            if self.deinterlace != previous {
-                self.send(&format!("deint {}", self.deinterlace));
-            }
         });
+
+        ui.collapsing("Filters", |ui| {
+            ui.label("Noise suppression");
+            for (kind, label) in [(0usize, "HQDN3D denoise"), (1, "Deband"), (2, "NLMeans denoise (slow)")] {
+                // Edit a local copy so the checkbox borrow ends before `self.send()`.
+                let mut enabled = match kind {
+                    0 => self.hqdn3d,
+                    1 => self.deband,
+                    _ => self.nlmeans,
+                };
+                if ui.checkbox(&mut enabled, label).changed() {
+                    match kind {
+                        0 => self.hqdn3d = enabled,
+                        1 => self.deband = enabled,
+                        _ => self.nlmeans = enabled,
+                    }
+                    self.send(&format!("noise {kind} {}", u8::from(enabled)));
+                }
+            }
+            ui.separator();
+            // These controls operate on the same shared filter state as the main window.
+            ui.horizontal(|ui| {
+                if ui.selectable_label(self.flip_x, "Mirror image").clicked() {
+                    self.flip_x = !self.flip_x;
+                    self.flip();
+                }
+                if ui.selectable_label(self.flip_y, "Flip image").clicked() {
+                    self.flip_y = !self.flip_y;
+                    self.flip();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Deinterlace:");
+                let previous = self.deinterlace;
+                eframe::egui::ComboBox::from_id_salt("deinterlace_filter")
+                    .selected_text(DEINTERLACERS[self.deinterlace])
+                    .show_ui(ui, |ui| {
+                        for (index, name) in DEINTERLACERS.iter().enumerate() {
+                            ui.selectable_value(&mut self.deinterlace, index, *name);
+                        }
+                    });
+                if self.deinterlace != previous {
+                    self.send(&format!("deint {}", self.deinterlace));
+                }
+            });
+        });
+
         // SMPlayer's *Zoom*: stepping, and a way back to the size that fits. It
         // scales the video widget and re-centres it; nothing goes to mpv, and
         // neither does anything here.
@@ -647,6 +715,10 @@ mod tests {
             allow_video_movement: false,
             deinterlace: 0,
             aspect_ratio: None,
+            rotation: 0,
+            hqdn3d: false,
+            deband: false,
+            nlmeans: false,
             stdout: std::io::stdout(),
         };
 
@@ -667,6 +739,8 @@ mod tests {
     #[test]
     fn a_deinterlace_choice_travels_as_an_index() {
         assert_eq!(parse_command("deint 3"), Some(VideoCommand::Deinterlace(3)));
+        assert_eq!(parse_command("rotate 90"), Some(VideoCommand::Rotate(90)));
+        assert_eq!(parse_command("rotate 450"), Some(VideoCommand::Rotate(90)));
         assert_eq!(parse_command("aspect 1.7777778"), Some(VideoCommand::AspectRatio(Some(1.7777778))));
         assert_eq!(parse_command("aspect 0"), Some(VideoCommand::AspectRatio(None)));
         assert_eq!(parse_command("deint nope"), None);

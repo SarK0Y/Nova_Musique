@@ -418,6 +418,12 @@ pub struct NovaApp {
     zoom: f32,
     /// Optional display aspect ratio override selected from Nova → Video.
     aspect_ratio_override: Option<f32>,
+    /// Clockwise rotation selected from Nova → Video → Rotate.
+    video_rotation: i32,
+    /// SMPlayer-style optional noise-reduction and cleanup filters.
+    noise_hqdn3d: bool,
+    noise_deband: bool,
+    noise_nlmeans: bool,
     /// SMPlayer's *Move left/right/up/down*: how far the picture is nudged off
     /// centre, in points, with +y running down like every other coordinate.
     /// The buttons in the video window nudge it; dragging the picture does the
@@ -531,6 +537,10 @@ impl NovaApp {
             flip_y: false,
             zoom: 1.0,
             aspect_ratio_override: None,
+            video_rotation: 0,
+            noise_hqdn3d: false,
+            noise_deband: false,
+            noise_nlmeans: false,
             pan: egui::Vec2::ZERO,
             deinterlace: 0,
             video_window: None,
@@ -1204,6 +1214,27 @@ impl NovaApp {
     // -- panels -------------------------------------------------------------
 
     fn top_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        // Keep the release number left-aligned while the product name stays
+        // visually centered in the main window, independent of menu widths.
+        let header_height = 24.0;
+        let (header_rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), header_height),
+            egui::Sense::hover(),
+        );
+        ui.painter().text(
+            header_rect.left_center() + egui::vec2(2.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            concat!("v", env!("CARGO_PKG_VERSION")),
+            egui::FontId::proportional(12.0),
+            ui.visuals().weak_text_color(),
+        );
+        ui.painter().text(
+            header_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Nova Musique",
+            egui::FontId::proportional(16.0),
+            ui.visuals().text_color(),
+        );
         ui.horizontal(|ui| {
             ui.menu_button(RichText::new("Nova").strong().size(18.0), |ui| {
                 if ui.button("Playlist").clicked() {
@@ -1234,6 +1265,43 @@ impl NovaApp {
                             if ui.selectable_label(selected, label).clicked() {
                                 self.aspect_ratio_override = ratio;
                                 self.pan = egui::Vec2::ZERO;
+                                ui.close();
+                            }
+                        }
+                    });
+                    ui.menu_button("Rotate", |ui| {
+                        for (label, degrees) in [("0°", 0), ("90° clockwise", 90), ("180°", 180), ("270° clockwise", 270)] {
+                            if ui.selectable_label(self.video_rotation == degrees, label).clicked() {
+                                self.video_rotation = degrees;
+                                if let Some(mpv) = self.mpv.clone() { mpv.set_video_rotation(degrees); }
+                                ui.close();
+                            }
+                        }
+                    });
+                    ui.menu_button("Filters", |ui| {
+                        ui.label("Noise suppression");
+                        if ui.checkbox(&mut self.noise_hqdn3d, "HQDN3D denoise").changed() {
+                            if let Some(mpv) = self.mpv.clone() { mpv.set_video_filter("lavfi=[hqdn3d]", self.noise_hqdn3d); }
+                        }
+                        if ui.checkbox(&mut self.noise_deband, "Deband").changed() {
+                            if let Some(mpv) = self.mpv.clone() { mpv.set_video_filter("lavfi=[deband]", self.noise_deband); }
+                        }
+                        if ui.checkbox(&mut self.noise_nlmeans, "NLMeans denoise (slow)").changed() {
+                            if let Some(mpv) = self.mpv.clone() { mpv.set_video_filter("lavfi=[nlmeans]", self.noise_nlmeans); }
+                        }
+                        ui.separator();
+                        ui.label("Image orientation");
+                        if ui.checkbox(&mut self.flip_x, "Mirror image").changed() {
+                            if let Some(mpv) = self.mpv.clone() { mpv.set_video_filter("hflip", self.flip_x); }
+                        }
+                        if ui.checkbox(&mut self.flip_y, "Flip image").changed() {
+                            if let Some(mpv) = self.mpv.clone() { mpv.set_video_filter("vflip", self.flip_y); }
+                        }
+                        ui.separator();
+                        ui.label("Deinterlace");
+                        for (index, name) in videowin::DEINTERLACERS.iter().enumerate() {
+                            if ui.selectable_label(self.deinterlace == index, *name).clicked() {
+                                self.set_deinterlace(index);
                                 ui.close();
                             }
                         }
@@ -2577,6 +2645,10 @@ impl NovaApp {
             allow_video_movement(),
             self.deinterlace,
             self.aspect_ratio_override,
+            self.video_rotation,
+            self.noise_hqdn3d,
+            self.noise_deband,
+            self.noise_nlmeans,
         );
         let commands = window.commands();
 
@@ -2604,6 +2676,24 @@ impl NovaApp {
             videowin::VideoCommand::AspectRatio(ratio) => {
                 self.aspect_ratio_override = ratio;
                 self.pan = egui::Vec2::ZERO;
+            }
+            videowin::VideoCommand::Rotate(degrees) => {
+                self.video_rotation = degrees.rem_euclid(360);
+                if let Some(mpv) = self.mpv.clone() { mpv.set_video_rotation(self.video_rotation); }
+            }
+            videowin::VideoCommand::NoiseFilter { kind, enabled } => {
+                let (state, filter) = match kind {
+                    0 => (&mut self.noise_hqdn3d, "lavfi=[hqdn3d]"),
+                    1 => (&mut self.noise_deband, "lavfi=[deband]"),
+                    2 => (&mut self.noise_nlmeans, "lavfi=[nlmeans]"),
+                    _ => return,
+                };
+                if *state != enabled {
+                    *state = enabled;
+                    if let Some(mpv) = self.mpv.clone() {
+                        mpv.set_video_filter(filter, enabled);
+                    }
+                }
             }
             videowin::VideoCommand::Flip { x, y } => {
                 self.flip_x = x;

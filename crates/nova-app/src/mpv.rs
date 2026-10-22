@@ -729,6 +729,12 @@ impl Mpv {
         self.command(&["vf", if on { "add" } else { "remove" }, filter]);
     }
 
+    /// Sets the clockwise video rotation in degrees (mpv's `video-rotate`).
+    pub fn set_video_rotation(&self, degrees: i32) {
+        let degrees = degrees.rem_euclid(360);
+        self.set_number("video-rotate", degrees as f64);
+    }
+
     /// Playback position, or zero when nothing is loaded yet.
     pub fn position(&self) -> Duration {
         self.read(|state| state.position)
