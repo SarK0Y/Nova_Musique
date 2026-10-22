@@ -16,7 +16,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -262,6 +262,7 @@ pub struct VideoTrack {
 /// read from there deadlocks. mpv therefore pushes values to a control thread
 /// (the arrangement SMPlayer uses), which publishes them here.
 struct State {
+    current_path: Option<PathBuf>,
     position: Duration,
     duration: Option<Duration>,
     paused: bool,
@@ -269,17 +270,23 @@ struct State {
     volume: f32,
     /// Video streams of the loaded file; empty when nothing video-ish is open.
     video_tracks: Vec<VideoTrack>,
+    audio_tracks: Vec<AudioTrack>,
+    /// Output devices exposed by mpv's active audio backends.
+    audio_devices: Vec<AudioDevice>,
 }
 
 impl Default for State {
     fn default() -> Self {
         State {
+            current_path: None,
             position: Duration::ZERO,
             duration: None,
             paused: true,
             finished: false,
             volume: 1.0,
             video_tracks: Vec::new(),
+            audio_tracks: Vec::new(),
+            audio_devices: Vec::new(),
         }
     }
 }
@@ -331,6 +338,86 @@ fn map_get<'a>(map: &'a MpvNode, key: &str) -> Option<&'a MpvNode> {
         })
         // Safe: same bounds reasoning as the key lookup above.
         .and_then(|i| unsafe { map.values.add(i).as_ref() })
+}
+
+
+/// An output device reported by mpv's `audio-device-list` property.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioDevice {
+    /// Backend-qualified identifier suitable for `audio-device`, e.g. `pulse/...`.
+    pub name: String,
+    /// Human-readable label supplied by the audio backend.
+    pub description: String,
+    pub is_default: bool,
+}
+
+fn read_audio_devices(handle: *mut MpvHandle) -> Vec<AudioDevice> {
+    let mut root = MpvNode {
+        u: MpvNodeValue { string: std::ptr::null_mut() },
+        format: 0,
+    };
+    let rc = unsafe {
+        mpv_get_property(handle, cstr("audio-device-list").as_ptr(), FORMAT_NODE,
+            &mut root as *mut MpvNode as *mut c_void)
+    };
+    if rc < 0 { return Vec::new(); }
+
+    let mut devices = Vec::new();
+    if root.format == FORMAT_NODE_ARRAY {
+        let list = unsafe { &*root.u.list };
+        for index in 0..list.num.max(0) as usize {
+            let Some(entry) = (unsafe { list.values.add(index).as_ref() }) else { continue; };
+            let Some(name) = map_get(entry, "name").and_then(node_string) else { continue; };
+            if name.is_empty() { continue; }
+            let description = map_get(entry, "description").and_then(node_string)
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| name.clone());
+            devices.push(AudioDevice {
+                name,
+                description,
+                is_default: map_get(entry, "is-default").is_some_and(node_flag),
+            });
+        }
+    }
+    unsafe { mpv_free_node_contents(&mut root as *mut MpvNode) };
+    devices
+}
+
+/// One audio stream reported by mpv.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioTrack {
+    pub id: String,
+    pub title: String,
+    pub selected: bool,
+}
+
+fn read_audio_tracks(handle: *mut MpvHandle) -> Vec<AudioTrack> {
+    let mut root = MpvNode {
+        u: MpvNodeValue { string: std::ptr::null_mut() },
+        format: 0,
+    };
+    let rc = unsafe {
+        mpv_get_property(handle, cstr("track-list").as_ptr(), FORMAT_NODE,
+            &mut root as *mut MpvNode as *mut c_void)
+    };
+    if rc < 0 { return Vec::new(); }
+    let mut tracks = Vec::new();
+    if root.format == FORMAT_NODE_ARRAY {
+        let list = unsafe { &*root.u.list };
+        for index in 0..list.num.max(0) as usize {
+            let Some(entry) = (unsafe { list.values.add(index).as_ref() }) else { continue; };
+            if map_get(entry, "type").and_then(node_string).as_deref() != Some("audio") { continue; }
+            let Some(id) = map_get(entry, "id").and_then(node_int).map(|id| id.to_string()) else { continue; };
+            let title = map_get(entry, "title").and_then(node_string)
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| map_get(entry, "lang").and_then(node_string))
+                .or_else(|| map_get(entry, "codec").and_then(node_string))
+                .unwrap_or_else(|| format!("Audio track {id}"));
+            tracks.push(AudioTrack { id, title, selected: map_get(entry, "selected").is_some_and(node_flag) });
+        }
+    }
+    unsafe { mpv_free_node_contents(&mut root as *mut MpvNode) };
+    tracks
 }
 
 /// Reads mpv's `track-list` and keeps the video streams.
@@ -680,6 +767,7 @@ impl Mpv {
     pub fn load(&self, path: &Path) {
         let path = path.to_string_lossy().into_owned();
         self.mutate(|state| {
+            state.current_path = Some(PathBuf::from(&path));
             state.position = Duration::ZERO;
             state.finished = false;
             state.paused = false;
@@ -765,6 +853,86 @@ impl Mpv {
         }
     }
 
+    pub fn audio_tracks(&self) -> Vec<AudioTrack> {
+        self.read(|state| state.audio_tracks.clone())
+    }
+
+    pub fn audio_devices(&self) -> Vec<AudioDevice> {
+        self.read(|state| state.audio_devices.clone())
+    }
+
+    pub fn select_audio_track(&self, id: &str) {
+        if let Ok(id) = id.parse::<i64>() {
+            self.set_int("aid", id);
+            self.reload_current_preserving_position();
+        }
+    }
+
+    pub fn set_audio_filter(&self, name: &str, filter: &str, on: bool) {
+        let action = if on { "add" } else { "remove" };
+        let filter_arg = if on {
+            format!("@nova-{name}:{filter}")
+        } else {
+            format!("@nova-{name}")
+        };
+        self.command(&["af", action, &filter_arg]);
+    }
+
+    /// Apply SMPlayer's Audio -> Stereo mode choices using mpv's lavfi/pan filter.
+    /// Selecting Stereo removes the mode filter and leaves the source channel layout untouched.
+    pub fn set_audio_mode(&self, mode: &str) {
+        self.command(&["af", "remove", "@nova-mode"]);
+        let filter = match mode {
+            "Mono" => Some("@nova-mode:lavfi=[pan=mono|c0=0.5*c0+0.5*c1]"),
+            "Left channel" | "Left" => Some("@nova-mode:lavfi=[pan=stereo|c0=c0|c1=c0]"),
+            "Right channel" | "Right" => Some("@nova-mode:lavfi=[pan=stereo|c0=c1|c1=c1]"),
+            "Reverse channels" | "Reverse stereo" | "Reverse" => {
+                Some("@nova-mode:lavfi=[pan=stereo|c0=c1|c1=c0]")
+            }
+            _ => None,
+        };
+        if let Some(filter) = filter {
+            self.command(&["af", "add", filter]);
+        }
+    }
+
+    pub fn set_audio_channels(&self, channels: &str) {
+        self.set_string("audio-channels", channels);
+    }
+
+    pub fn set_audio_delay_ms(&self, delay_ms: i32) {
+        self.set_number("audio-delay", delay_ms as f64 / 1000.0);
+    }
+
+    pub fn load_external_audio(&self, path: &Path) {
+        let path = path.to_string_lossy().into_owned();
+        self.command(&["audio-add", &path, "select"]);
+    }
+
+    pub fn set_audio_device(&self, device: &str) {
+        self.set_string("audio-device", device);
+        self.reload_current_preserving_position();
+    }
+
+    /// Reloads the current media after an audio stream/output change while
+    /// preserving the playhead and paused/playing state. mpv accepts `start`
+    /// as a per-file option on `loadfile`, avoiding a race from seeking before
+    /// the newly loaded file has finished opening.
+    fn reload_current_preserving_position(&self) {
+        let (path, position, paused) = self.read(|state| {
+            (state.current_path.clone(), state.position, state.paused)
+        });
+        let Some(path) = path else { return };
+        let path = path.to_string_lossy().into_owned();
+        let start = format!("start={:.3}", position.as_secs_f64());
+
+        self.mutate(|state| state.finished = false);
+        self.command(&["loadfile", &path, "replace", &start]);
+        // mpv's pause flag survives a reload, but explicitly restore it so the
+        // behavior is deterministic when switching tracks or output devices.
+        self.set_flag("pause", paused);
+    }
+
     /// Whether the file ran to its end. `keep-open` holds it there.
     pub fn is_finished(&self) -> bool {
         self.read(|state| state.finished)
@@ -805,6 +973,12 @@ impl Mpv {
         if rc < 0 {
             log::debug!("mpv: setting {name:?} failed: {}", error_text(rc));
         }
+    }
+
+    fn set_string(&self, name: &str, value: &str) {
+        let value = cstr(value);
+        let ptr = value.as_ptr();
+        self.set_property(name, FORMAT_STRING, &ptr as *const _ as *mut c_void);
     }
 
     /// Sets an integer property.
@@ -886,6 +1060,7 @@ fn control_loop(handle: &SharedHandle, state: &Mutex<State>) {
     let mut last_video_id: i64 = -2;
     let mut refresh_tracks = true;
     let mut next_track_read = Instant::now();
+    let mut next_device_read = Instant::now();
     loop {
         // Safe: `handle` outlives this thread — see `Drop for Mpv`.
         let read = |name: &str, format: c_int, slot: *mut c_void| unsafe {
@@ -956,6 +1131,10 @@ fn control_loop(handle: &SharedHandle, state: &Mutex<State>) {
                 next_track_read = Instant::now() + Duration::from_millis(500);
                 refresh_tracks = true;
             }
+            let refresh_devices = Instant::now() >= next_device_read;
+            if refresh_devices {
+                next_device_read = Instant::now() + Duration::from_secs(3);
+            }
 
             // One lock for the whole batch, so the UI never sees a torn update.
             let mut state = state.lock().unwrap_or_else(|err| err.into_inner());
@@ -970,13 +1149,18 @@ fn control_loop(handle: &SharedHandle, state: &Mutex<State>) {
             // a real end is caught even while `keep-open` holds the file.
             state.finished = (finished != 0 || position >= duration) && position > 0.0;
             if refresh_tracks {
-                // Outside the lock: this walks an mpv-owned tree.
+                // Outside the lock: these walk mpv-owned trees.
                 state.video_tracks = read_video_tracks(handle.0);
+                state.audio_tracks = read_audio_tracks(handle.0);
                 refresh_tracks = false;
             } else if state.video_tracks.is_empty() {
                 // Keep asking until something shows up, so opening the file
                 // while it is already playing is still noticed.
                 state.video_tracks = read_video_tracks(handle.0);
+                state.audio_tracks = read_audio_tracks(handle.0);
+            }
+            if refresh_devices {
+                state.audio_devices = read_audio_devices(handle.0);
             }
         }
 
