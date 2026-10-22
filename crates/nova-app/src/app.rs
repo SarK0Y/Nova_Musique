@@ -163,7 +163,6 @@ enum Action {
     OpenArtist(String),
     CloseArtist,
     SelectPath(String),
-    HideAll,
     PlayList(Vec<TrackId>, usize),
     PlayQueueIndex(usize),
     Enqueue(TrackId),
@@ -183,6 +182,11 @@ enum Action {
     LoadPlaylist(PathBuf),
     /// Go back from a loaded playlist to the whole library.
     UnloadPlaylist,
+    /// Empty the active playlist: drop its tracks from the library and clear
+    /// the playlist file and the list on screen.
+    ClearPlaylist,
+    /// Drop the library cache and the hidden list, then re-index the folder.
+    ClearCache,
     /// Open the "Songs → To NFM" conversion window.
     OpenNfm,
 }
@@ -1018,7 +1022,10 @@ impl NovaApp {
         if self.view == View::Songs {
             self.hidden.insert(id);
             save_hidden(&self.hidden);
-            self.library.hide(&self.hidden);
+            // Only this track leaves the library: the rest of the hidden list
+            // is untouched, or tracks a playlist re-imported would vanish
+            // with it.
+            self.library.hide(&HashSet::from([id]));
         } else {
             self.engine.queue_mut().remove(id);
         }
@@ -1106,13 +1113,6 @@ impl NovaApp {
                 }
                 Action::CloseArtist => self.artist_filter = None,
                 Action::SelectPath(path) => self.select_path(PathBuf::from(path)),
-                Action::HideAll => {
-                    self.hidden
-                        .extend(self.library.tracks().iter().map(|t| t.id));
-                    save_hidden(&self.hidden);
-                    self.library.hide(&self.hidden);
-                    self.engine.stop();
-                }
                 Action::PlayList(ids, start) => {
                     self.selected = ids.get(start).copied();
                     if let Err(err) = self.engine.set_queue(&self.library, ids, start) {
@@ -1186,6 +1186,13 @@ impl NovaApp {
                 }
                 Action::LoadPlaylist(path) => self.open_playlist(&path),
                 Action::UnloadPlaylist => self.loaded_playlist = None,
+                Action::ClearPlaylist => {
+                    // First drop the playlist's tracks from the library, then
+                    // clear the playlist itself (file on disk, list on screen).
+                    self.remove_stuff_from_library();
+                    self.fake_reload_playlist();
+                }
+                Action::ClearCache => self.clear_cache(),
                 Action::OpenNfm => self.nfm_open = true,
             }
         }
@@ -1372,6 +1379,61 @@ impl NovaApp {
         self.config.save();
     }
 
+    /// "Songs → Clear cache": drop the cached library index and the hidden
+    /// list, then re-index the folder, so the library is back to what is on
+    /// disk.
+    fn clear_cache(&mut self) {
+        self.hidden.clear();
+        for path in [hidden_file(), cache_file()].into_iter().flatten() {
+            let _ = std::fs::remove_file(path);
+        }
+        match self.music_dir.clone() {
+            Some(dir) => self.start_scan(dir),
+            None => self.toast("Cache cleared".to_string()),
+        }
+    }
+
+    /// Removes the current playlist's tracks from the library.
+    ///
+    /// The files stay on disk: the tracks are hidden the same way
+    /// <kbd>Del</kbd> hides them, so a rescan does not bring them back.
+    fn remove_stuff_from_library(&mut self) {
+        let ids: Vec<TrackId> = match &self.loaded_playlist {
+            Some((_, ids)) => ids.clone(),
+            None => return,
+        };
+        if ids.is_empty() {
+            return;
+        }
+        // Only the playlist's own tracks leave the library: the rest of the
+        // hidden list is untouched, or tracks a playlist re-imported would
+        // vanish with it.
+        self.library.hide(&ids.iter().copied().collect());
+        self.hidden.extend(ids);
+        save_hidden(&self.hidden);
+    }
+
+    /// Reloads the current playlist with its default data — the header of a
+    /// standard `.m3u8` file, with no tracks in it.
+    ///
+    /// No file is read: the file on disk is written with the same default
+    /// data and the in-memory list is reset, so the playlist stays the active
+    /// one but is empty.
+    ///
+    /// No-op when no playlist is current, so callers do not need to guard.
+    fn fake_reload_playlist(&mut self) {
+        let Some(path) = self.config.current_playlist.clone() else {
+            return;
+        };
+        let _ = std::fs::write(&path, DEFAULT_PLAYLIST);
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        self.loaded_playlist = Some((name, Vec::new()));
+    }
+
     /// Show `path`'s tracks in place of the whole library and make it the
     /// current playlist. Shared by the Load menu and by startup, which
     /// replays the config's current playlist.
@@ -1532,19 +1594,31 @@ impl NovaApp {
 
     /// The row above the song list. Drawn identically with and without a
     /// search filter, so `Clear all` never disappears behind a typed query.
+    ///
+    /// `Clear all` is a no-op when the whole library is on screen; it appears
+    /// only while a playlist is loaded, where it clears it.
     fn songs_header(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
             ui.heading("Songs");
             if let Some((name, _)) = &self.loaded_playlist {
                 ui.label(RichText::new(name).weak());
-            }
-            if ui.button("Clear all").clicked() {
-                actions.push(Action::HideAll);
+                // Fires on release: a click that ends on the button (not a
+                // click-drag that started here and left).
+                if ui
+                    .button("Clear all")
+                    .on_hover_text("current playlist")
+                    .clicked()
+                {
+                    actions.push(Action::ClearPlaylist);
+                }
             }
             self.save_menu(ui, actions);
             self.load_menu(ui, actions);
             if ui.button("To NFM").clicked() {
                 actions.push(Action::OpenNfm);
+            }
+            if ui.button("Clear cache").clicked() {
+                actions.push(Action::ClearCache);
             }
         });
     }
@@ -2684,6 +2758,7 @@ impl eframe::App for NovaApp {
                     .unwrap_or_default(),
             ),
             ("search", self.search.clone()),
+            ("library", format!("{} track(s)", self.library.len())),
             ("queue", format!("{} track(s)", self.engine.queue().len())),
             (
                 "nfm",
@@ -2768,8 +2843,12 @@ fn save_hidden(hidden: &HashSet<TrackId>) {
 ///
 /// An `#EXTINF` line names each track so other players show titles rather
 /// than file names; `-1` is the format's "duration unknown".
+/// The default contents of a playlist file: the header of a standard `.m3u8`,
+/// with no tracks in it.
+const DEFAULT_PLAYLIST: &str = "#EXTM3U\n";
+
 fn write_playlist(path: &Path, tracks: &[&Track]) -> std::io::Result<()> {
-    let mut body = String::from("#EXTM3U\n");
+    let mut body = String::from(DEFAULT_PLAYLIST);
     for track in tracks {
         let name = if track.artist.is_empty() {
             track.title.clone()

@@ -189,11 +189,14 @@ nova-cli play   <dir> [--index N] [--volume V] [--null] [--seconds S]
    playlist window and **Video** opens the video-stream picker. **Audio** is a
    placeholder for now.
 
-**Clear all**, **Save**, **Load** and **To NFM** sit beside the Songs title and
-keep working with a search typed in; **Clear all** ignores the search entirely
-(it hides tracks — see [Hiding songs](#hiding-songs)). **Save** and **Load** are
-the playlist buttons, described next; **To NFM** turns the current playlist into
-`.nfm` files — see [Converting to NFM](#converting-to-nfm).
+**Clear all**, **Save**, **Load**, **To NFM** and **Clear cache** sit beside the
+Songs title and keep working with a search typed in; **Clear all** is the
+playlist button — it clears the loaded playlist (see
+[Playlists](#playlists)) — while **Save** and **Load** manage playlist files.
+**To NFM** turns the current playlist into `.nfm` files — see
+[Converting to NFM](#converting-to-nfm). **Clear cache** drops the cached
+library index and the hidden list, then re-indexes the folder — see
+[Hiding songs](#hiding-songs).
 
 ### The Nova menu
 
@@ -448,9 +451,14 @@ has no tags at all.
 
 ### Playlists
 
-The Songs title carries two more buttons, **Save** and **Load**, for plain
-`.m3u8` files (with `.m3u` accepted on load). Both menus are sized to their
-longest entry, so file names never wrap.
+The Songs title carries three buttons, **Clear all**, **Save** and **Load**,
+for plain `.m3u8` files (with `.m3u` accepted on load). All three menus are
+sized to their longest entry, so file names never wrap.
+
+**Clear all** is only visible while a playlist is loaded; it clears the active
+playlist — its tracks leave the library too, and the playlist file on disk is
+rewritten with the plain `.m3u8` header, so it stays a valid (empty) playlist.
+The playlist stays the current one, with nothing in it.
 
 **Load** offers:
 
@@ -534,9 +542,9 @@ To bring songs back, empty or delete that file **and then press Scan**. The
 rescan matters: hiding also drops the track from the cached library, so without
 one you would be reading the cache that no longer has it.
 
-**Clear all** above the Songs list hides every track at once, by the same
-mechanism — the files are untouched, and the same "empty `hidden.json` and
-rescan" brings the whole library back.
+**Songs → Clear cache** does both in one go: it deletes `hidden.json` and the
+library cache, then re-indexes the folder — so the library is back to what is
+on disk and nothing stays hidden.
 
 ### Keyboard
 
@@ -650,7 +658,8 @@ While it runs, Nova also mirrors a few states into `/dev/shm/nova/*.out` as
 tiny text files — `playlist` (the loaded file and its track count),
 `menu_state` (`load` / `save` while one of those menus is open),
 `now_playing` (`playing` / `paused` / `stopped` and the track), `queue`,
-`search` and `toast`. They are only rewritten when a value changes, and exist
+`library` (the track count), `search` and `toast`. They are only rewritten when
+a value changes, and exist
 so a script can watch what the app is doing without screenshots:
 
 ```sh
