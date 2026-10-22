@@ -56,7 +56,7 @@ pub struct VideoWindow {
     /// What the child already knows, so the list is only sent when it changes.
     sent: Vec<VideoTrack>,
     /// Same, for the mirror/flip/zoom/pan/move-allowed state.
-    sent_state: (bool, bool, f32, eframe::egui::Vec2, bool, usize),
+    sent_state: (bool, bool, f32, eframe::egui::Vec2, bool, usize, Option<f32>),
 }
 
 impl VideoWindow {
@@ -102,7 +102,7 @@ impl VideoWindow {
             stdin,
             picks,
             sent: Vec::new(),
-            sent_state: (false, false, 1.0, eframe::egui::Vec2::ZERO, true, 0),
+            sent_state: (false, false, 1.0, eframe::egui::Vec2::ZERO, true, 0, None),
         })
     }
 
@@ -143,8 +143,9 @@ impl VideoWindow {
         pan: eframe::egui::Vec2,
         move_allowed: bool,
         deinterlace: usize,
+        aspect_ratio: Option<f32>,
     ) {
-        let state = (x, y, zoom, pan, move_allowed, deinterlace);
+        let state = (x, y, zoom, pan, move_allowed, deinterlace, aspect_ratio);
         if state == self.sent_state && self.stdin.is_some() {
             return;
         }
@@ -153,11 +154,12 @@ impl VideoWindow {
             return;
         };
         let line = format!(
-            "state {x} {y} {zoom} {:.2} {:.2} {} {}\n",
+            "state {x} {y} {zoom} {:.2} {:.2} {} {} {}\n",
             pan.x,
             pan.y,
             u8::from(move_allowed),
-            deinterlace
+            deinterlace,
+            aspect_ratio.unwrap_or(0.0)
         );
         if let Err(err) = stdin.write_all(line.as_bytes()) {
             log::debug!("video window is gone ({err})");
@@ -199,6 +201,8 @@ pub enum VideoCommand {
     MoveAllowed(bool),
     /// Which of [`DEINTERLACERS`] should be on the filter chain.
     Deinterlace(usize),
+    /// Set display aspect ratio; zero on the wire means use the source ratio.
+    AspectRatio(Option<f32>),
 }
 
 /// Reads one line from the pipe, whether that is the picker's end or nova's
@@ -211,6 +215,10 @@ pub(crate) fn parse_command(line: &str) -> Option<VideoCommand> {
     }
     if let Some(flag) = line.strip_prefix("move ") {
         return Some(VideoCommand::MoveAllowed(flag.trim() == "1"));
+    }
+    if let Some(value) = line.strip_prefix("aspect ") {
+        let value = value.trim().parse::<f32>().ok()?;
+        return Some(VideoCommand::AspectRatio((value > 0.0).then_some(value)));
     }
     if let Some(choice) = line.strip_prefix("deint ") {
         let choice = choice.trim().parse::<usize>().ok()?;
@@ -329,6 +337,7 @@ pub fn run() -> eframe::Result<()> {
                 pan: eframe::egui::Vec2::ZERO,
                 allow_video_movement: true,
                 deinterlace: 0,
+                aspect_ratio: None,
                 rows: Vec::new(),
                 stdout: std::io::stdout(),
             }))
@@ -350,6 +359,8 @@ struct Picker {
     allow_video_movement: bool,
     /// Which of [`DEINTERLACERS`] is on the filter chain.
     deinterlace: usize,
+    /// Display ratio selected in the main window; `None` means source ratio.
+    aspect_ratio: Option<f32>,
     stdout: std::io::Stdout,
 }
 
@@ -365,7 +376,7 @@ impl Picker {
                     continue;
                 };
                 // Tokens follow `VideoWindow::send_state`: x y zoom pan.x pan.y
-                // move. Reading the flag before the pan values puts pan.x where
+                // move deinterlace aspect. Reading the flag before the pan values puts pan.x where
                 // the flag belongs, and every state line then reports movement
                 // as forbidden — which quietly un-ticks the checkbox.
                 let number =
@@ -387,6 +398,9 @@ impl Picker {
                 self.allow_video_movement = move_allowed;
                 if let Some(index) = deinterlace {
                     self.deinterlace = index;
+                }
+                if let Some(value) = parts.next().and_then(|v| v.parse::<f32>().ok()) {
+                    self.aspect_ratio = (value > 0.0).then_some(value);
                 }
                 continue;
             }
@@ -434,6 +448,37 @@ impl eframe::App for Picker {
         self.drain();
 
         ui.heading("Video");
+
+        ui.horizontal(|ui| {
+            ui.label("Aspect ratio:");
+            let choices: [(&str, Option<f32>); 6] = [
+                ("Auto (source)", None),
+                ("16:9", Some(16.0 / 9.0)),
+                ("4:3", Some(4.0 / 3.0)),
+                ("16:10", Some(16.0 / 10.0)),
+                ("1:1", Some(1.0)),
+                ("2.35:1", Some(2.35)),
+            ];
+            eframe::egui::ComboBox::from_id_salt("aspect_ratio")
+                .selected_text(choices.iter().find(|(_, ratio)| match (self.aspect_ratio, *ratio) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => (a - b).abs() < 0.001,
+                    _ => false,
+                }).map_or("Auto (source)", |(label, _)| *label))
+                .show_ui(ui, |ui| {
+                    for (label, ratio) in choices {
+                        let selected = match (self.aspect_ratio, ratio) {
+                            (None, None) => true,
+                            (Some(a), Some(b)) => (a - b).abs() < 0.001,
+                            _ => false,
+                        };
+                        if ui.selectable_label(selected, label).clicked() {
+                            self.aspect_ratio = ratio;
+                            self.send(&format!("aspect {}", ratio.unwrap_or(0.0)));
+                        }
+                    }
+                });
+        });
 
         // SMPlayer's *Mirror image* and *Flip image*. There it asks for the
         // `hflip` and `vflip` lavfi filters; mpv has no property for either, but
@@ -592,7 +637,7 @@ mod tests {
         // The exact line `send_state` writes: x y zoom pan.x pan.y move.
         let mut picker = Picker {
             incoming: Arc::new(Mutex::new(vec![
-                "state 1 0 1.50 -16.00 32.00 1 3".to_string()
+                "state 1 0 1.50 -16.00 32.00 1 3 1.7777778".to_string()
             ])),
             rows: Vec::new(),
             flip_x: false,
@@ -601,6 +646,7 @@ mod tests {
             pan: eframe::egui::Vec2::ZERO,
             allow_video_movement: false,
             deinterlace: 0,
+            aspect_ratio: None,
             stdout: std::io::stdout(),
         };
 
@@ -615,11 +661,14 @@ mod tests {
         assert!(picker.allow_video_movement, "allow moving");
         // Last token, and only accepted when it names a real choice.
         assert_eq!(picker.deinterlace, 3, "deinterlace");
+        assert!((picker.aspect_ratio.unwrap() - 16.0 / 9.0).abs() < 0.001);
     }
 
     #[test]
     fn a_deinterlace_choice_travels_as_an_index() {
         assert_eq!(parse_command("deint 3"), Some(VideoCommand::Deinterlace(3)));
+        assert_eq!(parse_command("aspect 1.7777778"), Some(VideoCommand::AspectRatio(Some(1.7777778))));
+        assert_eq!(parse_command("aspect 0"), Some(VideoCommand::AspectRatio(None)));
         assert_eq!(parse_command("deint nope"), None);
         assert_eq!(parse_command("deint"), None);
     }
@@ -677,7 +726,7 @@ mod tests {
     #[test]
     fn rubbish_from_the_pipe_is_ignored() {
         for line in [
-            "", "pick", "flip", "flip x", "pan", "pan 1", "state", "nonsense",
+            "", "pick", "flip", "flip x", "pan", "pan 1", "state", "aspect nope", "nonsense",
         ] {
             assert_eq!(parse_command(line), None, "{line:?} was not ignored");
         }

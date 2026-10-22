@@ -2576,6 +2576,7 @@ impl NovaApp {
             self.pan,
             allow_video_movement(),
             self.deinterlace,
+            self.aspect_ratio_override,
         );
         let commands = window.commands();
 
@@ -2600,6 +2601,10 @@ impl NovaApp {
             videowin::VideoCommand::Pan(x, y) => self.pan = egui::vec2(x, y),
             videowin::VideoCommand::MoveAllowed(allowed) => set_allow_video_movement(allowed),
             videowin::VideoCommand::Deinterlace(choice) => self.set_deinterlace(choice),
+            videowin::VideoCommand::AspectRatio(ratio) => {
+                self.aspect_ratio_override = ratio;
+                self.pan = egui::Vec2::ZERO;
+            }
             videowin::VideoCommand::Flip { x, y } => {
                 self.flip_x = x;
                 self.flip_y = y;
