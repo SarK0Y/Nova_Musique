@@ -340,7 +340,6 @@ fn map_get<'a>(map: &'a MpvNode, key: &str) -> Option<&'a MpvNode> {
         .and_then(|i| unsafe { map.values.add(i).as_ref() })
 }
 
-
 /// An output device reported by mpv's `audio-device-list` property.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioDevice {
@@ -353,23 +352,38 @@ pub struct AudioDevice {
 
 fn read_audio_devices(handle: *mut MpvHandle) -> Vec<AudioDevice> {
     let mut root = MpvNode {
-        u: MpvNodeValue { string: std::ptr::null_mut() },
+        u: MpvNodeValue {
+            string: std::ptr::null_mut(),
+        },
         format: 0,
     };
     let rc = unsafe {
-        mpv_get_property(handle, cstr("audio-device-list").as_ptr(), FORMAT_NODE,
-            &mut root as *mut MpvNode as *mut c_void)
+        mpv_get_property(
+            handle,
+            cstr("audio-device-list").as_ptr(),
+            FORMAT_NODE,
+            &mut root as *mut MpvNode as *mut c_void,
+        )
     };
-    if rc < 0 { return Vec::new(); }
+    if rc < 0 {
+        return Vec::new();
+    }
 
     let mut devices = Vec::new();
     if root.format == FORMAT_NODE_ARRAY {
         let list = unsafe { &*root.u.list };
         for index in 0..list.num.max(0) as usize {
-            let Some(entry) = (unsafe { list.values.add(index).as_ref() }) else { continue; };
-            let Some(name) = map_get(entry, "name").and_then(node_string) else { continue; };
-            if name.is_empty() { continue; }
-            let description = map_get(entry, "description").and_then(node_string)
+            let Some(entry) = (unsafe { list.values.add(index).as_ref() }) else {
+                continue;
+            };
+            let Some(name) = map_get(entry, "name").and_then(node_string) else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            let description = map_get(entry, "description")
+                .and_then(node_string)
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| name.clone());
             devices.push(AudioDevice {
@@ -393,27 +407,49 @@ pub struct AudioTrack {
 
 fn read_audio_tracks(handle: *mut MpvHandle) -> Vec<AudioTrack> {
     let mut root = MpvNode {
-        u: MpvNodeValue { string: std::ptr::null_mut() },
+        u: MpvNodeValue {
+            string: std::ptr::null_mut(),
+        },
         format: 0,
     };
     let rc = unsafe {
-        mpv_get_property(handle, cstr("track-list").as_ptr(), FORMAT_NODE,
-            &mut root as *mut MpvNode as *mut c_void)
+        mpv_get_property(
+            handle,
+            cstr("track-list").as_ptr(),
+            FORMAT_NODE,
+            &mut root as *mut MpvNode as *mut c_void,
+        )
     };
-    if rc < 0 { return Vec::new(); }
+    if rc < 0 {
+        return Vec::new();
+    }
     let mut tracks = Vec::new();
     if root.format == FORMAT_NODE_ARRAY {
         let list = unsafe { &*root.u.list };
         for index in 0..list.num.max(0) as usize {
-            let Some(entry) = (unsafe { list.values.add(index).as_ref() }) else { continue; };
-            if map_get(entry, "type").and_then(node_string).as_deref() != Some("audio") { continue; }
-            let Some(id) = map_get(entry, "id").and_then(node_int).map(|id| id.to_string()) else { continue; };
-            let title = map_get(entry, "title").and_then(node_string)
+            let Some(entry) = (unsafe { list.values.add(index).as_ref() }) else {
+                continue;
+            };
+            if map_get(entry, "type").and_then(node_string).as_deref() != Some("audio") {
+                continue;
+            }
+            let Some(id) = map_get(entry, "id")
+                .and_then(node_int)
+                .map(|id| id.to_string())
+            else {
+                continue;
+            };
+            let title = map_get(entry, "title")
+                .and_then(node_string)
                 .filter(|s| !s.trim().is_empty())
                 .or_else(|| map_get(entry, "lang").and_then(node_string))
                 .or_else(|| map_get(entry, "codec").and_then(node_string))
                 .unwrap_or_else(|| format!("Audio track {id}"));
-            tracks.push(AudioTrack { id, title, selected: map_get(entry, "selected").is_some_and(node_flag) });
+            tracks.push(AudioTrack {
+                id,
+                title,
+                selected: map_get(entry, "selected").is_some_and(node_flag),
+            });
         }
     }
     unsafe { mpv_free_node_contents(&mut root as *mut MpvNode) };
@@ -880,22 +916,16 @@ impl Mpv {
 
     /// Apply SMPlayer's Audio -> Stereo mode choices using mpv's lavfi/pan filter.
     /// Selecting Stereo removes the mode filter and leaves the source channel layout untouched.
+    ///
+    /// Reloaded like a device change: the new chain is in place for the first
+    /// frame rather than after mpv gets around to reinit, and the playhead is kept.
     pub fn set_audio_mode(&self, mode: &str) {
         self.command(&["af", "remove", "@nova-mode"]);
-        let filter = match mode {
-            "Mono" => Some("@nova-mode:lavfi=[pan=mono|c0=0.5*c0+0.5*c1]"),
-            "Left channel" | "Left" => Some("@nova-mode:lavfi=[pan=stereo|c0=c0|c1=c0]"),
-            "Right channel" | "Right" => Some("@nova-mode:lavfi=[pan=stereo|c0=c1|c1=c1]"),
-            "Reverse channels" | "Reverse stereo" | "Reverse" => {
-                Some("@nova-mode:lavfi=[pan=stereo|c0=c1|c1=c0]")
-            }
-            _ => None,
-        };
-        if let Some(filter) = filter {
+        if let Some(filter) = stereo_mode_filter(mode) {
             self.command(&["af", "add", filter]);
         }
+        self.reload_current_preserving_position();
     }
-
     pub fn set_audio_channels(&self, channels: &str) {
         self.set_string("audio-channels", channels);
     }
@@ -919,9 +949,8 @@ impl Mpv {
     /// as a per-file option on `loadfile`, avoiding a race from seeking before
     /// the newly loaded file has finished opening.
     fn reload_current_preserving_position(&self) {
-        let (path, position, paused) = self.read(|state| {
-            (state.current_path.clone(), state.position, state.paused)
-        });
+        let (path, position, paused) =
+            self.read(|state| (state.current_path.clone(), state.position, state.paused));
         let Some(path) = path else { return };
         let path = path.to_string_lossy().into_owned();
         let start = format!("start={:.3}", position.as_secs_f64());
@@ -1013,6 +1042,39 @@ pub fn deinterlace_filter(choice: usize) -> Option<&'static str> {
         5 => "kerndeint=5",
         _ => return None,
     })
+}
+
+/// The lavfi filter behind each of SMPlayer's *Audio → Stereo mode* choices.
+///
+/// This is SMPlayer's own mapping (`mpvoptions.cpp`, `filter_name ==
+/// "stereo-mode"`): *Left channel* and *Right channel* keep one input channel
+/// and collapse the output to mono, *Mono* averages both, *Reverse* swaps them.
+/// *Stereo* is the untouched source, so there is no filter.
+fn stereo_mode_filter(mode: &str) -> Option<&'static str> {
+    use nova_core::playback::StereoMode;
+    Some(match stereo_mode(mode) {
+        StereoMode::Left => "@nova-mode:lavfi=[pan=mono|c0=c0]",
+        StereoMode::Right => "@nova-mode:lavfi=[pan=mono|c0=c1]",
+        StereoMode::Mono => "@nova-mode:lavfi=[pan=mono|c0=0.5*c0+0.5*c1]",
+        StereoMode::Reverse => "@nova-mode:lavfi=[pan=stereo|c0=c1|c1=c0]",
+        StereoMode::Stereo => return None,
+    })
+}
+
+/// The SMPlayer *Stereo mode* choice behind a label (UI label or pipe token).
+///
+/// Unknown names fall through to plain Stereo rather than fail: the same
+/// choice reaches both the mpv filter chain and the rodio path, so one mapping
+/// keeps the two in lockstep.
+pub fn stereo_mode(mode: &str) -> nova_core::playback::StereoMode {
+    use nova_core::playback::StereoMode;
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "left channel" | "left" => StereoMode::Left,
+        "right channel" | "right" => StereoMode::Right,
+        "mono" => StereoMode::Mono,
+        "reverse channels" | "reverse stereo" | "reverse" => StereoMode::Reverse,
+        _ => StereoMode::Stereo,
+    }
 }
 
 impl Drop for Mpv {
@@ -1294,6 +1356,12 @@ impl AudioBackend for VideoBackend {
         self.audio.set_volume(volume);
     }
 
+    fn set_stereo_mode(&mut self, mode: nova_core::playback::StereoMode) {
+        // The mode affects the rodio side live; mpv takes it via its own
+        // `set_audio_mode` call from the app, so no reload is needed here.
+        self.audio.set_stereo_mode(mode);
+    }
+
     fn volume(&self) -> f32 {
         self.volume
     }
@@ -1445,5 +1513,41 @@ mod tests {
         assert_eq!(deinterlace_filter(4), Some("yadif=mode=1"));
         assert_eq!(deinterlace_filter(3), Some("yadif=mode=send_field"));
         assert_eq!(deinterlace_filter(5), Some("kerndeint=5"));
+    }
+
+    #[test]
+    fn every_stereo_mode_is_mapped_smplayers_way() {
+        // The five lavfi strings from SMPlayer's `mpvoptions.cpp`. Left and
+        // right collapse to mono rather than being copied to both channels.
+        assert_eq!(stereo_mode_filter("Stereo"), None);
+        assert_eq!(
+            stereo_mode_filter("Left channel"),
+            Some("@nova-mode:lavfi=[pan=mono|c0=c0]")
+        );
+        assert_eq!(
+            stereo_mode_filter("Right channel"),
+            Some("@nova-mode:lavfi=[pan=mono|c0=c1]")
+        );
+        assert_eq!(
+            stereo_mode_filter("Mono"),
+            Some("@nova-mode:lavfi=[pan=mono|c0=0.5*c0+0.5*c1]")
+        );
+        assert_eq!(
+            stereo_mode_filter("Reverse channels"),
+            Some("@nova-mode:lavfi=[pan=stereo|c0=c1|c1=c0]")
+        );
+        // The pipe's short tokens and the UI's labels reach the same filters.
+        assert_eq!(
+            stereo_mode_filter("reverse"),
+            stereo_mode_filter("Reverse channels")
+        );
+        assert_eq!(
+            stereo_mode_filter("left"),
+            stereo_mode_filter("Left channel")
+        );
+        assert_eq!(
+            stereo_mode_filter("Right"),
+            stereo_mode_filter("Right channel")
+        );
     }
 }

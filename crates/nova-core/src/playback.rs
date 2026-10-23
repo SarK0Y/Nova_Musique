@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "audio")]
-use rodio::{Decoder, MixerDeviceSink, Player, Source as _};
+use rodio::{Decoder, MixerDeviceSink, Player, Source};
 
 #[cfg(all(feature = "audio", feature = "nofft"))]
 use std::num::NonZero;
@@ -28,6 +28,48 @@ pub enum PlaybackState {
     Paused,
 }
 
+/// SMPlayer's *Audio → Stereo mode* choices, in its own menu order.
+///
+/// mpv gets these as `pan` lavfi filters; rodio has no filter chain, so the
+/// same choice is applied to the decoded frames by the adapter in
+/// [`RodioBackend`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StereoMode {
+    /// Untouched.
+    #[default]
+    Stereo,
+    /// One input channel duplicated to both.
+    Left,
+    /// One input channel duplicated to both.
+    Right,
+    /// Both inputs averaged to mono.
+    Mono,
+    /// Left and right swapped.
+    Reverse,
+}
+
+impl StereoMode {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Stereo => 0,
+            Self::Left => 1,
+            Self::Right => 2,
+            Self::Mono => 3,
+            Self::Reverse => 4,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Left,
+            2 => Self::Right,
+            3 => Self::Mono,
+            4 => Self::Reverse,
+            _ => Self::Stereo,
+        }
+    }
+}
+
 /// A track of playback: the engine drives the queue, the backend only knows how
 /// to play a single file.
 pub trait AudioBackend {
@@ -46,6 +88,11 @@ pub trait AudioBackend {
     fn seek(&mut self, position: Duration) -> Result<()>;
     /// Sets the output volume, where `1.0` is unity gain.
     fn set_volume(&mut self, volume: f32);
+    /// Applies SMPlayer's *Audio → Stereo mode* to the decoded audio.
+    ///
+    /// The default keeps the choice for backends that have no sample path to
+    /// rewrite; the engine calls it after every mode change.
+    fn set_stereo_mode(&mut self, _mode: StereoMode) {}
     /// Current volume.
     fn volume(&self) -> f32;
     /// Elapsed position of the loaded track.
@@ -287,6 +334,102 @@ impl Drop for StreamedPcm {
     }
 }
 
+/// SMPlayer's *Audio → Stereo mode*, applied to a decoded source frame at a
+/// time.
+///
+/// mpv does this with a `pan` lavfi filter; rodio has a chain of iterators, so
+/// the same choice is made here instead. Left and Right keep one input channel
+/// and send it to both — what SMPlayer's `pan=mono` sounds like on a stereo
+/// output — Mono averages the pair and Reverse swaps them. The choice is shared
+/// with the backend, so it changes the sound mid-track, no reload required.
+#[cfg(feature = "audio")]
+struct StereoPan<S> {
+    inner: S,
+    mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Which sample of the current frame is due next.
+    channel: u16,
+    /// The frame's first two samples, already rewritten.
+    left: f32,
+    right: f32,
+}
+
+#[cfg(feature = "audio")]
+impl<S: Source> StereoPan<S> {
+    fn new(inner: S, mode: std::sync::Arc<std::sync::atomic::AtomicU8>) -> Self {
+        Self {
+            inner,
+            mode,
+            channel: 0,
+            left: 0.0,
+            right: 0.0,
+        }
+    }
+}
+
+#[cfg(feature = "audio")]
+impl<S: Source> Source for StereoPan<S> {
+    fn current_span_len(&self) -> Option<usize> {
+        self.inner.current_span_len()
+    }
+
+    fn channels(&self) -> rodio::ChannelCount {
+        self.inner.channels()
+    }
+
+    fn sample_rate(&self) -> rodio::SampleRate {
+        self.inner.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
+    }
+
+    fn try_seek(
+        &mut self,
+        position: Duration,
+    ) -> std::result::Result<(), rodio::source::SeekError> {
+        // Realign the frame counter; the inner source does the actual seek.
+        self.channel = 0;
+        self.inner.try_seek(position)
+    }
+}
+
+#[cfg(feature = "audio")]
+impl<S: Source> Iterator for StereoPan<S> {
+    type Item = rodio::Sample;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let channels = self.inner.channels().get();
+        if self.channel == 0 {
+            // Start of frame: every mode needs both inputs before emitting.
+            let first = self.inner.next()?;
+            let second = if channels > 1 {
+                self.inner.next()?
+            } else {
+                first
+            };
+            let (left, right) =
+                match StereoMode::from_u8(self.mode.load(std::sync::atomic::Ordering::Relaxed)) {
+                    StereoMode::Left => (first, first),
+                    StereoMode::Right => (second, second),
+                    StereoMode::Mono => ((first + second) * 0.5, (first + second) * 0.5),
+                    StereoMode::Reverse => (second, first),
+                    StereoMode::Stereo => (first, second),
+                };
+            self.left = left;
+            self.right = right;
+        }
+        let sample = match self.channel {
+            0 => self.left,
+            1 => self.right,
+            // Channel 2 and up: pass through untouched.
+            _ => self.inner.next()?,
+        };
+        self.channel = (self.channel + 1) % channels;
+        Some(sample)
+    }
+}
+
 /// Plays audio through the operating system's default output device.
 #[cfg(feature = "audio")]
 pub struct RodioBackend {
@@ -299,6 +442,9 @@ pub struct RodioBackend {
     duration: Option<Duration>,
     volume: f32,
     paused: bool,
+    /// SMPlayer's *Audio → Stereo mode*; every source appended to the player
+    /// shares this cell, so the choice rewrites audio mid-track.
+    mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// Removes payload files left behind by an earlier run.
@@ -347,6 +493,7 @@ impl RodioBackend {
             duration: None,
             volume: 1.0,
             paused: false,
+            mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         })
     }
 }
@@ -385,7 +532,8 @@ impl AudioBackend for RodioBackend {
             self.duration = Some(source.format.duration());
             // `clear` also pauses, so we always resume explicitly below.
             self.player.clear();
-            self.player.append(source);
+            self.player
+                .append(StereoPan::new(source, std::sync::Arc::clone(&self.mode)));
             self.player.set_volume(self.volume);
             self.player.play();
             self.paused = false;
@@ -402,7 +550,8 @@ impl AudioBackend for RodioBackend {
             self.duration = Some(source.format.duration());
             // `clear` also pauses, so we always resume explicitly below.
             self.player.clear();
-            self.player.append(source);
+            self.player
+                .append(StereoPan::new(source, std::sync::Arc::clone(&self.mode)));
             self.player.set_volume(self.volume);
             self.player.play();
             self.paused = false;
@@ -417,7 +566,8 @@ impl AudioBackend for RodioBackend {
         self.duration = decoder.total_duration();
         // `clear` also pauses, so we always resume explicitly below.
         self.player.clear();
-        self.player.append(decoder);
+        self.player
+            .append(StereoPan::new(decoder, std::sync::Arc::clone(&self.mode)));
         self.player.set_volume(self.volume);
         self.player.play();
         self.paused = false;
@@ -466,6 +616,11 @@ impl AudioBackend for RodioBackend {
     fn set_volume(&mut self, volume: f32) {
         self.volume = volume.clamp(0.0, 1.5);
         self.player.set_volume(self.volume);
+    }
+
+    fn set_stereo_mode(&mut self, mode: StereoMode) {
+        self.mode
+            .store(mode.as_u8(), std::sync::atomic::Ordering::Relaxed);
     }
 
     fn volume(&self) -> f32 {
@@ -771,6 +926,14 @@ impl PlaybackEngine {
         self.backend.set_volume(self.volume);
     }
 
+    /// Applies SMPlayer's *Audio → Stereo mode* to playback.
+    ///
+    /// The choice is shared with every source already appended, so it takes
+    /// effect mid-track without a reload.
+    pub fn set_stereo_mode(&mut self, mode: StereoMode) {
+        self.backend.set_stereo_mode(mode);
+    }
+
     /// Current volume.
     pub fn volume(&self) -> f32 {
         self.volume
@@ -985,5 +1148,32 @@ mod tests {
             .expect("queue starts");
         engine.seek(Duration::from_millis(15)).expect("seek works");
         assert!(engine.position() >= Duration::from_millis(15));
+    }
+
+    #[cfg(feature = "audio")]
+    #[test]
+    fn stereo_modes_rewrite_frames_like_smplayers_pan_filters() {
+        use rodio::buffer::SamplesBuffer;
+        use std::sync::atomic::AtomicU8;
+
+        let frames: [[f32; 2]; 2] = [[0.1, 0.2], [0.3, 0.4]];
+        let samples: Vec<f32> = frames.iter().flatten().copied().collect();
+        let two = rodio::ChannelCount::new(2).unwrap();
+        let rate = rodio::SampleRate::new(44_100).unwrap();
+
+        let run = |mode: StereoMode| {
+            let source = SamplesBuffer::new(two, rate, samples.clone());
+            let shared = std::sync::Arc::new(AtomicU8::new(mode.as_u8()));
+            StereoPan::new(source, shared).collect::<Vec<_>>()
+        };
+        let approx_eq = |a: &[f32], b: &[f32]| {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-6)
+        };
+        let stereo = samples.clone();
+        assert!(approx_eq(&run(StereoMode::Stereo), &stereo));
+        assert!(approx_eq(&run(StereoMode::Left), &[0.1, 0.1, 0.3, 0.3]));
+        assert!(approx_eq(&run(StereoMode::Right), &[0.2, 0.2, 0.4, 0.4]));
+        assert!(approx_eq(&run(StereoMode::Mono), &[0.15, 0.15, 0.35, 0.35]));
+        assert!(approx_eq(&run(StereoMode::Reverse), &[0.2, 0.1, 0.4, 0.3]));
     }
 }

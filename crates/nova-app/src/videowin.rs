@@ -56,7 +56,19 @@ pub struct VideoWindow {
     /// What the child already knows, so the list is only sent when it changes.
     sent: Vec<VideoTrack>,
     /// Same, for the mirror/flip/zoom/pan/move-allowed state.
-    sent_state: (bool, bool, f32, eframe::egui::Vec2, bool, usize, Option<f32>, i32, bool, bool, bool),
+    sent_state: (
+        bool,
+        bool,
+        f32,
+        eframe::egui::Vec2,
+        bool,
+        usize,
+        Option<f32>,
+        i32,
+        bool,
+        bool,
+        bool,
+    ),
 }
 
 impl VideoWindow {
@@ -102,7 +114,19 @@ impl VideoWindow {
             stdin,
             picks,
             sent: Vec::new(),
-            sent_state: (false, false, 1.0, eframe::egui::Vec2::ZERO, true, 0, None, 0, false, false, false),
+            sent_state: (
+                false,
+                false,
+                1.0,
+                eframe::egui::Vec2::ZERO,
+                true,
+                0,
+                None,
+                0,
+                false,
+                false,
+                false,
+            ),
         })
     }
 
@@ -149,7 +173,19 @@ impl VideoWindow {
         deband: bool,
         nlmeans: bool,
     ) {
-        let state = (x, y, zoom, pan, move_allowed, deinterlace, aspect_ratio, rotation, hqdn3d, deband, nlmeans);
+        let state = (
+            x,
+            y,
+            zoom,
+            pan,
+            move_allowed,
+            deinterlace,
+            aspect_ratio,
+            rotation,
+            hqdn3d,
+            deband,
+            nlmeans,
+        );
         if state == self.sent_state && self.stdin.is_some() {
             return;
         }
@@ -200,7 +236,10 @@ pub enum VideoCommand {
     /// Show the video stream with this track id.
     Pick(String),
     /// Mirror the picture left-right (`x`), flip it top-bottom (`y`).
-    Flip { x: bool, y: bool },
+    Flip {
+        x: bool,
+        y: bool,
+    },
     /// Scale the picture by this factor; 1.0 is the size that fits.
     Zoom(f32),
     /// Nudge the picture off centre, in points, with +y running down.
@@ -213,7 +252,10 @@ pub enum VideoCommand {
     AspectRatio(Option<f32>),
     /// Set the video rotation in degrees.
     Rotate(i32),
-    NoiseFilter { kind: usize, enabled: bool },
+    NoiseFilter {
+        kind: usize,
+        enabled: bool,
+    },
 }
 
 /// Reads one line from the pipe, whether that is the picker's end or nova's
@@ -239,7 +281,9 @@ pub(crate) fn parse_command(line: &str) -> Option<VideoCommand> {
         let mut parts = value.split_whitespace();
         let kind = parts.next()?.parse::<usize>().ok()?;
         let enabled = parts.next()? == "1";
-        if kind < 3 { return Some(VideoCommand::NoiseFilter { kind, enabled }); }
+        if kind < 3 {
+            return Some(VideoCommand::NoiseFilter { kind, enabled });
+        }
         return None;
     }
     if let Some(choice) = line.strip_prefix("deint ") {
@@ -497,11 +541,16 @@ impl eframe::App for Picker {
                 ("2.35:1", Some(2.35)),
             ];
             eframe::egui::ComboBox::from_id_salt("aspect_ratio")
-                .selected_text(choices.iter().find(|(_, ratio)| match (self.aspect_ratio, *ratio) {
-                    (None, None) => true,
-                    (Some(a), Some(b)) => (a - b).abs() < 0.001,
-                    _ => false,
-                }).map_or("Auto (source)", |(label, _)| *label))
+                .selected_text(
+                    choices
+                        .iter()
+                        .find(|(_, ratio)| match (self.aspect_ratio, *ratio) {
+                            (None, None) => true,
+                            (Some(a), Some(b)) => (a - b).abs() < 0.001,
+                            _ => false,
+                        })
+                        .map_or("Auto (source)", |(label, _)| *label),
+                )
                 .show_ui(ui, |ui| {
                     for (label, ratio) in choices {
                         let selected = match (self.aspect_ratio, ratio) {
@@ -519,9 +568,19 @@ impl eframe::App for Picker {
 
         ui.horizontal(|ui| {
             ui.label("Rotate:");
-            let rotations = [("0°", 0), ("90° clockwise", 90), ("180°", 180), ("270° clockwise", 270)];
+            let rotations = [
+                ("0°", 0),
+                ("90° clockwise", 90),
+                ("180°", 180),
+                ("270° clockwise", 270),
+            ];
             eframe::egui::ComboBox::from_id_salt("video_rotation")
-                .selected_text(rotations.iter().find(|(_, value)| *value == self.rotation).map_or("0°", |(label, _)| *label))
+                .selected_text(
+                    rotations
+                        .iter()
+                        .find(|(_, value)| *value == self.rotation)
+                        .map_or("0°", |(label, _)| *label),
+                )
                 .show_ui(ui, |ui| {
                     for (label, value) in rotations {
                         if ui.selectable_label(self.rotation == value, label).clicked() {
@@ -534,7 +593,11 @@ impl eframe::App for Picker {
 
         ui.collapsing("Filters", |ui| {
             ui.label("Noise suppression");
-            for (kind, label) in [(0usize, "HQDN3D denoise"), (1, "Deband"), (2, "NLMeans denoise (slow)")] {
+            for (kind, label) in [
+                (0usize, "HQDN3D denoise"),
+                (1, "Deband"),
+                (2, "NLMeans denoise (slow)"),
+            ] {
                 // Edit a local copy so the checkbox borrow ends before `self.send()`.
                 let mut enabled = match kind {
                     0 => self.hqdn3d,
@@ -705,7 +768,7 @@ mod tests {
         // The exact line `send_state` writes: x y zoom pan.x pan.y move.
         let mut picker = Picker {
             incoming: Arc::new(Mutex::new(vec![
-                "state 1 0 1.50 -16.00 32.00 1 3 1.7777778".to_string()
+                "state 1 0 1.50 -16.00 32.00 1 3 1.7777778".to_string(),
             ])),
             rows: Vec::new(),
             flip_x: false,
@@ -741,8 +804,14 @@ mod tests {
         assert_eq!(parse_command("deint 3"), Some(VideoCommand::Deinterlace(3)));
         assert_eq!(parse_command("rotate 90"), Some(VideoCommand::Rotate(90)));
         assert_eq!(parse_command("rotate 450"), Some(VideoCommand::Rotate(90)));
-        assert_eq!(parse_command("aspect 1.7777778"), Some(VideoCommand::AspectRatio(Some(1.7777778))));
-        assert_eq!(parse_command("aspect 0"), Some(VideoCommand::AspectRatio(None)));
+        assert_eq!(
+            parse_command("aspect 1.7777778"),
+            Some(VideoCommand::AspectRatio(Some(1.7777778)))
+        );
+        assert_eq!(
+            parse_command("aspect 0"),
+            Some(VideoCommand::AspectRatio(None))
+        );
         assert_eq!(parse_command("deint nope"), None);
         assert_eq!(parse_command("deint"), None);
     }
@@ -800,7 +869,15 @@ mod tests {
     #[test]
     fn rubbish_from_the_pipe_is_ignored() {
         for line in [
-            "", "pick", "flip", "flip x", "pan", "pan 1", "state", "aspect nope", "nonsense",
+            "",
+            "pick",
+            "flip",
+            "flip x",
+            "pan",
+            "pan 1",
+            "state",
+            "aspect nope",
+            "nonsense",
         ] {
             assert_eq!(parse_command(line), None, "{line:?} was not ignored");
         }
