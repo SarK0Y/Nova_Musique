@@ -22,8 +22,6 @@ const VENDORED_FILES: &[&str] = &[
     "nofft.h",
     "acpcm.cpp",
     "acpcm.h",
-    "nfm.cpp",
-    "nfm.h",
     "LICENSE",
 ];
 
@@ -173,25 +171,67 @@ fn sync_nofft(destination: &Path) {
     let commit = git_output(&checkout, &["rev-parse", "HEAD"]);
     let date = git_output(&checkout, &["log", "-1", "--format=%cI"]);
 
-    // Validate every required file before changing the current vendored copy.
+    // Validate the codec sources on the requested branch before changing the
+    // vendored copy. The current upstream `main` no longer ships the NFM
+    // container (nfm.cpp/nfm.h), but Nova's stable C ABI still uses it. Keep
+    // the requested codec branch as `main` and obtain only this compatibility
+    // component from `trunk` when it is absent.
     for file in VENDORED_FILES {
         if !checkout.join(file).is_file() {
             let _ = fs::remove_dir_all(&temp_root);
             panic!("upstream checkout is missing required file `{file}`; vendored sources were not updated");
         }
     }
+    // Copy the valid files from the requested branch as soon as they have
+    // been validated. This way a later compatibility-fetch failure cannot
+    // leave `no_fft/` empty after a successful fetch of upstream `main`.
     if !checkout.join("third_party/dr_wav.h").is_file() {
         let _ = fs::remove_dir_all(&temp_root);
         panic!("upstream checkout is missing `third_party/dr_wav.h`; vendored sources were not updated");
     }
-
     fs::create_dir_all(destination.join("third_party")).unwrap_or_else(|error| {
         panic!("could not create {}: {error}", destination.display())
     });
-
     for file in VENDORED_FILES {
         fs::copy(checkout.join(file), destination.join(file)).unwrap_or_else(|error| {
             panic!("could not copy upstream file `{file}` into {}: {error}", destination.display())
+        });
+    }
+    fs::copy(
+        checkout.join("third_party/dr_wav.h"),
+        destination.join("third_party/dr_wav.h"),
+    )
+    .unwrap_or_else(|error| panic!("could not copy upstream `third_party/dr_wav.h`: {error}"));
+
+    let nfm_compat = if checkout.join("nfm.cpp").is_file() && checkout.join("nfm.h").is_file() {
+        None
+    } else {
+        let compat_checkout = temp_root.join("nfm-compat");
+        let compat_output = Command::new("git")
+            .args(["clone", "--depth", "1", "--branch", "trunk", repo_url.as_str()])
+            .arg(&compat_checkout)
+            .output()
+            .unwrap_or_else(|error| {
+                let _ = fs::remove_dir_all(&temp_root);
+                panic!("could not run git clone for NFM compatibility files: {error}");
+            });
+        if !compat_output.status.success() {
+            let detail = command_error("git clone (NFM compatibility branch trunk)", &compat_output);
+            let _ = fs::remove_dir_all(&temp_root);
+            panic!("upstream main does not contain nfm.cpp/nfm.h and compatibility fetch failed: {detail}");
+        }
+        for file in ["nfm.cpp", "nfm.h"] {
+            if !compat_checkout.join(file).is_file() {
+                let _ = fs::remove_dir_all(&temp_root);
+                panic!("NFM compatibility checkout is missing `{file}`");
+            }
+        }
+        Some(compat_checkout)
+    };
+    let nfm_source = nfm_compat.as_deref().unwrap_or(&checkout);
+    for file in ["nfm.cpp", "nfm.h"] {
+        fs::copy(nfm_source.join(file), destination.join(file)).unwrap_or_else(|error| {
+            panic!("could not copy NFM compatibility file `{file}` into {}: {error}", destination.display())
         });
     }
     fs::copy(
@@ -205,17 +245,21 @@ fn sync_nofft(destination: &Path) {
          This directory is a **verbatim, unmodified** copy of the codec sources from\n\n\
              {repo_url}\n\n\
          pinned to the `{branch}` branch ({mode} mode).\n\n\
+         The NFM container is not present on the current upstream `main` branch.\n\
+         When absent, `nfm.cpp` and `nfm.h` are fetched from the compatibility\n\
+         branch `trunk`; the codec sources below remain from `{branch}`.\n\n\
          | Field | Value |\n| --- | --- |\n\
          | Repo | `{repo_url}` |\n\
          | Mode | `{mode}` |\n\
          | Branch | `{branch}` |\n\
          | Commit | `{commit}` |\n\
-         | Date | `{date}` |\n\n\
+         | Date | `{date}` |\n\
+         | NFM compatibility | `trunk` when absent from `{branch}` |\n\n\
          ## Vendored files\n\n\
          | File | Origin |\n| --- | --- |\n\
-         | `nofft.cpp`, `nofft.h` | polynomial-fit codec (`.no_fft`) |\n\
-         | `acpcm.cpp`, `acpcm.h` | DPCM/basket codecs (`.nadc`, NFA1–NFA6) |\n\
-         | `nfm.cpp`, `nfm.h` | NFM container (metadata and cover art) |\n\
+         | `nofft.cpp`, `nofft.h` | polynomial-fit codec (`.no_fft`) from `{branch}` |\n\
+         | `acpcm.cpp`, `acpcm.h` | DPCM/basket codecs (`.nadc`, NFA1–NFA6) from `{branch}` |\n\
+         | `nfm.cpp`, `nfm.h` | NFM container (metadata and cover art), compatibility branch `trunk` if absent |\n\
          | `third_party/dr_wav.h` | upstream WAV reader dependency |\n\
          | `LICENSE` | upstream licence |\n\n\
          Nothing here is edited by Nova: all glue lives in `crates/nova-codec`\n\
