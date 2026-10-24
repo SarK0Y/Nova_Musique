@@ -25,8 +25,8 @@ use std::time::Instant;
 use eframe::egui;
 use eframe::glow;
 use eframe::glow::HasContext as _;
-use nova_core::error::Result;
-use nova_core::playback::{AudioBackend, NullBackend, RodioBackend};
+use nova_core357_11::error::Result;
+use nova_core357_11::playback::{AudioBackend, NullBackend, RodioBackend};
 
 /// Largest surface we will allocate, so an enormous window cannot ask for a
 /// texture bigger than any GPU wants.
@@ -1051,7 +1051,7 @@ pub fn deinterlace_filter(choice: usize) -> Option<&'static str> {
 /// and collapse the output to mono, *Mono* averages both, *Reverse* swaps them.
 /// *Stereo* is the untouched source, so there is no filter.
 fn stereo_mode_filter(mode: &str) -> Option<&'static str> {
-    use nova_core::playback::StereoMode;
+    use nova_core357_11::playback::StereoMode;
     Some(match stereo_mode(mode) {
         StereoMode::Left => "@nova-mode:lavfi=[pan=mono|c0=c0]",
         StereoMode::Right => "@nova-mode:lavfi=[pan=mono|c0=c1]",
@@ -1066,8 +1066,8 @@ fn stereo_mode_filter(mode: &str) -> Option<&'static str> {
 /// Unknown names fall through to plain Stereo rather than fail: the same
 /// choice reaches both the mpv filter chain and the rodio path, so one mapping
 /// keeps the two in lockstep.
-pub fn stereo_mode(mode: &str) -> nova_core::playback::StereoMode {
-    use nova_core::playback::StereoMode;
+pub fn stereo_mode(mode: &str) -> nova_core357_11::playback::StereoMode {
+    use nova_core357_11::playback::StereoMode;
     match mode.trim().to_ascii_lowercase().as_str() {
         "left channel" | "left" => StereoMode::Left,
         "right channel" | "right" => StereoMode::Right,
@@ -1294,7 +1294,7 @@ impl AudioBackend for VideoBackend {
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
-        self.video = nova_core::video::is_video(path) && self.mpv.is_some();
+        self.video = nova_core357_11::video::is_video(path) && self.mpv.is_some();
         if self.video {
             self.audio.stop();
             let mpv = self.mpv.as_ref().expect("checked above");
@@ -1356,7 +1356,7 @@ impl AudioBackend for VideoBackend {
         self.audio.set_volume(volume);
     }
 
-    fn set_stereo_mode(&mut self, mode: nova_core::playback::StereoMode) {
+    fn set_stereo_mode(&mut self, mode: nova_core357_11::playback::StereoMode) {
         // The mode affects the rodio side live; mpv takes it via its own
         // `set_audio_mode` call from the app, so no reload is needed here.
         self.audio.set_stereo_mode(mode);

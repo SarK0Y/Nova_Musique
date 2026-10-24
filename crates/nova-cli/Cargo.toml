@@ -6,14 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-# The CLI can't be published: its deps point at sibling crates, not crates.io.
-publish = false
 
 [[bin]]
 name = "nova-cli"
 path = "src/main.rs"
 
 [dependencies]
-nova-core = { workspace = true, features = ["nofft"] }
+nova-core357_11 = { workspace = true, features = ["nofft"] }
 log = { workspace = true }
 env_logger = { workspace = true }

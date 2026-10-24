@@ -45,7 +45,7 @@ pub(super) fn format_label(path: &Path) -> String {
         .extension()
         .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    if nova_core::video::VIDEO_EXTENSIONS.contains(&ext.as_str()) {
+    if nova_core357_11::video::VIDEO_EXTENSIONS.contains(&ext.as_str()) {
         return format!("{} video", ext.to_ascii_uppercase());
     }
     match ext.as_str() {

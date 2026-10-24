@@ -1,4 +1,4 @@
-//! Tiny CLI that exercises `nova-core` without any GUI.
+//! Tiny CLI that exercises `nova_core357_11` without any GUI.
 //!
 //! ```text
 //! nova-cli scan   <dir>
@@ -10,7 +10,7 @@ use std::io::Write;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use nova_core::{Library, NullBackend, PlaybackEngine, PlaybackState};
+use nova_core357_11::{Library, NullBackend, PlaybackEngine, PlaybackState};
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
@@ -50,7 +50,7 @@ fn usage() {
     );
 }
 
-fn scan(dir: &str) -> Result<(Library, nova_core::ScanReport), String> {
+fn scan(dir: &str) -> Result<(Library, nova_core357_11::ScanReport), String> {
     let mut last_print = Instant::now();
     let (library, report) = Library::scan(dir, &mut |progress| {
         if last_print.elapsed() > Duration::from_millis(200) {

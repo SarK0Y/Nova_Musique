@@ -1,10 +1,10 @@
 [package]
-name = "nova-core"
+name = "nova-core357_11"
 description = "Library, metadata, queue and playback engine for Nova"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file="LICENSE"
 repository.workspace = true
 
 [dependencies]

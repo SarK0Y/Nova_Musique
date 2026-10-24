@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use nova_core::{Library, NullBackend, PlaybackEngine, PlaybackState};
+use nova_core357_11::{Library, NullBackend, PlaybackEngine, PlaybackState};
 
 /// Writes a mono 16-bit PCM WAV containing a quiet square-ish tone.
 fn write_wav(path: &Path, seconds: f32, sample_rate: u32, frequency: f32) -> std::io::Result<()> {

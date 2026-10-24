@@ -31,8 +31,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::mpv::{deinterlace_filter, Mpv, VideoBackend};
 use crate::videowin;
-use nova_core::metadata;
-use nova_core::{
+use nova_core357_11::metadata;
+use nova_core357_11::{
     track_id, AlbumKey, Library, PlaybackEngine, PlaybackState, ScanReport, Track, TrackId,
 };
 

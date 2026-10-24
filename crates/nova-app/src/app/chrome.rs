@@ -269,7 +269,7 @@ impl NovaApp {
                     }
                     if ui
                         .selectable_label(
-                            self.engine.queue().repeat() != nova_core::RepeatMode::Off,
+                            self.engine.queue().repeat() != nova_core357_11::RepeatMode::Off,
                             "🔁",
                         )
                         .on_hover_text(self.engine.queue().repeat().label())

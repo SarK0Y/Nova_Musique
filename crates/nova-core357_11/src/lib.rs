@@ -8,9 +8,9 @@
 //! an egui app (`nova-app`), a CLI, or tests.
 //!
 //! ```no_run
-//! use nova_core::{Library, PlaybackEngine};
+//! use nova_core357_11::{Library, PlaybackEngine};
 //!
-//! # fn main() -> nova_core::Result<()> {
+//! # fn main() -> nova_core357_11::Result<()> {
 //! let (library, report) = Library::scan("/home/me/Music", &mut |_| {})?;
 //! println!("indexed {} of {} files", report.indexed, report.found);
 //!
