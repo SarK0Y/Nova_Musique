@@ -1,13 +1,13 @@
 [package]
 name = "nova-codec"
-description = "FFI bindings to the vendored No_FFT codecs (.no_fft / .nadc)"
+description = "FFI bindings to the vendored No_FFT codecs (.no_fft / .nadc / .nfm)"
 version.workspace = true
+repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 # One crate owns the native artifact, so Cargo forbids a second linker of it.
 links = "nova_nofft"
-publish = false
 
 [lib]
 name = "nova_codec"

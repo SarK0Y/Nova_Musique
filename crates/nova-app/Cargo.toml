@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+# The desktop app can't be published: its deps point at sibling crates, not crates.io.
+publish = false
 
 [[bin]]
 name = "nova"

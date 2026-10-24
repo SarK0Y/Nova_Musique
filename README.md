@@ -68,8 +68,10 @@ Nova is a Cargo workspace with five crates:
 | `crates/nova-faav`  | Process-wide get/set cells (`static mut`, no locks) — the search box's text, in the style of TAM's `faav.rs`. |
 | `crates/nova-app`   | The egui/eframe desktop application (binary: `nova`). |
 
-`no_fft/` holds a pristine copy of the upstream No_FFT codec
-sources; `scripts/sync-nofft.sh` refreshes it from `main`/trunk.
+`no_fft/` holds a pristine copy of the upstream No_FFT codec sources.
+`crates/nova-codec/build.rs` creates it if it is missing, writes
+`scripts/sync-nofft.sh` and runs it, so every build refreshes it from GitHub:
+`main` for `--release` builds, `trunk` otherwise (see [Refreshing](#refreshing)).
 
 ### `nova-core`
 
@@ -95,6 +97,30 @@ Audio sits behind a small `AudioBackend` trait with two implementations:
   without waiting on real time.
 
 ### `nova-app`
+
+The app's code lives in `crates/nova-app/src/app/`, one module per concern:
+
+| Module | Responsibility |
+| --- | --- |
+| `mod`      | `NovaApp` (all the state), `new`, and the per-frame `ui()` loop. |
+| `config`   | The JSON config file, XDG paths, and the global `allow_video_movement`. |
+| `types`    | `View`, `Action` and the messages passed between threads/processes. |
+| `input`    | Keyboard shortcuts, and applying the `Action`s collected in a frame. |
+| `chrome`   | The top bar and the bottom transport bar. |
+| `browse`   | Songs / Albums / Artists / Queue views, the sidebar, the track-info panel. |
+| `library`  | Scanning, indexing, the library cache and the hidden list. |
+| `playlist` | `.m3u8` reading/writing, the Load/Save menus, the playlist window. |
+| `drops`    | Drag and drop, command-line targets, "play these files". |
+| `nfm`      | Songs → To NFM: the conversion window and its worker threads. |
+| `video`    | In-window video, the stream picker's commands, and `WindowMode` (<kbd>F</kbd>). |
+| `audio`    | The Audio window. |
+| `covers`   | Cover-art texture cache. |
+| `remote`   | Commands read from stdin. |
+| `text`     | Clock / duration / format-label helpers. |
+| `tests`    | Unit tests. |
+
+Modules share one `NovaApp`: each adds its own `impl NovaApp` block, and
+everything is `pub(super)` — visible across the `app` module and nowhere else.
 
 A single-window egui app: a top bar (folder + scan + search), a left sidebar
 (library sections and *now playing*), a content pane (the current view), and a
@@ -343,7 +369,9 @@ resolution from `ffprobe`, a poster frame grabbed on demand for the cover art)
 and are marked `V` in track lists. Playing one hands the main window over to the
 picture: the sidebar and the playlist step aside, and the video fills the space
 between the top bar and the transport bar, scaled to its own aspect ratio and
-centred. Press <kbd>Esc</kbd> to stop and get the library back. A file with more
+centred. Press <kbd>Esc</kbd> to stop and get the library back, and <kbd>F</kbd>
+to change how the window shows it — see [Video window modes](#video-window-modes).
+A file with more
 than one video stream can switch between them from the **Nova** menu's **Video**
 item, which opens the stream picker in its own process.
 
@@ -558,7 +586,26 @@ on disk and nothing stays hidden.
 | <kbd>↑</kbd> / <kbd>↓</kbd> | Move the cursor through a list |
 | <kbd>Enter</kbd> | Play the track under the cursor |
 | <kbd>Del</kbd> | Queue view: remove from queue · Songs view: hide from library |
-| <kbd>Esc</kbd> | Stop and return to the library while a video is on screen |
+| <kbd>F</kbd> | While a video is on screen: normal window → full screen → maximised window → normal window |
+| <kbd>Esc</kbd> | Leave full screen; otherwise stop and return to the library while a video is on screen |
+
+#### Video window modes
+
+<kbd>F</kbd> steps through three states while a video is showing:
+
+1. **Normal window** — the window as you sized it, with the top bar, transport
+   bar and side panels.
+2. **Full screen** — the picture fills the whole display on black. The top bar,
+   transport bar, sidebar and info panel are hidden; <kbd>Space</kbd>,
+   <kbd>Ctrl</kbd>+<kbd>←</kbd>/<kbd>→</kbd> and <kbd>F</kbd> still work.
+3. **Maximised window** — the window fills the desktop but keeps its title bar
+   and all the bars.
+
+<kbd>Esc</kbd> leaves full screen straight back to the normal window instead of
+stopping the video. If a video ends while the window is still full screen, the
+library comes back inside it and <kbd>F</kbd> or <kbd>Esc</kbd> leaves full
+screen. <kbd>F</kbd> is ignored while a text field has focus, and with
+<kbd>Ctrl</kbd> or <kbd>Alt</kbd> held.
 
 ## Codecs
 
@@ -605,9 +652,9 @@ optional image block) — including header-only v1 files with `header_len == 0`.
 
 | Path | Role |
 | --- | --- |
-| `no_fft/` | Pristine, unmodified copy of the upstream `trunk` sources. |
+| `no_fft/` | Pristine, unmodified copy of the upstream sources (`main` or `trunk`, see below). Created by `build.rs` if missing. |
 | `crates/nova-codec/` | The C ABI shim (`shim/nova_nofft_shim.cpp`), `build.rs`, and safe Rust wrappers. |
-| `scripts/sync-nofft.sh` | Re-vendors the sources from upstream `main`/trunk. |
+| `scripts/sync-nofft.sh` | Re-vendors the sources from upstream. Generated by `build.rs`; run by it on every build. |
 
 The C++ sources are compiled into a static library by `nova-codec`'s
 `build.rs` (via the [`cc`](https://crates.io/crates/cc) crate) and linked into
@@ -616,6 +663,37 @@ whatever binary uses the `nofft` feature. `crates/nova-core` exposes that as the
 
 ### Refreshing
 
+`nova-codec`'s `build.rs` keeps `no_fft/` current by itself. Each time it runs
+it:
+
+1. creates `no_fft/` if it does not exist,
+2. writes `scripts/sync-nofft.sh` (the script is embedded in `build.rs`; edit it
+   there, not in `scripts/`), and
+3. runs it, which fetches the upstream branch that matches the Cargo profile:
+
+| Build | Upstream branch |
+| --- | --- |
+| `cargo build`, `cargo run`, `cargo test` (dev profile) | `trunk` |
+| `cargo build --release` | `main` |
+
+Only files whose content changed are rewritten, so an up-to-date checkout never
+triggers a rebuild, and `no_fft/UPSTREAM.md` always records the exact
+branch/commit that is vendored. Because the profiles share one `no_fft/`
+directory, alternating between a dev and a release build re-syncs it each time.
+
+If there is no network (or no `git`/`bash`), the sync is skipped with a build
+warning and the copy already in `no_fft/` is used; the build only fails if those
+sources are missing altogether.
+
+| Variable | Effect |
+| --- | --- |
+| `NOVA_NOFFT_OFFLINE=1` | Skip the sync; build what is in `no_fft/`. |
+| `NOVA_NOFFT_BRANCH=<name>` | Use this branch whatever the profile. |
+| `NOFFT_REPO_URL=<url>` | Fetch from another repository (an alternative fork). |
+| `NOVA_NOFFT_DIR=<dir>` | Build against that checkout instead; no sync at all. |
+
+The script also works by hand:
+
 ```sh
 scripts/sync-nofft.sh                 # dev: fetch branch trunk (default)
 scripts/sync-nofft.sh --release       # release: fetch branch main
@@ -623,18 +701,24 @@ scripts/sync-nofft.sh --branch <name> # explicit branch override
 scripts/sync-nofft.sh --remote <url>  # alternative fork
 ```
 
-The script clones the requested branch, copies the codec sources into
-`no_fft/`, and records the exact branch/commit in
-`no_fft/UPSTREAM.md`. `NOVA_BRANCH` / `NOVA_REPO_URL` are accepted
-as environment overrides too.
+(`NOFFT_MODE`, `NOFFT_BRANCH` and `NOFFT_REPO_URL` are accepted as environment
+overrides too.)
 
 To build against a live checkout instead of the vendored copy, point
 `NOVA_NOFFT_DIR` at it:
 
 ```sh
-NOVA_NOFFT_DIR=/path/to/No_FFT_v0 cargo build -p nova-app
+NOVA_SYNC_NOFFT=1 cargo build --release --features nofft --features audio #default branch == main
+NOFFT_MODE=dev NOVA_SYNC_NOFFT=1 cargo build --release --features nofft --features audio #to fetch trunk branch
+cargo build --release --features nofft --features audio #using already-vendored No_FFT
 ```
-
+You can also override the upstream repository or branch using NOFFT_REPO_URL and NOFFT_BRANCH. <br>
+//! Options:<br>
+//!   NOVA_NOFFT_DIR    build against a different checkout instead of `no_fft`<br>
+//!   NOVA_SYNC_NOFFT   set to `1`/`true` to refresh upstream sources manually<br>
+//!   NOFFT_MODE        `release` (default, branch `main`) or `dev` (branch `trunk`)<br>
+//!   NOFFT_BRANCH      explicit upstream branch override<br>
+//!   NOFFT_REPO_URL    upstream repository URL override<br>
 ### Feature gates
 
 ```sh

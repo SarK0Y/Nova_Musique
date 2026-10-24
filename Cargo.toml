@@ -15,13 +15,13 @@ edition = "2021"
 rust-version = "1.92"
 license = "free"
 authors = ["SarK0Y"]
-description = "Be capable to use innovative media codecs, Dear User 😉"
+description = "Be capable t use innovative media codecs, Dear User 😉"
 repository = "https://github.com/SarK0Y/Nova_Musique.git"
 
 [workspace.dependencies]
-nova-core = { path = "crates/nova-core" }
-nova-codec = { path = "crates/nova-codec" }
-nova-faav = { path = "crates/nova-faav" }
+nova-core = { path = "crates/nova-core", version = "0.2.0" }
+nova-codec = { path = "crates/nova-codec", version = "0.2.0" }
+nova-faav = { path = "crates/nova-faav", version = "0.2.0" }
 
 # Shared
 serde = { version = "1.0", features = ["derive"] }
