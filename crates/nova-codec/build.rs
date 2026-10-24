@@ -129,11 +129,12 @@ fn main() {
 fn sync_nofft(destination: &Path) {
     let repo_url = env::var("NOFFT_REPO_URL").unwrap_or_else(|_| DEFAULT_REPO_URL.to_owned());
     let mode = env::var("NOFFT_MODE").unwrap_or_else(|_| "release".to_owned());
+    let main_branch: String = "for_nova_musique_0.2.0".to_owned();
     let branch = match env::var("NOFFT_BRANCH") {
         Ok(branch) if !branch.trim().is_empty() => branch,
         _ => match mode.as_str() {
             "dev" => "trunk".to_owned(),
-            "release" => "main".to_owned(),
+            "release" => main_branch,
             other => panic!("unknown NOFFT_MODE `{other}` (use `dev` or `release`)"),
         },
     };
