@@ -1,0 +1,11 @@
+[package]
+name = "install-nova-musique"
+version = "0.1.0"
+edition = "2021"
+license-file = "LICENSE"
+description = "Builds and installs Nova Musique from https://github.com/SarK0Y/Nova_Musique (branch main), then erases the downloaded sources"
+readme = "README.md"
+# never ship a leftover ./nova clone if a previous build was interrupted
+exclude = ["nova"]
+
+[dependencies]
