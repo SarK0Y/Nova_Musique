@@ -18,12 +18,12 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1180.0, 780.0])
             .with_min_inner_size([880.0, 560.0])
             .with_drag_and_drop(true)
-            .with_title("Nova Musique v0.2.0"),
+            .with_title("Nova Musique"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Nova Musique v0.2.0",
+        "Nova Musique",
         options,
         Box::new(|cc| Ok(Box::new(app::NovaApp::new(cc)))),
     )
