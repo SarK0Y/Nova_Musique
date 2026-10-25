@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "install-nova-musique"
-version = "0.1.0"
+name = "Nova-Musique"
+version = "0.5.0"
