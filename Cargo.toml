@@ -1,9 +1,9 @@
 [package]
 name = "Nova-Musique"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license-file = "LICENSE"
-description = "Media player for innovative codecs, Dear User :)"
+description = "(cargo install Nova-Musique --features install) Media player for innovative codecs, Dear User :)"
 readme = "README.md"
 # never ship a leftover ./nova clone if a previous build was interrupted
 exclude = ["nova"]

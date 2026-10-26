@@ -8,12 +8,6 @@ use std::path::Path;
 mod install;
 
 fn main() {
-if env::var_os("CARGO_FEATURE_INSTALL").is_none() {
-    println!(
-        "cargo:warning=Dear User, use feature install to get fresh version of Nova Musique. :)"
-    );
-    return;
-	}
     // shortcut: the install reruns only when the install logic changes; touch build.rs (or cargo
     // clean) to reinstall, otherwise a plain rebuild does nothing
     println!("cargo:rerun-if-changed=build.rs");
@@ -22,6 +16,9 @@ if env::var_os("CARGO_FEATURE_INSTALL").is_none() {
 
     // the whole install only runs on demand: cargo build --features install
     if env::var_os("CARGO_FEATURE_INSTALL").is_none() {
+        println!(
+            "cargo:warning=Dear User, use feature install to get fresh version of Nova Musique. :)"
+        );
         return;
     }
 
