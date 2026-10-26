@@ -1,5 +1,5 @@
 //! Nova — a local music library player with an Apollo-flavoured UI.
-
+#[allow(unused)]
 mod app;
 mod mpv;
 mod videowin;

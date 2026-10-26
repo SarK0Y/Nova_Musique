@@ -7,25 +7,42 @@ impl NovaApp {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (toggle, next, prev, info, del, escape, window) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::Space),
-                i.modifiers.command && i.key_pressed(egui::Key::ArrowRight),
-                i.modifiers.command && i.key_pressed(egui::Key::ArrowLeft),
-                i.key_pressed(egui::Key::I),
-                i.key_pressed(egui::Key::Delete),
-                i.key_pressed(egui::Key::Escape),
-                i.key_pressed(egui::Key::F) && !i.modifiers.command && !i.modifiers.alt,
-            )
-        });
+        let (toggle, next, prev, info, del, escape, window, pgup, pgdn, c, shift, command, alt) =
+            ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::Space),
+                    i.modifiers.command && i.key_pressed(egui::Key::ArrowRight),
+                    i.modifiers.command && i.key_pressed(egui::Key::ArrowLeft),
+                    i.key_pressed(egui::Key::I),
+                    i.key_pressed(egui::Key::Delete),
+                    i.key_pressed(egui::Key::Escape),
+                    i.key_pressed(egui::Key::F) && !i.modifiers.command && !i.modifiers.alt,
+                    i.key_pressed(egui::Key::PageUp),
+                    i.key_pressed(egui::Key::PageDown),
+                    i.key_pressed(egui::Key::C),
+                    i.modifiers.shift,
+                    i.modifiers.command,
+                    i.modifiers.alt,
+                )
+            });
         if toggle {
             self.engine.toggle();
         }
-        if next {
+        if next || pgdn {
             self.engine.next(&self.library);
         }
-        if prev {
+        if prev || pgup {
             self.engine.previous(&self.library);
+        }
+        // Shift-C puts the window away with playback carrying on; C pauses
+        // first, so the music stops right there too.
+        //let (shift, c) = Self::c_key(c, shift, command, alt);
+        if c && !shift && !command && !alt {
+            self.engine.pause();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        if c && shift {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
         if info {
             self.info_open = !self.info_open;
@@ -54,6 +71,19 @@ impl NovaApp {
                 self.set_window_mode(ctx, WindowMode::Normal);
             }
         }
+    }
+
+    /// <kbd>C</kbd> and <kbd>Shift</kbd>+<kbd>C</kbd> as one decision:
+    /// `(pause, minimize)`.
+    ///
+    /// SHIFT+C pauses first and puts the window away; C puts the window
+    /// away with playback carrying on. C with Ctrl or Alt belongs to someone
+    /// else (copy, whatever the desktop bound it to), so it does nothing here.
+    pub(super) fn c_key(c: bool, shift: bool, command: bool, alt: bool) -> (bool, bool) {
+        if !c || command || alt {
+            return (false, false);
+        }
+        (!shift, true)
     }
 
     /// <kbd>Del</kbd>. In Songs the highlighted track is hidden from the

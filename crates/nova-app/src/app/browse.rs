@@ -5,7 +5,11 @@ use super::*;
 /// Renders the cover, the primary text fields and the technical details of
 /// `track` inside the info panel. Split out from [`NovaApp::track_info_panel`]
 /// so it can be exercised without a full application.
-pub(super) fn track_info_body(ui: &mut egui::Ui, track: &Track, cover: Option<&egui::TextureHandle>) {
+pub(super) fn track_info_body(
+    ui: &mut egui::Ui,
+    track: &Track,
+    cover: Option<&egui::TextureHandle>,
+) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         // Embedded cover art (NFM containers and tagged audio alike).
         let cover_size = ui.available_width().min(320.0);
@@ -187,7 +191,12 @@ impl NovaApp {
 
     /// Renders a clickable list of tracks. Clicking one replaces the queue with
     /// this very list, starting at the clicked track.
-    pub(super) fn track_list(&self, ui: &mut egui::Ui, tracks: &[&Track], actions: &mut Vec<Action>) {
+    pub(super) fn track_list(
+        &self,
+        ui: &mut egui::Ui,
+        tracks: &[&Track],
+        actions: &mut Vec<Action>,
+    ) {
         if tracks.is_empty() {
             ui.label(RichText::new("No tracks.").weak());
             return;
@@ -311,7 +320,12 @@ impl NovaApp {
         });
     }
 
-    pub(super) fn album_detail(&self, ui: &mut egui::Ui, key: &AlbumKey, actions: &mut Vec<Action>) {
+    pub(super) fn album_detail(
+        &self,
+        ui: &mut egui::Ui,
+        key: &AlbumKey,
+        actions: &mut Vec<Action>,
+    ) {
         let tracks = self.library.album_tracks(key);
 
         ui.horizontal(|ui| {

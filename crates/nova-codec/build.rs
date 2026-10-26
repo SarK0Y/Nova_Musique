@@ -17,24 +17,20 @@ use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_REPO_URL: &str = "https://github.com/SarK0Y/No_FFT_v0.git";
-const VENDORED_FILES: &[&str] = &[
-    "nofft.cpp",
-    "nofft.h",
-    "acpcm.cpp",
-    "acpcm.h",
-    "LICENSE",
-];
+const VENDORED_FILES: &[&str] = &["nofft.cpp", "nofft.h", "acpcm.cpp", "acpcm.h", "LICENSE"];
 
 fn main() {
-    let manifest = PathBuf::from(
-        env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"),
-    );
+    let manifest =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
     let vendored = manifest.join("../../no_fft");
 
     // Ensure the expected workspace-level directory exists before checking its
     // first-sync marker or trying to copy upstream files into it.
     fs::create_dir_all(&vendored).unwrap_or_else(|error| {
-        panic!("could not create No_FFT directory {}: {error}", vendored.display())
+        panic!(
+            "could not create No_FFT directory {}: {error}",
+            vendored.display()
+        )
     });
 
     println!("cargo:rerun-if-env-changed=NOVA_NOFFT_DIR");
@@ -55,7 +51,12 @@ fn main() {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
     let manual_sync_requested = env::var("NOVA_SYNC_NOFFT")
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
         .unwrap_or(false);
     // This build script always needs the No_FFT C++ sources to compile the
     // codec. Do not gate first-run synchronization on CARGO_FEATURE_NOFFT:
@@ -63,11 +64,18 @@ fn main() {
     // and the codec can be built through workspace/default-feature paths too.
     // Sync automatically on the first build, and also recover if the marker
     // exists but the required source files have since disappeared.
-    let required_sources_missing = ["nofft.cpp", "acpcm.cpp", "nofft.h", "acpcm.h", "nfm.cpp", "nfm.h"]
-        .iter()
-        .any(|file| !vendored.join(file).is_file());
-    let first_build_sync_requested = external_dir.is_none()
-        && (!first_sync_marker.is_file() || required_sources_missing);
+    let required_sources_missing = [
+        "nofft.cpp",
+        "acpcm.cpp",
+        "nofft.h",
+        "acpcm.h",
+        "nfm.cpp",
+        "nfm.h",
+    ]
+    .iter()
+    .any(|file| !vendored.join(file).is_file());
+    let first_build_sync_requested =
+        external_dir.is_none() && (!first_sync_marker.is_file() || required_sources_missing);
     let sync_requested = manual_sync_requested || first_build_sync_requested;
 
     if sync_requested && external_dir.is_some() {
@@ -83,12 +91,22 @@ fn main() {
         // Write the marker only after a complete successful sync. If fetching
         // or copying fails, the next build will try again.
         fs::write(&first_sync_marker, "Initial No_FFT sync completed\n").unwrap_or_else(|error| {
-            panic!("could not write first-sync marker {}: {error}", first_sync_marker.display())
+            panic!(
+                "could not write first-sync marker {}: {error}",
+                first_sync_marker.display()
+            )
         });
     }
 
     let codec_dir = external_dir.unwrap_or_else(|| vendored.clone());
-    for file in ["nofft.cpp", "acpcm.cpp", "nofft.h", "acpcm.h", "nfm.cpp", "nfm.h"] {
+    for file in [
+        "nofft.cpp",
+        "acpcm.cpp",
+        "nofft.h",
+        "acpcm.h",
+        "nfm.cpp",
+        "nfm.h",
+    ] {
         let path = codec_dir.join(file);
         if !path.is_file() {
             panic!(
@@ -149,11 +167,21 @@ fn sync_nofft(destination: &Path) {
     let checkout = temp_root.join("nofft");
 
     fs::create_dir_all(&temp_root).unwrap_or_else(|error| {
-        panic!("could not create temporary directory {}: {error}", temp_root.display())
+        panic!(
+            "could not create temporary directory {}: {error}",
+            temp_root.display()
+        )
     });
 
     let clone_output = match Command::new("git")
-        .args(["clone", "--depth", "1", "--branch", branch.as_str(), repo_url.as_str()])
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            branch.as_str(),
+            repo_url.as_str(),
+        ])
         .arg(&checkout)
         .output()
     {
@@ -190,12 +218,14 @@ fn sync_nofft(destination: &Path) {
         let _ = fs::remove_dir_all(&temp_root);
         panic!("upstream checkout is missing `third_party/dr_wav.h`; vendored sources were not updated");
     }
-    fs::create_dir_all(destination.join("third_party")).unwrap_or_else(|error| {
-        panic!("could not create {}: {error}", destination.display())
-    });
+    fs::create_dir_all(destination.join("third_party"))
+        .unwrap_or_else(|error| panic!("could not create {}: {error}", destination.display()));
     for file in VENDORED_FILES {
         fs::copy(checkout.join(file), destination.join(file)).unwrap_or_else(|error| {
-            panic!("could not copy upstream file `{file}` into {}: {error}", destination.display())
+            panic!(
+                "could not copy upstream file `{file}` into {}: {error}",
+                destination.display()
+            )
         });
     }
     fs::copy(
@@ -209,7 +239,14 @@ fn sync_nofft(destination: &Path) {
     } else {
         let compat_checkout = temp_root.join("nfm-compat");
         let compat_output = Command::new("git")
-            .args(["clone", "--depth", "1", "--branch", "trunk", repo_url.as_str()])
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                "trunk",
+                repo_url.as_str(),
+            ])
             .arg(&compat_checkout)
             .output()
             .unwrap_or_else(|error| {
@@ -217,7 +254,8 @@ fn sync_nofft(destination: &Path) {
                 panic!("could not run git clone for NFM compatibility files: {error}");
             });
         if !compat_output.status.success() {
-            let detail = command_error("git clone (NFM compatibility branch trunk)", &compat_output);
+            let detail =
+                command_error("git clone (NFM compatibility branch trunk)", &compat_output);
             let _ = fs::remove_dir_all(&temp_root);
             panic!("upstream main does not contain nfm.cpp/nfm.h and compatibility fetch failed: {detail}");
         }
@@ -232,7 +270,10 @@ fn sync_nofft(destination: &Path) {
     let nfm_source = nfm_compat.as_deref().unwrap_or(&checkout);
     for file in ["nfm.cpp", "nfm.h"] {
         fs::copy(nfm_source.join(file), destination.join(file)).unwrap_or_else(|error| {
-            panic!("could not copy NFM compatibility file `{file}` into {}: {error}", destination.display())
+            panic!(
+                "could not copy NFM compatibility file `{file}` into {}: {error}",
+                destination.display()
+            )
         });
     }
     fs::copy(
@@ -272,7 +313,10 @@ fn sync_nofft(destination: &Path) {
              NOFFT_BRANCH=my-branch NOVA_SYNC_NOFFT=1 cargo build # explicit branch\n"
     );
     fs::write(destination.join("UPSTREAM.md"), upstream).unwrap_or_else(|error| {
-        panic!("could not write {}/UPSTREAM.md: {error}", destination.display())
+        panic!(
+            "could not write {}/UPSTREAM.md: {error}",
+            destination.display()
+        )
     });
 
     let _ = fs::remove_dir_all(&temp_root);

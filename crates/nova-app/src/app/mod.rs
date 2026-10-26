@@ -54,11 +54,11 @@ mod library;
 mod nfm;
 mod playlist;
 mod remote;
+#[cfg(test)]
+mod tests;
 mod text;
 mod types;
 mod video;
-#[cfg(test)]
-mod tests;
 
 use self::browse::*;
 use self::config::*;
@@ -433,8 +433,7 @@ impl eframe::App for NovaApp {
         if showing_video {
             let panel = if bare {
                 // Edge to edge on black: no margin, no letterbox colour but black.
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(Color32::BLACK))
+                egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::BLACK))
             } else {
                 egui::CentralPanel::default()
             };

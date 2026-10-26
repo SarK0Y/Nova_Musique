@@ -32,6 +32,19 @@ fn default_thread_count_is_one_or_more() {
 }
 
 #[test]
+fn c_key_pauses_on_shift_and_leaves_alone_ctrl() {
+    // Plain C: minimise, keep playing.
+    assert_eq!(NovaApp::c_key(true, false, false, false), (false, true));
+    // Shift+C: pause and minimise.
+    assert_eq!(NovaApp::c_key(true, true, false, false), (true, true));
+    // Ctrl+C / Alt+C belong to the desktop, so nothing happens.
+    assert_eq!(NovaApp::c_key(true, false, true, false), (false, false));
+    assert_eq!(NovaApp::c_key(true, false, false, true), (false, false));
+    // No C at all: nothing.
+    assert_eq!(NovaApp::c_key(false, true, false, false), (false, false));
+}
+
+#[test]
 fn a_remote_line_becomes_a_command() {
     use videowin::VideoCommand;
     // The picker's own wire language travels unchanged.

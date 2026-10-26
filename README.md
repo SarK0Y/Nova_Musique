@@ -582,10 +582,14 @@ on disk and nothing stays hidden.
 | <kbd>Space</kbd> | Play / pause |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> | Previous track |
 | <kbd>Ctrl</kbd>+<kbd>→</kbd> | Next track |
+| <kbd>PgUp</kbd> | Previous track |
+| <kbd>PgDn</kbd> | Next track |
 | <kbd>I</kbd> | Toggle the track info panel |
 | <kbd>↑</kbd> / <kbd>↓</kbd> | Move the cursor through a list |
 | <kbd>Enter</kbd> | Play the track under the cursor |
 | <kbd>Del</kbd> | Queue view: remove from queue · Songs view: hide from library |
+| <kbd>Shift</kbd>+<kbd>C</kbd> | Minimise the window; playback carries on |
+|<kbd>C</kbd> | Pause and minimise the window |
 | <kbd>F</kbd> | While a video is on screen: normal window → full screen → maximised window → normal window |
 | <kbd>Esc</kbd> | Leave full screen; otherwise stop and return to the library while a video is on screen |
 
