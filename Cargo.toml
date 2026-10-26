@@ -9,20 +9,20 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 # Driven by the GUI stack: eframe/egui 0.35 require rustc 1.92.
 rust-version = "1.92"
 authors = ["Evgeney Knyazhev (SarK0Y) <sark0y@protonmail.com>"]
 license = "free"
 readme = "README.md"
-description = "Be capable t use innovative media codecs, Dear User 😉"
+description = "Be capable to use innovative media codecs, Dear User 😉"
 repository = "https://github.com/SarK0Y/Nova_Musique.git"
 
 [workspace.dependencies]
-nova-core357_11 = { path = "crates/nova-core357_11", version = "0.4.0" }
-nova-codec = { path = "crates/nova-codec", version = "0.3.0" }
-nova-faav = { path = "crates/nova-faav", version = "0.4.0" }
+nova-core357_11 = { path = "crates/nova-core357_11" }
+nova-codec = { path = "crates/nova-codec" }
+nova-faav = { path = "crates/nova-faav" }
 
 # Shared
 serde = { version = "1.0", features = ["derive"] }
