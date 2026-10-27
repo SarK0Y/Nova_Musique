@@ -62,7 +62,7 @@ Nova is a Cargo workspace with five crates:
 
 | Crate | What it is |
 | --- | --- |
-| `crates/nova-core`  | The library and playback engine. UI-agnostic, fully unit-tested. |
+| `crates/nova_core357_11`  | The library and playback engine. UI-agnostic, fully unit-tested. |
 | `crates/nova-codec` | `unsafe` FFI bindings to the vendored No_FFT C++ codecs. |
 | `crates/nova-cli`   | A tiny headless CLI used to verify scanning and playback. |
 | `crates/nova-faav`  | Process-wide get/set cells (`static mut`, no locks) — the search box's text, in the style of TAM's `faav.rs`. |
@@ -73,7 +73,7 @@ Nova is a Cargo workspace with five crates:
 `scripts/sync-nofft.sh` and runs it, so every build refreshes it from GitHub:
 `main` for `--release` builds, `trunk` otherwise (see [Refreshing](#refreshing)).
 
-### `nova-core`
+### `nova_core357_11`
 
 | Module | Responsibility |
 | --- | --- |
@@ -135,7 +135,7 @@ playback.
   rustc 1.92 (0.36 already requires 1.95).
 - **A C++ compiler** (g++/clang++), for the vendored No_FFT codecs. The codec
   support is the `nofft` feature, which the app and CLI enable by default;
-  `nova-core` alone still builds without a C++ toolchain.
+  `nova_core357_11` alone still builds without a C++ toolchain.
 - **libmpv** (`libmpv.so` plus its headers) — required to *build* the GUI, since
   the bindings are linked in. `pkg-config --exists mpv` is the check. Without it
   the app still builds audio-only if you drop `crates/nova-app/src/mpv.rs`.
@@ -582,10 +582,16 @@ on disk and nothing stays hidden.
 | <kbd>Space</kbd> | Play / pause |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> | Previous track |
 | <kbd>Ctrl</kbd>+<kbd>→</kbd> | Next track |
+| <kbd>←</kbd> / <kbd>→</kbd> | Seek 5 s back / forward |
+| <kbd>PgUp</kbd> | Previous track |
+| <kbd>PgDn</kbd> | Next track |
+| <kbd>9</kbd> / <kbd>0</kbd> | Volume down / up by 1 % |
 | <kbd>I</kbd> | Toggle the track info panel |
 | <kbd>↑</kbd> / <kbd>↓</kbd> | Move the cursor through a list |
 | <kbd>Enter</kbd> | Play the track under the cursor |
 | <kbd>Del</kbd> | Queue view: remove from queue · Songs view: hide from library |
+| <kbd>Shift</kbd>+<kbd>C</kbd> | Minimise the window; playback carries on |
+|<kbd>C</kbd> | Pause and minimise the window |
 | <kbd>F</kbd> | While a video is on screen: normal window → full screen → maximised window → normal window |
 | <kbd>Esc</kbd> | Leave full screen; otherwise stop and return to the library while a video is on screen |
 
@@ -658,7 +664,7 @@ optional image block) — including header-only v1 files with `header_len == 0`.
 
 The C++ sources are compiled into a static library by `nova-codec`'s
 `build.rs` (via the [`cc`](https://crates.io/crates/cc) crate) and linked into
-whatever binary uses the `nofft` feature. `crates/nova-core` exposes that as the
+whatever binary uses the `nofft` feature. `crates/nova_core357_11` exposes that as the
 `nofft` feature; `nova-app` and `nova-cli` turn it on by default.
 
 ### Refreshing
@@ -722,8 +728,8 @@ You can also override the upstream repository or branch using NOFFT_REPO_URL and
 ### Feature gates
 
 ```sh
-cargo build -p nova-core                          # no codecs (no C++ needed)
-cargo build -p nova-core --features nofft         # codecs, no audio backend
+cargo build -p nova_core357_11                          # no codecs (no C++ needed)
+cargo build -p nova_core357_11 --features nofft         # codecs, no audio backend
 cargo build -p nova-app                           # codecs + audio (default)
 ```
 
@@ -756,13 +762,13 @@ watch -n1 cat /dev/shm/nova/playlist.out
 
 The test suite needs no audio hardware and no external tools:
 
-- Unit tests in `nova-core` cover the model, tag parsing, grouping/sorting,
+- Unit tests in `nova_core357_11` cover the model, tag parsing, grouping/sorting,
   search, queue semantics (shuffle/repeat/insert) and engine advance/pause/seek.
 - `crates/nova-codec` tests round-trip a generated signal through the polynomial
   codec and all six NFA variants, and round-trip NFM containers (with and
   without metadata/cover), so no binary fixtures are needed. The streaming
   decoder is checked against the buffered one: same samples, same order.
-- `crates/nova-core/tests/library_integration.rs` synthesises WAV files into a
+- `crates/nova_core357_11/tests/library_integration.rs` synthesises WAV files into a
   temporary directory and exercises the real scan → cache → play loop.
 
 ```sh
@@ -782,6 +788,6 @@ Deliberately out of scope for this first pass — the natural next steps:
 - Richer now-playing (waveform/visualiser, lyrics).
 - Drag-and-drop reordering of the queue.
 
-## Project has been assisted by awesome OpenCode (Big Pickle, LongCat, Space Bunny) / ChatGPT 🙂
+## Project has been assisted by awesome OpenCode (Big Pickle, LongCat, Space Bunny) / ChatGPT / Claude 🙂
 
 ## my the Best Wishes to You, Dear User 🙃

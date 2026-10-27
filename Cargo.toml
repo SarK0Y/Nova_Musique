@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/nova-core",
+    "crates/nova-core357_11",
     "crates/nova-codec",
     "crates/nova-faav",
     "crates/nova-cli",
@@ -9,17 +9,18 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.7.0"
 edition = "2021"
 # Driven by the GUI stack: eframe/egui 0.35 require rustc 1.92.
 rust-version = "1.92"
+authors = ["Evgeney Knyazhev (SarK0Y) <sark0y@protonmail.com>"]
 license = "free"
-authors = ["SarK0Y"]
-description = "Be capable t use innovative media codecs, Dear User 😉"
+readme = "README.md"
+description = "Be capable to use innovative media codecs, Dear User 😉"
 repository = "https://github.com/SarK0Y/Nova_Musique.git"
 
 [workspace.dependencies]
-nova-core = { path = "crates/nova-core" }
+nova-core357_11 = { path = "crates/nova-core357_11" }
 nova-codec = { path = "crates/nova-codec" }
 nova-faav = { path = "crates/nova-faav" }
 

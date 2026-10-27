@@ -211,7 +211,7 @@ impl NovaApp {
         });
     }
 
-    pub(super) fn player_bar(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    pub(super) fn player_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let track = self.engine.current_track(&self.library);
         let position = self.engine.position();
         let total = self.engine.duration(&self.library);
@@ -269,7 +269,7 @@ impl NovaApp {
                     }
                     if ui
                         .selectable_label(
-                            self.engine.queue().repeat() != nova_core::RepeatMode::Off,
+                            self.engine.queue().repeat() != nova_core357_11::RepeatMode::Off,
                             "🔁",
                         )
                         .on_hover_text(self.engine.queue().repeat().label())
@@ -280,16 +280,37 @@ impl NovaApp {
                 });
 
                 let seconds_total = total.map(|d| d.as_secs_f32()).unwrap_or(0.0).max(0.001);
-                let mut seconds_position = position.as_secs_f32().min(seconds_total);
+                let playback = position.as_secs_f32().min(seconds_total);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format_clock(position)).size(12.0).weak());
+                    // SMPlayer's TimeSlider: grabbing the handle freezes the
+                    // clock (the file keeps playing so the stream stays in
+                    // sync), and the seek goes out once on release only if
+                    // the drag moved it.
+                    let before = self
+                        .seek_drag
+                        .map(|(_, current)| current)
+                        .unwrap_or(playback);
+                    ui.label(
+                        RichText::new(format_clock(Duration::from_secs_f32(before)))
+                            .size(12.0)
+                            .weak(),
+                    );
+                    let mut seconds_position = before;
                     let slider = egui::Slider::new(&mut seconds_position, 0.0..=seconds_total)
                         .show_value(false);
-                    if ui
-                        .add_sized([ui.available_width() - 52.0, 18.0], slider)
-                        .changed()
-                    {
-                        actions.push(Action::Seek(seconds_position));
+                    let response = ui.add_sized([ui.available_width() - 52.0, 18.0], slider);
+                    let grabbed = response.drag_started() || response.dragged();
+                    let (drag, seek_to) = seek_drag(
+                        self.seek_drag,
+                        before,
+                        seconds_position,
+                        grabbed,
+                        response.changed(),
+                        response.drag_stopped(),
+                    );
+                    self.seek_drag = drag;
+                    if let Some(seconds) = seek_to {
+                        actions.push(Action::Seek(seconds));
                     }
                     ui.label(
                         RichText::new(format_clock(total.unwrap_or_default()))

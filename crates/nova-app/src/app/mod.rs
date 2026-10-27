@@ -31,8 +31,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::mpv::{deinterlace_filter, Mpv, VideoBackend};
 use crate::videowin;
-use nova_core::metadata;
-use nova_core::{
+use nova_core357_11::metadata;
+use nova_core357_11::{
     track_id, AlbumKey, Library, PlaybackEngine, PlaybackState, ScanReport, Track, TrackId,
 };
 
@@ -54,16 +54,17 @@ mod library;
 mod nfm;
 mod playlist;
 mod remote;
+#[cfg(test)]
+mod tests;
 mod text;
 mod types;
 mod video;
-#[cfg(test)]
-mod tests;
 
 use self::browse::*;
 use self::config::*;
 use self::covers::*;
 use self::drops::*;
+use self::input::*;
 use self::library::*;
 use self::nfm::*;
 use self::playlist::*;
@@ -94,6 +95,23 @@ pub struct NovaApp {
     scan_status: Option<String>,
     config: Config,
     toast: Option<(String, Instant)>,
+    /// `Some((start, target))` while a ←/→ hotkey run is in progress: the
+    /// first press freezes the counter and each later press only moves the
+    /// target, and the stream is set to it once when the key lifts — the
+    /// press/release model of SMPlayer's `TimeSlider`.
+    hotkey_seek: Option<(f32, f32)>,
+    /// `Some((start, current))` while the seek handle is held: the progress
+    /// bar stops following playback until the drag ends (SMPlayer's
+    /// `TimeSlider` `dont_update`). The file keeps playing so the stream
+    /// stays in sync; the seek itself goes out on release.
+    seek_drag: Option<(f32, f32)>,
+    /// When the pending 9/0 hotkey volume step may be applied (SMPlayer's
+    /// 200 ms drag timer), so a rapid run of presses settles instead of
+    /// firing one step per key.
+    volume_step: Option<Instant>,
+    /// When the in-memory volume reaches config.json; `None` when nothing
+    /// is pending. A drag writes once it settles, not on every frame.
+    volume_save: Option<Instant>,
     /// Whether the track-info panel is shown.
     info_open: bool,
     /// Last track the user explicitly played; the info panel falls back to it
@@ -267,6 +285,10 @@ impl NovaApp {
             scan_status: None,
             config,
             toast: None,
+            hotkey_seek: None,
+            seek_drag: None,
+            volume_step: None,
+            volume_save: None,
             info_open: false,
             selected: None,
             hidden,
@@ -386,10 +408,19 @@ impl eframe::App for NovaApp {
 
         self.poll_scan(&ctx);
         self.tick_engine();
-        self.handle_input(&ctx);
-        self.handle_drops(&ctx);
+
+        // SMPlayer writes its whole prefs file once at exit; Nova keeps the
+        // same spirit by writing the volume a beat after the last change
+        // instead of on every drag frame.
+        if self.volume_save.is_some_and(|when| Instant::now() >= when) {
+            self.config.save();
+            self.volume_save = None;
+        }
 
         let mut actions = Vec::new();
+        self.handle_input(&ctx, &mut actions);
+        self.handle_drops(&ctx);
+
         self.remote_commands(&mut actions);
 
         // While a video plays, the sidebar gives up its width to the picture;
@@ -433,8 +464,7 @@ impl eframe::App for NovaApp {
         if showing_video {
             let panel = if bare {
                 // Edge to edge on black: no margin, no letterbox colour but black.
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(Color32::BLACK))
+                egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::BLACK))
             } else {
                 egui::CentralPanel::default()
             };

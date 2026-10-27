@@ -1,0 +1,26 @@
+[package]
+name = "nova-core357_11"
+description = "Library, metadata, queue and playback engine for Nova"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file="LICENSE"
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+walkdir = { workspace = true }
+lofty = { workspace = true }
+rodio = { workspace = true, optional = true }
+nova-codec = { workspace = true, optional = true }
+
+[features]
+default = ["audio"]
+# Real audio output through cpal/rodio (ALSA on Linux, WASAPI on Windows, CoreAudio on macOS).
+audio = ["dep:rodio"]
+# Decode the vendored No_FFT codecs (.no_fft / .nadc) via the C++ sources in
+# no_fft; see crates/nova-codec and scripts/sync-nofft.sh.
+nofft = ["dep:nova-codec"]

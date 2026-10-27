@@ -3,29 +3,102 @@
 use super::*;
 
 impl NovaApp {
-    pub(super) fn handle_input(&mut self, ctx: &egui::Context) {
+    pub(super) fn handle_input(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (toggle, next, prev, info, del, escape, window) = ctx.input(|i| {
+        let (toggle, next, prev, info, del, escape, window, pgup, pgdn, c, shift, command, alt) =
+            ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::Space),
+                    i.modifiers.command && i.key_pressed(egui::Key::ArrowRight),
+                    i.modifiers.command && i.key_pressed(egui::Key::ArrowLeft),
+                    i.key_pressed(egui::Key::I),
+                    i.key_pressed(egui::Key::Delete),
+                    i.key_pressed(egui::Key::Escape),
+                    i.key_pressed(egui::Key::F) && !i.modifiers.command && !i.modifiers.alt,
+                    i.key_pressed(egui::Key::PageUp),
+                    i.key_pressed(egui::Key::PageDown),
+                    i.key_pressed(egui::Key::C),
+                    i.modifiers.shift,
+                    i.modifiers.command,
+                    i.modifiers.alt,
+                )
+            });
+        // Plain arrows scrub the progress bar by 5 s; Ctrl+arrows stay
+        // bound to prev/next above. 9/0 nudge the volume by 1 %.
+        let (seek_back, seek_fwd, vol_down, vol_up) = ctx.input(|i| {
+            let plain = !i.modifiers.command && !i.modifiers.alt;
             (
-                i.key_pressed(egui::Key::Space),
-                i.modifiers.command && i.key_pressed(egui::Key::ArrowRight),
-                i.modifiers.command && i.key_pressed(egui::Key::ArrowLeft),
-                i.key_pressed(egui::Key::I),
-                i.key_pressed(egui::Key::Delete),
-                i.key_pressed(egui::Key::Escape),
-                i.key_pressed(egui::Key::F) && !i.modifiers.command && !i.modifiers.alt,
+                plain && i.key_pressed(egui::Key::ArrowLeft),
+                plain && i.key_pressed(egui::Key::ArrowRight),
+                plain && i.key_pressed(egui::Key::Num9),
+                plain && i.key_pressed(egui::Key::Num0),
             )
         });
+        // SMPlayer's TimeSlider press model, for the ←/→ hotkeys: the first
+        // press freezes the counter at the current position, every press in
+        // the run only moves the target (never the stream), and the stream
+        // is set to it once when the key lifts. A run that ends where it
+        // started seeks nowhere, so holding the key does not thrash the
+        // stream.
+        if (seek_back || seek_fwd) && self.engine.state() != PlaybackState::Stopped {
+            let position = self.engine.position().as_secs_f32();
+            if let Some((start, _)) = self.hotkey_seek {
+                // A later press in the run: re-aim the target from the
+                // frozen start so the steps accumulate cleanly.
+                self.hotkey_seek = Some((start, step_seek(start, seek_fwd)));
+            } else {
+                // The first press of the run: freeze the counter and set
+                // the target one step away from where playback actually is.
+                self.hotkey_seek = Some((position, step_seek(position, seek_fwd)));
+            }
+        }
+        // The release: the held key has lifted, so fire the seek once to
+        // wherever the target ended up.
+        let key_lifted = ctx.input(|i| {
+            i.key_released(egui::Key::ArrowLeft) || i.key_released(egui::Key::ArrowRight)
+        });
+        if key_lifted {
+            if let Some((start, end)) = self.hotkey_seek.take() {
+                // `slider_has_moved`: only seek if the target actually moved.
+                if end != start {
+                    actions.push(Action::Seek(end));
+                }
+            }
+        }
+        // SMPlayer throttles drag volume changes with a 200 ms timer so a
+        // rapid run of 9/0 presses settles instead of firing one seek-and-
+        // save per key. Hold the last step and only push it when that
+        // interval has passed; a later press overrides the pending one.
+        if vol_down || vol_up {
+            if let Some(when) = self.volume_step {
+                if Instant::now() < when {
+                    return;
+                }
+            }
+            let volume = self.engine.volume();
+            actions.push(Action::SetVolume(step_volume(volume, vol_up)));
+            self.volume_step = Some(Instant::now() + Duration::from_millis(200));
+        }
         if toggle {
             self.engine.toggle();
         }
-        if next {
+        if next || pgdn {
             self.engine.next(&self.library);
         }
-        if prev {
+        if prev || pgup {
             self.engine.previous(&self.library);
+        }
+        // Shift-C puts the window away with playback carrying on; C pauses
+        // first, so the music stops right there too.
+        //let (shift, c) = Self::c_key(c, shift, command, alt);
+        if c && !shift && !command && !alt {
+            self.engine.pause();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        if c && shift {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
         if info {
             self.info_open = !self.info_open;
@@ -54,6 +127,19 @@ impl NovaApp {
                 self.set_window_mode(ctx, WindowMode::Normal);
             }
         }
+    }
+
+    /// <kbd>C</kbd> and <kbd>Shift</kbd>+<kbd>C</kbd> as one decision:
+    /// `(pause, minimize)`.
+    ///
+    /// SHIFT+C pauses first and puts the window away; C puts the window
+    /// away with playback carrying on. C with Ctrl or Alt belongs to someone
+    /// else (copy, whatever the desktop bound it to), so it does nothing here.
+    pub(super) fn c_key(c: bool, shift: bool, command: bool, alt: bool) -> (bool, bool) {
+        if !c || command || alt {
+            return (false, false);
+        }
+        (!shift, true)
     }
 
     /// <kbd>Del</kbd>. In Songs the highlighted track is hidden from the
@@ -137,10 +223,16 @@ impl NovaApp {
                     }
                 }
                 Action::SetVolume(volume) => {
-                    self.engine.set_volume(volume);
-                    self.config.volume = volume;
-                    self.config.allow_video_movement = allow_video_movement();
-                    self.config.save();
+                    // SMPlayer's `Core::setVolume` returns early when the
+                    // value did not change, and keeps the volume in memory —
+                    // its prefs are written once at the end, not per step.
+                    // Writing config.json here would stall every drag frame.
+                    if volume != self.engine.volume() {
+                        self.engine.set_volume(volume);
+                        self.config.volume = volume;
+                        self.config.allow_video_movement = allow_video_movement();
+                        self.volume_save = Some(Instant::now() + Duration::from_millis(400));
+                    }
                 }
                 Action::ToggleShuffle => self.engine.queue_mut().toggle_shuffle(),
                 Action::CycleRepeat => self.engine.queue_mut().cycle_repeat(),
@@ -182,4 +274,62 @@ impl NovaApp {
             }
         }
     }
+}
+
+/// Where the ←/→ hotkeys put the playhead: a 5 s step, never before zero.
+/// The top end is left to the backend, which already clamps to the duration.
+pub(super) fn step_seek(position: f32, forward: bool) -> f32 {
+    const STEP: f32 = 5.0;
+    (position + if forward { STEP } else { -STEP }).max(0.0)
+}
+
+/// Where the 9/0 hotkeys put the volume: a 1 % step inside the slider's
+/// 0.0..=1.0. Rounded to whole percents first so repeated presses stay on
+/// exact values instead of drifting through float error.
+pub(super) fn step_volume(volume: f32, up: bool) -> f32 {
+    let cents = (volume * 100.0).round() + if up { 1.0 } else { -1.0 };
+    (cents / 100.0).clamp(0.0, 1.0)
+}
+
+/// SMPlayer's `TimeSlider` state machine, one frame at a time
+/// (`timeslider.cpp`).
+///
+/// `drag` is `None` while playback drives the handle and `Some((start,
+/// current))` while the pointer holds it. `before` is the value the slider
+/// was seeded with this frame, `after` the value it gave back. Returns the
+/// new state plus a position to seek to, if this frame should seek:
+///
+/// - never while the handle is held (`dont_update`), and nothing is sent
+///   mid-drag at all — SMPlayer's `update_while_seeking` defaults to off,
+///   so the seek happens once, on release;
+/// - on release only if the drag actually moved the handle
+///   (`slider_has_moved`), which is what keeps a click that lands where
+///   playback already is from seeking and juddering;
+/// - a change with no pointer holding the slider — an arrow key on a
+///   focused one — seeks straight away, like `valueChanged_slot` outside a
+///   drag.
+pub(super) fn seek_drag(
+    drag: Option<(f32, f32)>,
+    before: f32,
+    after: f32,
+    grabbed: bool,
+    changed: bool,
+    released: bool,
+) -> (Option<(f32, f32)>, Option<f32>) {
+    let mut drag = drag;
+    if drag.is_none() && grabbed {
+        drag = Some((before, before));
+    }
+    if let Some((start, current)) = drag.as_mut() {
+        if changed {
+            *current = after;
+        }
+        if released {
+            let (start, end) = (*start, *current);
+            // SMPlayer only seeks on release when the handle actually moved.
+            return (None, (end != start).then_some(end));
+        }
+        return (drag, None);
+    }
+    (None, changed.then_some(after))
 }

@@ -4,4 +4,5 @@ description = "Process-wide get/set cells (faav), in the style of TAM's faav.rs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file = "LICENSE"
+repository.workspace = true

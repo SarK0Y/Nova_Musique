@@ -32,7 +32,11 @@ impl CoverCache {
     }
 }
 
-pub(super) fn decode_texture(ctx: &egui::Context, name: String, bytes: &[u8]) -> Option<egui::TextureHandle> {
+pub(super) fn decode_texture(
+    ctx: &egui::Context,
+    name: String,
+    bytes: &[u8],
+) -> Option<egui::TextureHandle> {
     let image = image::load_from_memory(bytes).ok()?.to_rgba8();
     let size = [image.width() as usize, image.height() as usize];
     if size[0] == 0 || size[1] == 0 {

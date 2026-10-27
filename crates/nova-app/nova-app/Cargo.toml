@@ -1,0 +1,25 @@
+[package]
+name = "nova-app"
+description = "Media Player for innovative codecs, Dear User :)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file="LICENSE"
+readme="README.md"
+repository.workspace = true
+
+[[bin]]
+name = "nova"
+path = "src/main.rs"
+
+[dependencies]
+nova-core357_11 = { workspace = true, features = ["nofft"] }
+nova-faav = { workspace = true }
+eframe = { workspace = true }
+image = { workspace = true }
+rfd = { workspace = true }
+walkdir = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
