@@ -95,10 +95,20 @@ pub struct NovaApp {
     scan_status: Option<String>,
     config: Config,
     toast: Option<(String, Instant)>,
+    /// `Some((start, target))` while a ←/→ hotkey run is in progress: the
+    /// first press freezes the counter and each later press only moves the
+    /// target, and the stream is set to it once when the key lifts — the
+    /// press/release model of SMPlayer's `TimeSlider`.
+    hotkey_seek: Option<(f32, f32)>,
     /// `Some((start, current))` while the seek handle is held: the progress
     /// bar stops following playback until the drag ends (SMPlayer's
-    /// `TimeSlider` `dont_update`).
+    /// `TimeSlider` `dont_update`). The file keeps playing so the stream
+    /// stays in sync; the seek itself goes out on release.
     seek_drag: Option<(f32, f32)>,
+    /// When the pending 9/0 hotkey volume step may be applied (SMPlayer's
+    /// 200 ms drag timer), so a rapid run of presses settles instead of
+    /// firing one step per key.
+    volume_step: Option<Instant>,
     /// When the in-memory volume reaches config.json; `None` when nothing
     /// is pending. A drag writes once it settles, not on every frame.
     volume_save: Option<Instant>,
@@ -275,7 +285,9 @@ impl NovaApp {
             scan_status: None,
             config,
             toast: None,
+            hotkey_seek: None,
             seek_drag: None,
+            volume_step: None,
             volume_save: None,
             info_open: false,
             selected: None,

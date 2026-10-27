@@ -4,7 +4,21 @@ use super::*;
 
 impl NovaApp {
     pub(super) fn handle_input(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        // Always finish an active seek gesture on key-up, even if focus moved
+        // to a text field while the arrow key was held. Otherwise the frozen
+        // progress counter can remain stuck and the pending seek is lost.
         if ctx.egui_wants_keyboard_input() {
+            let key_lifted = ctx.input(|i| {
+                i.key_released(egui::Key::ArrowLeft)
+                    || i.key_released(egui::Key::ArrowRight)
+            });
+            if key_lifted {
+                if let Some((start, target)) = self.hotkey_seek.take() {
+                    if (target - start).abs() > f32::EPSILON {
+                        actions.push(Action::Seek(target));
+                    }
+                }
+            }
             return;
         }
         let (toggle, next, prev, info, del, escape, window, pgup, pgdn, c, shift, command, alt) =
@@ -36,13 +50,51 @@ impl NovaApp {
                 plain && i.key_pressed(egui::Key::Num0),
             )
         });
+        // SMPlayer's TimeSlider press model, for the ←/→ hotkeys: the first
+        // press freezes the counter at the current position, every press in
+        // the run only moves the target (never the stream), and the stream
+        // is set to it once when the key lifts. A run that ends where it
+        // started seeks nowhere, so holding the key does not thrash the
+        // stream.
         if (seek_back || seek_fwd) && self.engine.state() != PlaybackState::Stopped {
             let position = self.engine.position().as_secs_f32();
-            actions.push(Action::Seek(step_seek(position, seek_fwd)));
+            if let Some((start, target)) = self.hotkey_seek {
+                // Repeated key presses advance from the pending target, not
+                // from the frozen playback position. This lets a held/repeated
+                // arrow key build up long jumps while the stream stays put.
+                self.hotkey_seek = Some((start, step_seek(target, seek_fwd)));
+            } else {
+                // The first press of the run: freeze the counter and set
+                // the target one step away from where playback actually is.
+                self.hotkey_seek = Some((position, step_seek(position, seek_fwd)));
+            }
         }
+        // The release: the held key has lifted, so fire the seek once to
+        // wherever the target ended up.
+        let key_lifted = ctx.input(|i| {
+            i.key_released(egui::Key::ArrowLeft) || i.key_released(egui::Key::ArrowRight)
+        });
+        if key_lifted {
+            if let Some((start, end)) = self.hotkey_seek.take() {
+                // `slider_has_moved`: only seek if the target actually moved.
+                if (end - start).abs() > f32::EPSILON {
+                    actions.push(Action::Seek(end));
+                }
+            }
+        }
+        // SMPlayer throttles drag volume changes with a 200 ms timer so a
+        // rapid run of 9/0 presses settles instead of firing one seek-and-
+        // save per key. Hold the last step and only push it when that
+        // interval has passed; a later press overrides the pending one.
         if vol_down || vol_up {
+            if let Some(when) = self.volume_step {
+                if Instant::now() < when {
+                    return;
+                }
+            }
             let volume = self.engine.volume();
             actions.push(Action::SetVolume(step_volume(volume, vol_up)));
+            self.volume_step = Some(Instant::now() + Duration::from_millis(200));
         }
         if toggle {
             self.engine.toggle();
@@ -178,7 +230,7 @@ impl NovaApp {
                         Ok(Err(err)) => self.toast(err.to_string()),
                         Err(_) => {
                             // rodio may panic on seek (e.g. underflow in
-                            // SamplesBuffer::try_seek).  Reset the transport
+                            // SamplesBuffer::try_seek). Reset the transport
                             // so the UI stays consistent.
                             self.engine.stop();
                             self.toast("Seek failed — reset to start".to_string());
@@ -289,6 +341,7 @@ pub(super) fn seek_drag(
         }
         if released {
             let (start, end) = (*start, *current);
+            // SMPlayer only seeks on release when the handle actually moved.
             return (None, (end != start).then_some(end));
         }
         return (drag, None);

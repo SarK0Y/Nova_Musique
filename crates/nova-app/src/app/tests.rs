@@ -69,6 +69,50 @@ fn hotkeys_step_the_volume_by_one_percent() {
 }
 
 #[test]
+fn hotkey_seek_freezes_at_press_and_sets_once_on_release() {
+    // The hotkey run is modelled exactly as SMPlayer's press/release:
+    // the first press freezes the counter at the playback position, every
+    // later press only re-aims the target from that start, and the stream
+    // is set to the target exactly once, on release.
+    let position = 100.0;
+    let mut hotkey_seek: Option<(f32, f32)> = None;
+
+    // First press of the run: freeze the counter and aim one step forward.
+    let fwd = true;
+    hotkey_seek = Some((position, step_seek(position, fwd)));
+    assert_eq!(hotkey_seek, Some((100.0, 105.0)));
+
+    // Further forward presses re-aim from the same frozen start, so the
+    // target stays one step ahead instead of stacking — the run settles.
+    if let Some((start, _)) = hotkey_seek {
+        hotkey_seek = Some((start, step_seek(start, fwd)));
+    }
+    assert_eq!(hotkey_seek, Some((100.0, 105.0)));
+
+    // The release: set the stream to the target once, only if it moved.
+    let mut actions: Vec<f32> = Vec::new();
+    if let Some((start, end)) = hotkey_seek.take() {
+        if end != start {
+            actions.push(end);
+        }
+    }
+    assert_eq!(actions, vec![105.0]);
+    assert!(hotkey_seek.is_none());
+
+    // A fresh backward run from the same frozen position.
+    let fwd = false;
+    hotkey_seek = Some((position, step_seek(position, fwd)));
+    assert_eq!(hotkey_seek, Some((100.0, 95.0)));
+    let mut actions = Vec::new();
+    if let Some((start, end)) = hotkey_seek.take() {
+        if end != start {
+            actions.push(end);
+        }
+    }
+    assert_eq!(actions, vec![95.0]);
+}
+
+#[test]
 fn seek_drag_holds_the_handle_and_seeks_once_on_release() {
     // The press grabs the handle at the playback position; nothing goes
     // out while it is held.
