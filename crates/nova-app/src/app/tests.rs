@@ -33,15 +33,72 @@ fn default_thread_count_is_one_or_more() {
 
 #[test]
 fn c_key_pauses_on_shift_and_leaves_alone_ctrl() {
-    // Plain C: minimise, keep playing.
-    assert_eq!(NovaApp::c_key(true, false, false, false), (false, true));
-    // Shift+C: pause and minimise.
-    assert_eq!(NovaApp::c_key(true, true, false, false), (true, true));
+    // Plain C: pause and minimise.
+    assert_eq!(NovaApp::c_key(true, false, false, false), (true, true));
+    // Shift+C: minimise, keep playing.
+    assert_eq!(NovaApp::c_key(true, true, false, false), (false, true));
     // Ctrl+C / Alt+C belong to the desktop, so nothing happens.
     assert_eq!(NovaApp::c_key(true, false, true, false), (false, false));
     assert_eq!(NovaApp::c_key(true, false, false, true), (false, false));
     // No C at all: nothing.
     assert_eq!(NovaApp::c_key(false, true, false, false), (false, false));
+}
+
+#[test]
+fn hotkeys_step_the_seek_bar_by_five_seconds() {
+    assert_eq!(step_seek(10.0, true), 15.0);
+    assert_eq!(step_seek(10.0, false), 5.0);
+    // Never rewind before the start of the track.
+    assert_eq!(step_seek(3.0, false), 0.0);
+    assert_eq!(step_seek(0.0, false), 0.0);
+}
+
+#[test]
+fn hotkeys_step_the_volume_by_one_percent() {
+    assert!((step_volume(0.5, true) - 0.51).abs() < f32::EPSILON);
+    assert!((step_volume(0.5, false) - 0.49).abs() < f32::EPSILON);
+    // Clamped to the slider's ends.
+    assert_eq!(step_volume(0.0, false), 0.0);
+    assert_eq!(step_volume(1.0, true), 1.0);
+    // Repeated presses land on whole percents, not float drift.
+    let mut volume = 0.0;
+    for _ in 0..50 {
+        volume = step_volume(volume, true);
+    }
+    assert!((volume - 0.5).abs() < 1e-6, "drifted to {volume}");
+}
+
+#[test]
+fn seek_drag_holds_the_handle_and_seeks_once_on_release() {
+    // The press grabs the handle at the playback position; nothing goes
+    // out while it is held.
+    let (drag, seek) = seek_drag(None, 10.0, 30.0, true, true, false);
+    assert_eq!(seek, None);
+    assert_eq!(drag, Some((10.0, 30.0)));
+    // Frames while held keep the dragged value, still no seek.
+    let (drag, seek) = seek_drag(drag, 30.0, 45.0, false, true, false);
+    assert_eq!(seek, None);
+    assert_eq!(drag, Some((10.0, 45.0)));
+    // The release seeks exactly once, to where the handle landed.
+    let (drag, seek) = seek_drag(drag, 45.0, 45.0, false, false, true);
+    assert_eq!(drag, None);
+    assert_eq!(seek, Some(45.0));
+}
+
+#[test]
+fn seek_drag_ignores_a_click_that_did_not_move() {
+    // Pressed and released on the spot playback already shows: no seek —
+    // the spurious same-position seek SMPlayer's `slider_has_moved` avoids.
+    let (drag, seek) = seek_drag(None, 10.0, 10.0, true, false, false);
+    assert_eq!((drag, seek), (Some((10.0, 10.0)), None));
+    let (drag, seek) = seek_drag(drag, 10.0, 10.0, false, false, true);
+    assert_eq!((drag, seek), (None, None));
+    // A value change with no pointer holding the slider (arrow key on a
+    // focused slider) seeks straight away.
+    assert_eq!(
+        seek_drag(None, 10.0, 12.0, false, true, false),
+        (None, Some(12.0))
+    );
 }
 
 #[test]

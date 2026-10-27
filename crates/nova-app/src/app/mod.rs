@@ -64,6 +64,7 @@ use self::browse::*;
 use self::config::*;
 use self::covers::*;
 use self::drops::*;
+use self::input::*;
 use self::library::*;
 use self::nfm::*;
 use self::playlist::*;
@@ -94,6 +95,13 @@ pub struct NovaApp {
     scan_status: Option<String>,
     config: Config,
     toast: Option<(String, Instant)>,
+    /// `Some((start, current))` while the seek handle is held: the progress
+    /// bar stops following playback until the drag ends (SMPlayer's
+    /// `TimeSlider` `dont_update`).
+    seek_drag: Option<(f32, f32)>,
+    /// When the in-memory volume reaches config.json; `None` when nothing
+    /// is pending. A drag writes once it settles, not on every frame.
+    volume_save: Option<Instant>,
     /// Whether the track-info panel is shown.
     info_open: bool,
     /// Last track the user explicitly played; the info panel falls back to it
@@ -267,6 +275,8 @@ impl NovaApp {
             scan_status: None,
             config,
             toast: None,
+            seek_drag: None,
+            volume_save: None,
             info_open: false,
             selected: None,
             hidden,
@@ -386,10 +396,19 @@ impl eframe::App for NovaApp {
 
         self.poll_scan(&ctx);
         self.tick_engine();
-        self.handle_input(&ctx);
-        self.handle_drops(&ctx);
+
+        // SMPlayer writes its whole prefs file once at exit; Nova keeps the
+        // same spirit by writing the volume a beat after the last change
+        // instead of on every drag frame.
+        if self.volume_save.is_some_and(|when| Instant::now() >= when) {
+            self.config.save();
+            self.volume_save = None;
+        }
 
         let mut actions = Vec::new();
+        self.handle_input(&ctx, &mut actions);
+        self.handle_drops(&ctx);
+
         self.remote_commands(&mut actions);
 
         // While a video plays, the sidebar gives up its width to the picture;

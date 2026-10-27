@@ -3,7 +3,7 @@
 use super::*;
 
 impl NovaApp {
-    pub(super) fn handle_input(&mut self, ctx: &egui::Context) {
+    pub(super) fn handle_input(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
@@ -25,6 +25,25 @@ impl NovaApp {
                     i.modifiers.alt,
                 )
             });
+        // Plain arrows scrub the progress bar by 5 s; Ctrl+arrows stay
+        // bound to prev/next above. 9/0 nudge the volume by 1 %.
+        let (seek_back, seek_fwd, vol_down, vol_up) = ctx.input(|i| {
+            let plain = !i.modifiers.command && !i.modifiers.alt;
+            (
+                plain && i.key_pressed(egui::Key::ArrowLeft),
+                plain && i.key_pressed(egui::Key::ArrowRight),
+                plain && i.key_pressed(egui::Key::Num9),
+                plain && i.key_pressed(egui::Key::Num0),
+            )
+        });
+        if (seek_back || seek_fwd) && self.engine.state() != PlaybackState::Stopped {
+            let position = self.engine.position().as_secs_f32();
+            actions.push(Action::Seek(step_seek(position, seek_fwd)));
+        }
+        if vol_down || vol_up {
+            let volume = self.engine.volume();
+            actions.push(Action::SetVolume(step_volume(volume, vol_up)));
+        }
         if toggle {
             self.engine.toggle();
         }
@@ -167,10 +186,16 @@ impl NovaApp {
                     }
                 }
                 Action::SetVolume(volume) => {
-                    self.engine.set_volume(volume);
-                    self.config.volume = volume;
-                    self.config.allow_video_movement = allow_video_movement();
-                    self.config.save();
+                    // SMPlayer's `Core::setVolume` returns early when the
+                    // value did not change, and keeps the volume in memory —
+                    // its prefs are written once at the end, not per step.
+                    // Writing config.json here would stall every drag frame.
+                    if volume != self.engine.volume() {
+                        self.engine.set_volume(volume);
+                        self.config.volume = volume;
+                        self.config.allow_video_movement = allow_video_movement();
+                        self.volume_save = Some(Instant::now() + Duration::from_millis(400));
+                    }
                 }
                 Action::ToggleShuffle => self.engine.queue_mut().toggle_shuffle(),
                 Action::CycleRepeat => self.engine.queue_mut().cycle_repeat(),
@@ -212,4 +237,61 @@ impl NovaApp {
             }
         }
     }
+}
+
+/// Where the ←/→ hotkeys put the playhead: a 5 s step, never before zero.
+/// The top end is left to the backend, which already clamps to the duration.
+pub(super) fn step_seek(position: f32, forward: bool) -> f32 {
+    const STEP: f32 = 5.0;
+    (position + if forward { STEP } else { -STEP }).max(0.0)
+}
+
+/// Where the 9/0 hotkeys put the volume: a 1 % step inside the slider's
+/// 0.0..=1.0. Rounded to whole percents first so repeated presses stay on
+/// exact values instead of drifting through float error.
+pub(super) fn step_volume(volume: f32, up: bool) -> f32 {
+    let cents = (volume * 100.0).round() + if up { 1.0 } else { -1.0 };
+    (cents / 100.0).clamp(0.0, 1.0)
+}
+
+/// SMPlayer's `TimeSlider` state machine, one frame at a time
+/// (`timeslider.cpp`).
+///
+/// `drag` is `None` while playback drives the handle and `Some((start,
+/// current))` while the pointer holds it. `before` is the value the slider
+/// was seeded with this frame, `after` the value it gave back. Returns the
+/// new state plus a position to seek to, if this frame should seek:
+///
+/// - never while the handle is held (`dont_update`), and nothing is sent
+///   mid-drag at all — SMPlayer's `update_while_seeking` defaults to off,
+///   so the seek happens once, on release;
+/// - on release only if the drag actually moved the handle
+///   (`slider_has_moved`), which is what keeps a click that lands where
+///   playback already is from seeking and juddering;
+/// - a change with no pointer holding the slider — an arrow key on a
+///   focused one — seeks straight away, like `valueChanged_slot` outside a
+///   drag.
+pub(super) fn seek_drag(
+    drag: Option<(f32, f32)>,
+    before: f32,
+    after: f32,
+    grabbed: bool,
+    changed: bool,
+    released: bool,
+) -> (Option<(f32, f32)>, Option<f32>) {
+    let mut drag = drag;
+    if drag.is_none() && grabbed {
+        drag = Some((before, before));
+    }
+    if let Some((start, current)) = drag.as_mut() {
+        if changed {
+            *current = after;
+        }
+        if released {
+            let (start, end) = (*start, *current);
+            return (None, (end != start).then_some(end));
+        }
+        return (drag, None);
+    }
+    (None, changed.then_some(after))
 }

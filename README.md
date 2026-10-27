@@ -582,8 +582,10 @@ on disk and nothing stays hidden.
 | <kbd>Space</kbd> | Play / pause |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> | Previous track |
 | <kbd>Ctrl</kbd>+<kbd>→</kbd> | Next track |
+| <kbd>←</kbd> / <kbd>→</kbd> | Seek 5 s back / forward |
 | <kbd>PgUp</kbd> | Previous track |
 | <kbd>PgDn</kbd> | Next track |
+| <kbd>9</kbd> / <kbd>0</kbd> | Volume down / up by 1 % |
 | <kbd>I</kbd> | Toggle the track info panel |
 | <kbd>↑</kbd> / <kbd>↓</kbd> | Move the cursor through a list |
 | <kbd>Enter</kbd> | Play the track under the cursor |
@@ -786,6 +788,6 @@ Deliberately out of scope for this first pass — the natural next steps:
 - Richer now-playing (waveform/visualiser, lyrics).
 - Drag-and-drop reordering of the queue.
 
-## Project has been assisted by awesome OpenCode (Big Pickle, LongCat, Space Bunny) / ChatGPT 🙂
+## Project has been assisted by awesome OpenCode (Big Pickle, LongCat, Space Bunny) / ChatGPT / Claude 🙂
 
 ## my the Best Wishes to You, Dear User 🙃
