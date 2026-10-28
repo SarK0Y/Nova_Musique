@@ -34,11 +34,23 @@ impl Ctrl {
             .map(|name| media.with_file_name(format!("{name}.ctrl")))
     }
 
+    /// Sort marks ascending and deduplicate them.
+    pub(super) fn normalize(&mut self) {
+        self.jo
+            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        self.gut
+            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        self.jo.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        self.gut.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    }
+
     /// Load the `.ctrl` that governs `media`, if one sits beside it.
     pub(super) fn load(media: &Path) -> Option<Ctrl> {
         let path = Self::path_for(media)?;
         let raw = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&raw).ok()
+        let mut ctrl: Ctrl = serde_json::from_str(&raw).ok()?;
+        ctrl.normalize();
+        Some(ctrl)
     }
 
     /// Save this `.ctrl` next to `media`.
@@ -65,26 +77,21 @@ impl Ctrl {
 
     /// Advance the cursor: if it has reached a fragment's `gut`, jump to
     /// the next `jo`. Return `Some(seek)` when a jump is owed, `None` when
-    /// the cursor is still inside the fragment. The landing mark is at or
-    /// ahead of the cursor, so a repeated `repeat` wraps to the first `jo`
-    /// when the last fragment ends.
+    /// the cursor is still inside the fragment.
     pub(super) fn advance(&self, position: f64) -> Option<f64> {
-        // A jump is owed when the cursor sits at-or-past a `gut` that
-        // started after the previous jump. The last `gut` at-or-before the
-        // cursor is the one we just ran into; its successor `jo` is the
-        // target.
-        let hit = self
-            .gut
-            .iter()
-            .copied()
-            .filter(|&mark| mark <= position + f64::EPSILON)
-            .last();
-        hit.is_some().then(|| {
-            let from = hit.unwrap();
-            self.next_jo(from)
-                .or_else(|| self.jo.first().copied())
-                .unwrap_or(0.0)
-        })
+        // Find which fragment we're in by pairing jo and gut in order
+        if self.jo.is_empty() || self.gut.is_empty() {
+            return None;
+        }
+        for i in 0..self.gut.len() {
+            let gut = self.gut[i];
+            if position >= gut - 1e-9 {
+                // We've reached this gut - jump to next jo or wrap to first
+                let next_jo = self.jo.get(i + 1).copied().or_else(|| self.jo.first().copied());
+                return next_jo;
+            }
+        }
+        None
     }
 }
 
@@ -92,6 +99,15 @@ impl NovaApp {
     /// The media path the active ctrl is attached to, if any.
     pub(super) fn ctrl_media_path(&self) -> Option<PathBuf> {
         self.active_ctrl_for.clone()
+    }
+
+    fn ctrl_should_jump(&self, ctrl: &Ctrl, position: f64, target: f64) -> bool {
+        // Don't jump if we're already very close to the target
+        if (position - target).abs() < 0.8 {
+            return false;
+        }
+        // Don't jump back to a jo if we just passed a gut but are already past that jo
+        true
     }
 
     /// Ensure we have a ctrl object for the current track (create empty one if missing).
@@ -126,10 +142,10 @@ impl NovaApp {
         let position = self.engine.position().as_secs_f64();
         if let Some(ctrl) = self.ensure_ctrl() {
             ctrl.jo.push(position);
-            ctrl.jo.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            ctrl.jo.dedup_by(|a, b| (*a - *b).abs() < f64::EPSILON);
+            ctrl.normalize();
         }
-        if let Some(ctrl) = self.active_ctrl.as_ref() {
+        if let Some(ctrl) = self.active_ctrl.as_mut() {
+            ctrl.normalize();
             if let Err(err) = ctrl.save(&path) {
                 self.toast(format!("Ctrl save failed: {err}"));
                 return;
@@ -149,10 +165,10 @@ impl NovaApp {
         let position = self.engine.position().as_secs_f64();
         if let Some(ctrl) = self.ensure_ctrl() {
             ctrl.gut.push(position);
-            ctrl.gut.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            ctrl.gut.dedup_by(|a, b| (*a - *b).abs() < f64::EPSILON);
+            ctrl.normalize();
         }
-        if let Some(ctrl) = self.active_ctrl.as_ref() {
+        if let Some(ctrl) = self.active_ctrl.as_mut() {
+            ctrl.normalize();
             if let Err(err) = ctrl.save(&path) {
                 self.toast(format!("Ctrl save failed: {err}"));
                 return;
@@ -164,12 +180,28 @@ impl NovaApp {
 
     /// Toggle repeat flag and save the ctrl.
     pub(super) fn ctrl_toggle_repeat(&mut self) {
-        let Some(path) = self.ctrl_media_path().or_else(|| {
+        let path = self.ctrl_media_path().or_else(|| {
             self.engine.current_track(&self.library).map(|t| t.path.clone())
-        }) else {
+        });
+        let Some(path) = path else {
             return;
         };
-        let repeat = if let Some(ctrl) = self.ensure_ctrl() {
+        // When ctrl not enabled, try to load/create for current track
+        if !self.ctrl_enabled {
+            self.active_ctrl_for = Some(path.clone());
+            if self.active_ctrl.is_none() {
+                self.active_ctrl = Ctrl::load(&path);
+            }
+            if self.active_ctrl.is_none() {
+                self.active_ctrl = Some(Ctrl {
+                    jo: Vec::new(),
+                    gut: Vec::new(),
+                    repeat: false,
+                });
+            }
+            self.ctrl_enabled = true;
+        }
+        let repeat = if let Some(ctrl) = self.active_ctrl.as_mut() {
             ctrl.repeat = !ctrl.repeat;
             ctrl.repeat
         } else {
@@ -235,22 +267,36 @@ impl NovaApp {
                 return;
             }
         }
+        eprintln!("CTRL_TICK: enabled={} has_ctrl={} jo={:?} gut={:?}", self.ctrl_enabled, self.active_ctrl.is_some(), self.active_ctrl.as_ref().map(|c| &c.jo), self.active_ctrl.as_ref().map(|c| &c.gut));
         let Some(ctrl) = &self.active_ctrl else {
             return;
         };
         let position = self.engine.position().as_secs_f64();
-        // If we've reached/passed the last gut and not repeating, stop at it
+        // If we've reached/passed the last gut and not repeating, seek to last gut and pause
         if !ctrl.repeat {
             if let Some(&last_gut) = ctrl.gut.last() {
                 if position >= last_gut - 0.25 {
-                    self.engine.stop();
+                    self.engine.pause();
                     return;
                 }
+            }
+        }
+        // When repeating and we reach/past the last gut, jump to first jo
+        if ctrl.repeat && !ctrl.gut.is_empty() && !ctrl.jo.is_empty() {
+            let last_gut = ctrl.gut[ctrl.gut.len()-1];
+            if position >= last_gut - 2.0 {
+                let first_jo = ctrl.jo[0];
+                eprintln!("CTRL_REPEAT: pos={} last_gut={} jo[0]={} dur={:?} enabled={}", position, last_gut, first_jo, Duration::from_secs_f64(first_jo), self.ctrl_enabled);
+                self.engine.seek(Duration::from_secs_f64(first_jo));
+                return;
             }
         }
         let Some(target) = ctrl.advance(position) else {
             return;
         };
+        if (position - target).abs() < 0.3 {
+            return;
+        }
         // The jump is the engine's next seek; the engine clamps it to the
         // duration, so a stray mark past the end is harmless.
         self.engine.seek(Duration::from_secs_f64(target));
