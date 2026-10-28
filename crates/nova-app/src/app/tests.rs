@@ -82,12 +82,13 @@ fn hotkey_seek_freezes_at_press_and_sets_once_on_release() {
     hotkey_seek = Some((position, step_seek(position, fwd)));
     assert_eq!(hotkey_seek, Some((100.0, 105.0)));
 
-    // Further forward presses re-aim from the same frozen start, so the
-    // target stays one step ahead instead of stacking — the run settles.
-    if let Some((start, _)) = hotkey_seek {
-        hotkey_seek = Some((start, step_seek(start, fwd)));
+    // The key repeat of the same run steps on from the pending target, so
+    // one press-and-release cycle per jump — the stream is left alone until
+    // the key lifts.
+    if let Some((start, target)) = hotkey_seek {
+        hotkey_seek = Some((start, step_seek(target, fwd)));
     }
-    assert_eq!(hotkey_seek, Some((100.0, 105.0)));
+    assert_eq!(hotkey_seek, Some((100.0, 110.0)));
 
     // The release: set the stream to the target once, only if it moved.
     let mut actions: Vec<f32> = Vec::new();
@@ -96,7 +97,7 @@ fn hotkey_seek_freezes_at_press_and_sets_once_on_release() {
             actions.push(end);
         }
     }
-    assert_eq!(actions, vec![105.0]);
+    assert_eq!(actions, vec![110.0]);
     assert!(hotkey_seek.is_none());
 
     // A fresh backward run from the same frozen position.
@@ -110,6 +111,70 @@ fn hotkey_seek_freezes_at_press_and_sets_once_on_release() {
         }
     }
     assert_eq!(actions, vec![95.0]);
+}
+
+#[test]
+fn the_ctrl_file_governs_its_media_file() {
+    // The `.ctrl` sits beside its media file, named after it.
+    let media = PathBuf::from("/home/evg/films/Season 1/ep.mkv");
+    assert_eq!(
+        Ctrl::path_for(&media),
+        Some(PathBuf::from("/home/evg/films/Season 1/ep.mkv.ctrl"))
+    );
+
+    let ctrl = Ctrl {
+        jo: vec![0.0, 120.0],
+        gut: vec![60.0, 300.0],
+        repeat: false,
+    };
+    // Inside the fragment: the cursor runs on to the next `gut`.
+    assert_eq!(ctrl.advance(30.0), None);
+    // At the first `gut`: jump to the next `jo`.
+    assert_eq!(ctrl.advance(60.0), Some(120.0));
+    // Inside the second fragment: the cursor runs on to the last `gut`.
+    assert_eq!(ctrl.advance(200.0), Some(120.0));
+    // At the last `gut` with no `repeat`: the fragment is over — the
+    // target wraps to the first `jo`, and it is `tick_ctrl` that turns
+    // that into a stop instead of a loop.
+    assert_eq!(ctrl.advance(300.0), Some(0.0));
+}
+
+#[test]
+fn a_repeating_ctrl_wraps_to_the_first_jo() {
+    let ctrl = Ctrl {
+        jo: vec![10.0, 100.0],
+        gut: vec![50.0, 200.0],
+        repeat: true,
+    };
+    // At the first `gut`: the next `jo` in the list.
+    assert_eq!(ctrl.advance(50.0), Some(100.0));
+    // Past the last `gut`: wrap to the first `jo` and keep looping.
+    assert_eq!(ctrl.advance(200.0), Some(10.0));
+}
+
+#[test]
+fn a_ctrl_without_marks_is_no_op() {
+    let ctrl = Ctrl {
+        jo: Vec::new(),
+        gut: Vec::new(),
+        repeat: false,
+    };
+    // No marks: the sub-timeline never owes a jump.
+    assert_eq!(ctrl.advance(999.0), None);
+}
+
+#[test]
+fn the_ctrl_stops_at_the_last_gut_without_repeat() {
+    // The non-repeating model: `advance` wraps to the first `jo` when the
+    // cursor is at the last `gut`, and `tick_ctrl` turns that into a stop
+    // instead of a loop. Here we just check the wrap target.
+    let ctrl = Ctrl {
+        jo: vec![0.0, 120.0],
+        gut: vec![60.0, 300.0],
+        repeat: false,
+    };
+    // At the last `gut`: the target is the first `jo` (the wrap point).
+    assert_eq!(ctrl.advance(300.0), Some(0.0));
 }
 
 #[test]

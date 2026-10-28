@@ -273,7 +273,7 @@ drives the app without a pointer:
 | `flip <x> <y>` | Mirror left-right, flip top-bottom |
 | `zoom <n>` / `pan <x> <y>` / `move <0\|1>` | Picture size and position — what the picker's buttons do |
 | `deint <n>` | Which deinterlacer is on the filter chain |
-| `mode <name>` | SMPlayer's *Stereo mode*: `stereo`, `left`, `right`, `mono`, `reverse` |
+| `mode <name>` | SMPlayer's *Stereo mode*: `stereo`, `left`, `right`, `mono`, `reverse`, `off`, `middle`, `karaoke` |
 
 Lines that do not parse are ignored here just as they are at the picker's end,
 and `play` starts only files the library already knows: anything else gets a
@@ -580,18 +580,17 @@ on disk and nothing stays hidden.
 | Shortcut | Action |
 | --- | --- |
 | <kbd>Space</kbd> | Play / pause |
+| <kbd>←</kbd> / <kbd>→</kbd> | Seek 5 s backward / forward (SMPlayer-style press/release) |
+| <kbd>9</kbd> / <kbd>0</kbd> | Volume down / up by 1 % |
+| <kbd>PgUp</kbd> / <kbd>PgDn</kbd> | Previous / next track |
+| <kbd>C</kbd> | Minimise the video window |
+| <kbd>Shift</kbd>+<kbd>C</kbd> | Pause / swap (toggle pause) |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> | Previous track |
 | <kbd>Ctrl</kbd>+<kbd>→</kbd> | Next track |
-| <kbd>←</kbd> / <kbd>→</kbd> | Seek 5 s back / forward |
-| <kbd>PgUp</kbd> | Previous track |
-| <kbd>PgDn</kbd> | Next track |
-| <kbd>9</kbd> / <kbd>0</kbd> | Volume down / up by 1 % |
 | <kbd>I</kbd> | Toggle the track info panel |
 | <kbd>↑</kbd> / <kbd>↓</kbd> | Move the cursor through a list |
 | <kbd>Enter</kbd> | Play the track under the cursor |
 | <kbd>Del</kbd> | Queue view: remove from queue · Songs view: hide from library |
-| <kbd>Shift</kbd>+<kbd>C</kbd> | Minimise the window; playback carries on |
-|<kbd>C</kbd> | Pause and minimise the window |
 | <kbd>F</kbd> | While a video is on screen: normal window → full screen → maximised window → normal window |
 | <kbd>Esc</kbd> | Leave full screen; otherwise stop and return to the library while a video is on screen |
 
@@ -788,6 +787,33 @@ Deliberately out of scope for this first pass — the natural next steps:
 - Richer now-playing (waveform/visualiser, lyrics).
 - Drag-and-drop reordering of the queue.
 
-## Project has been assisted by awesome OpenCode (Big Pickle, LongCat, Space Bunny) / ChatGPT / Claude 🙂
+## Project has been assisted by awesome OpenCode (Big Pickle, LongCat, Space Bunny) / ChatGPT 🙂
 
 ## my the Best Wishes to You, Dear User 🙃
+
+### `.ctrl` sub-timeline
+
+Place a JSON file beside the media file, named after its **full filename including extension** with `.ctrl` appended (e.g. `clip.mp4` → `clip.mp4.ctrl`):
+
+```json
+{
+  "jo": [0, 120],
+  "gut": [60, 300],
+  "repeat": true
+}
+```
+
+- `jo` — start points of fragments.
+- `gut` — end points; when playback reaches a `gut` Nova jumps to the next `jo` and plays up to the nearest `gut` again.
+- `repeat` — if `true`, after the last `gut` it loops back to the first `jo` endlessly; if `false`, it stops at the last `gut`.
+
+**Hotkeys (while playing):**
+
+| Shortcut | Action |
+| --- | --- |
+| <kbd>M</kbd> | Add a `jo` mark at current position (creates/updates `*.ctrl` beside the file) |
+| <kbd>Shift</kbd>+<kbd>M</kbd> | Add a `gut` mark at current position |
+| <kbd>Shift</kbd>+<kbd>R</kbd> | Toggle `repeat` |
+| <kbd>Shift</kbd>+<kbd>Esc</kbd> | Unload / reload the `.ctrl` for the current track |
+
+See `examples/ctrl.example` for a commented example.

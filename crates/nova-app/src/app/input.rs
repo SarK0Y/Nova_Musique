@@ -4,7 +4,20 @@ use super::*;
 
 impl NovaApp {
     pub(super) fn handle_input(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        // Always finish an active seek gesture on key-up, even if focus moved
+        // to a text field while the arrow key was held. Otherwise the frozen
+        // progress counter can remain stuck and the pending seek is lost.
         if ctx.egui_wants_keyboard_input() {
+            let key_lifted = ctx.input(|i| {
+                i.key_released(egui::Key::ArrowLeft) || i.key_released(egui::Key::ArrowRight)
+            });
+            if key_lifted {
+                if let Some((start, target)) = self.hotkey_seek.take() {
+                    if (target - start).abs() > f32::EPSILON {
+                        actions.push(Action::Seek(target));
+                    }
+                }
+            }
             return;
         }
         let (toggle, next, prev, info, del, escape, window, pgup, pgdn, c, shift, command, alt) =
@@ -25,6 +38,31 @@ impl NovaApp {
                     i.modifiers.alt,
                 )
             });
+        // Ctrl hotkeys: m = add jo, Shift+M = add gut, Shift+R = toggle repeat, Shift+Esc = unload/load ctrl
+        let (m_key, r_key) = ctx.input(|i| {
+            let plain_or_shift = !i.modifiers.command && !i.modifiers.alt;
+            (
+                plain_or_shift && i.key_pressed(egui::Key::M),
+                plain_or_shift && i.key_pressed(egui::Key::R),
+            )
+        });
+        if m_key && !shift {
+            self.ctrl_add_jo();
+        }
+        if m_key && shift {
+            self.ctrl_add_gut();
+        }
+        if r_key && shift {
+            self.ctrl_toggle_repeat();
+        }
+        if escape && shift && !m_key {
+            self.ctrl_reload();
+            return;
+        }
+        // Don't let Shift+M trigger escape/video-stop behavior
+        if m_key && shift {
+            // still allow other hotkeys, but skip escape handling below
+        }
         // Plain arrows scrub the progress bar by 5 s; Ctrl+arrows stay
         // bound to prev/next above. 9/0 nudge the volume by 1 %.
         let (seek_back, seek_fwd, vol_down, vol_up) = ctx.input(|i| {
@@ -36,21 +74,22 @@ impl NovaApp {
                 plain && i.key_pressed(egui::Key::Num0),
             )
         });
-        // SMPlayer's TimeSlider press model, for the ←/→ hotkeys: the first
-        // press freezes the counter at the current position, every press in
-        // the run only moves the target (never the stream), and the stream
-        // is set to it once when the key lifts. A run that ends where it
-        // started seeks nowhere, so holding the key does not thrash the
-        // stream.
+        // SMPlayer's TimeSlider press model, for the ←/→ hotkeys: one
+        // press-and-release cycle steps the counter one 5 s jump, and the
+        // stream is set to the target exactly once — when the key lifts.
+        // Holding the key lets the OS key repeat feed further presses, so
+        // the counter keeps stepping until it reaches the wanted value; the
+        // frozen stream is left to a single seek on release instead of a
+        // thrashing run of them.
         if (seek_back || seek_fwd) && self.engine.state() != PlaybackState::Stopped {
             let position = self.engine.position().as_secs_f32();
-            if let Some((start, _)) = self.hotkey_seek {
-                // A later press in the run: re-aim the target from the
-                // frozen start so the steps accumulate cleanly.
-                self.hotkey_seek = Some((start, step_seek(start, seek_fwd)));
+            if let Some((_, target)) = self.hotkey_seek {
+                // The key repeat of the same run: step on from the pending
+                // target, so each press adds one jump.
+                self.hotkey_seek = Some((position, step_seek(target, seek_fwd)));
             } else {
-                // The first press of the run: freeze the counter and set
-                // the target one step away from where playback actually is.
+                // The first press of the run: freeze the counter at where
+                // playback actually is and set the target one step away.
                 self.hotkey_seek = Some((position, step_seek(position, seek_fwd)));
             }
         }
@@ -62,7 +101,7 @@ impl NovaApp {
         if key_lifted {
             if let Some((start, end)) = self.hotkey_seek.take() {
                 // `slider_has_moved`: only seek if the target actually moved.
-                if end != start {
+                if (end - start).abs() > f32::EPSILON {
                     actions.push(Action::Seek(end));
                 }
             }
@@ -110,12 +149,14 @@ impl NovaApp {
         // library once a clip has finished and nothing is queued behind it.
         // Esc backs out of full screen first; only from a normal or maximised
         // window does it stop the video.
-        if escape {
+        if escape && !(shift && m_key) {
             if self.window_mode == WindowMode::Fullscreen {
                 self.set_window_mode(ctx, WindowMode::Normal);
             } else if self.video_showing() {
                 self.engine.stop();
             }
+        } else if escape && shift && m_key {
+            // Shift+M was pressed to add a gut mark; don't trigger escape behavior
         }
         // F: normal → full screen → maximised → normal, for as long as a video
         // is up. If the video ended while the window was still full screen,
@@ -215,7 +256,7 @@ impl NovaApp {
                         Ok(Err(err)) => self.toast(err.to_string()),
                         Err(_) => {
                             // rodio may panic on seek (e.g. underflow in
-                            // SamplesBuffer::try_seek).  Reset the transport
+                            // SamplesBuffer::try_seek). Reset the transport
                             // so the UI stays consistent.
                             self.engine.stop();
                             self.toast("Seek failed — reset to start".to_string());

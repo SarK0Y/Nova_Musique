@@ -140,10 +140,6 @@ impl NovaApp {
                     .desired_width(300.0)
                     .hint_text("/home/you/Music"),
             );
-            // Enter does what the Scan button does, so a typed path needs no
-            // mouse. A one-line field drops focus on Enter, so `has_focus` is
-            // already false by the time the frame closes; `lost_focus` plus the
-            // key is how egui itself spells this.
             let entered =
                 folder_field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             if entered || ui.button("Scan").clicked() {
@@ -167,10 +163,6 @@ impl NovaApp {
                     .desired_width(220.0)
                     .hint_text("title, artist, album"),
             );
-            // Enter reports how many tracks the filter kept, the same way the
-            // Folder field's Enter commits: a one-line field drops focus on
-            // Enter, so `lost_focus` is where the key is still visible. An
-            // empty box never searched anything, so it has nothing to report.
             let searched =
                 search_field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             if searched && !self.search.trim().is_empty() {
@@ -180,8 +172,6 @@ impl NovaApp {
             if ui.button("✕").on_hover_text("Clear search").clicked() {
                 self.search.clear();
             }
-            // Mirror the box into the faav cell so any crate depending on
-            // nova-faav sees the filter; the field itself lives in this binary.
             nova_faav::search(Some(self.search.clone()));
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -218,7 +208,6 @@ impl NovaApp {
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            // Cover thumbnail.
             cover_thumb(ui, track.and_then(|t| self.covers.get(t.id)), 72.0);
 
             ui.vertical(|ui| {
@@ -281,20 +270,27 @@ impl NovaApp {
 
                 let seconds_total = total.map(|d| d.as_secs_f32()).unwrap_or(0.0).max(0.001);
                 let playback = position.as_secs_f32().min(seconds_total);
+
+                // While the ←/→ hotkey gesture is active, show its pending
+                // target immediately. Playback itself stays at `playback`
+                // until input.rs commits one seek on key release.
+                let displayed_position = self
+                    .hotkey_seek
+                    .map(|(_, target)| target)
+                    .unwrap_or(playback)
+                    .clamp(0.0, seconds_total);
+
                 ui.horizontal(|ui| {
-                    // SMPlayer's TimeSlider: grabbing the handle freezes the
-                    // clock (the file keeps playing so the stream stays in
-                    // sync), and the seek goes out once on release only if
-                    // the drag moved it.
                     let before = self
                         .seek_drag
                         .map(|(_, current)| current)
-                        .unwrap_or(playback);
+                        .unwrap_or(displayed_position);
                     ui.label(
                         RichText::new(format_clock(Duration::from_secs_f32(before)))
                             .size(12.0)
                             .weak(),
                     );
+
                     let mut seconds_position = before;
                     let slider = egui::Slider::new(&mut seconds_position, 0.0..=seconds_total)
                         .show_value(false);
