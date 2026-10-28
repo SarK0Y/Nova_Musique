@@ -54,6 +54,7 @@ mod library;
 mod nfm;
 mod playlist;
 mod remote;
+mod sub_timeline;
 #[cfg(test)]
 mod tests;
 mod text;
@@ -69,6 +70,7 @@ use self::library::*;
 use self::nfm::*;
 use self::playlist::*;
 use self::remote::*;
+use self::sub_timeline::*;
 use self::text::*;
 use self::types::*;
 use self::video::*;
@@ -112,6 +114,15 @@ pub struct NovaApp {
     /// When the in-memory volume reaches config.json; `None` when nothing
     /// is pending. A drag writes once it settles, not on every frame.
     volume_save: Option<Instant>,
+    /// The active `.ctrl` sub-timeline of the file under playback, if one
+    /// sits beside it. `Some` when the engine loads a file that has a
+    /// `.ctrl`, `None` otherwise.
+    active_ctrl: Option<Ctrl>,
+    /// The media path `active_ctrl` governs, so a track switch drops a
+    /// stale sub-timeline.
+    active_ctrl_for: Option<PathBuf>,
+    /// Ctrl is only active when explicitly enabled (Shift+Esc toggles).
+    ctrl_enabled: bool,
     /// Whether the track-info panel is shown.
     info_open: bool,
     /// Last track the user explicitly played; the info panel falls back to it
@@ -289,6 +300,9 @@ impl NovaApp {
             seek_drag: None,
             volume_step: None,
             volume_save: None,
+            active_ctrl: None,
+            active_ctrl_for: None,
+            ctrl_enabled: false,
             info_open: false,
             selected: None,
             hidden,
@@ -376,6 +390,7 @@ impl NovaApp {
         if let Some(error) = self.engine.take_error() {
             self.toast(error);
         }
+        self.tick_ctrl();
     }
 }
 
