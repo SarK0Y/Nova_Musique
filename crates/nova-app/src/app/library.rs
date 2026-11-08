@@ -41,47 +41,64 @@ pub(super) fn save_hidden(hidden: &HashSet<TrackId>) {
     }
 }
 
-impl NovaApp {
-    /// Locates a track in the library by file path (exact first, then
-    /// canonicalised so symlinks and redundant components still match).
-    pub(super) fn find_track_by_path(&self, path: &Path) -> Option<TrackId> {
-        if let Some(track) = self.library.tracks().iter().find(|t| t.path == path) {
-            return Some(track.id);
+/// Locates a track in `library` by file path (exact first, then
+/// canonicalised so symlinks and redundant components still match).
+pub(super) fn find_track_in(library: &Library, path: &Path) -> Option<TrackId> {
+    if let Some(track) = library.tracks().iter().find(|t| t.path == path) {
+        return Some(track.id);
+    }
+    let target = std::fs::canonicalize(path).ok()?;
+    library.tracks().iter().find_map(|track| {
+        let candidate = std::fs::canonicalize(&track.path).ok()?;
+        (candidate == target).then_some(track.id)
+    })
+}
+
+/// Reads tags for files `library` has not seen yet and adds them, so a drop,
+/// an add or a playlist works without rescanning the folder. Returns one
+/// message per file that could not be read; it never touches the screen, so
+/// the startup load can call it from its own thread.
+pub(super) fn import_missing_into(library: &mut Library, files: &[PathBuf]) -> Vec<String> {
+    let missing: Vec<PathBuf> = files
+        .iter()
+        .filter(|path| find_track_in(library, path).is_none())
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    let mut tracks = library.tracks().to_vec();
+    let mut errors = Vec::new();
+    let mut added = 0usize;
+    for path in &missing {
+        match metadata::read_track(path) {
+            Ok(track) => {
+                if !tracks.iter().any(|known| known.path == track.path) {
+                    tracks.push(track);
+                    added += 1;
+                }
+            }
+            Err(err) => errors.push(format!("Could not read {}: {err}", path.display())),
         }
-        let target = std::fs::canonicalize(path).ok()?;
-        self.library.tracks().iter().find_map(|track| {
-            let candidate = std::fs::canonicalize(&track.path).ok()?;
-            (candidate == target).then_some(track.id)
-        })
+    }
+    if added > 0 {
+        let root = library.root().map(Path::to_path_buf);
+        *library = Library::from_tracks(root, tracks);
+    }
+    errors
+}
+
+impl NovaApp {
+    /// Locates a track in the library by file path.
+    pub(super) fn find_track_by_path(&self, path: &Path) -> Option<TrackId> {
+        find_track_in(&self.library, path)
     }
 
     /// Reads tags for files the library has not seen yet and adds them, so a
     /// drop or an add works without rescanning the folder.
     pub(super) fn import_missing(&mut self, files: &[PathBuf]) {
-        let missing: Vec<PathBuf> = files
-            .iter()
-            .filter(|path| self.find_track_by_path(path).is_none())
-            .cloned()
-            .collect();
-        if missing.is_empty() {
-            return;
-        }
-        let mut tracks = self.library.tracks().to_vec();
-        let mut added = 0usize;
-        for path in &missing {
-            match metadata::read_track(path) {
-                Ok(track) => {
-                    if !tracks.iter().any(|known| known.path == track.path) {
-                        tracks.push(track);
-                        added += 1;
-                    }
-                }
-                Err(err) => self.toast(format!("Could not read {}: {err}", path.display())),
-            }
-        }
-        if added > 0 {
-            let root = self.library.root().map(Path::to_path_buf);
-            self.library = Library::from_tracks(root, tracks);
+        for message in import_missing_into(&mut self.library, files) {
+            self.toast(message);
         }
     }
 

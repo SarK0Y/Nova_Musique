@@ -58,6 +58,22 @@ pub(super) enum ScanMsg {
     Failed(String),
 }
 
+/// What the startup thread finished: the library cache and the current
+/// playlist, both read off the UI thread so the window comes up at once.
+pub(super) enum InitMsg {
+    Ready(Box<InitResult>),
+}
+
+/// The cached library plus the configured current playlist, ready to be
+/// applied on the UI thread.
+#[derive(Default)]
+pub(super) struct InitResult {
+    pub(super) library: Library,
+    /// The current playlist's path and how it resolved; `None` inside the
+    /// pair means the file exists but could not be read.
+    pub(super) playlist: Option<(PathBuf, Option<PlaylistLoad>)>,
+}
+
 /// Messages sent by the "To NFM" conversion threads. One per file, so the
 /// window can show progress and count the failures, plus one per file as it
 /// starts, so it can show what is running now.

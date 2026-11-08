@@ -773,6 +773,30 @@ The test suite needs no audio hardware and no external tools:
 ```sh
 cargo test --workspace
 ```
+### `.ctrl` sub-timeline
+
+Place a JSON file beside the media file, named after its **full filename including extension** with `.ctrl` appended (e.g. `clip.mp4` → `clip.mp4.ctrl`):
+
+```json
+{
+  "jo": [0, 120],
+  "gut": [60, 300],
+  "repeat": true
+}
+```
+
+- `jo`(jump over) — start points of fragments.
+- `gut` (go up to) — end points; when playback reaches a `gut` Nova jumps to the next `jo` and plays up to the nearest `gut` again.
+- `repeat` — if `true`, after the last `gut` it loops back to the first `jo` endlessly; otherwise, it stops at the last `gut`.
+
+**Hotkeys (while playing):**
+
+| Shortcut | Action |
+| --- | --- |
+| <kbd>M</kbd> | Add a `jo` mark at current position (creates/updates `*.ctrl` beside the file) |
+| <kbd>Shift</kbd>+<kbd>M</kbd> | Add a `gut` mark at current position |
+| <kbd>Shift</kbd>+<kbd>R</kbd> | Toggle `repeat` |
+| <kbd>Shift</kbd>+<kbd>Esc</kbd> | Unload / reload the `.ctrl` for the current track |
 
 ## Roadmap
 
@@ -791,29 +815,3 @@ Deliberately out of scope for this first pass — the natural next steps:
 
 ## my the Best Wishes to You, Dear User 🙃
 
-### `.ctrl` sub-timeline
-
-Place a JSON file beside the media file, named after its **full filename including extension** with `.ctrl` appended (e.g. `clip.mp4` → `clip.mp4.ctrl`):
-
-```json
-{
-  "jo": [0, 120],
-  "gut": [60, 300],
-  "repeat": true
-}
-```
-
-- `jo` — start points of fragments.
-- `gut` — end points; when playback reaches a `gut` Nova jumps to the next `jo` and plays up to the nearest `gut` again.
-- `repeat` — if `true`, after the last `gut` it loops back to the first `jo` endlessly; if `false`, it stops at the last `gut`.
-
-**Hotkeys (while playing):**
-
-| Shortcut | Action |
-| --- | --- |
-| <kbd>M</kbd> | Add a `jo` mark at current position (creates/updates `*.ctrl` beside the file) |
-| <kbd>Shift</kbd>+<kbd>M</kbd> | Add a `gut` mark at current position |
-| <kbd>Shift</kbd>+<kbd>R</kbd> | Toggle `repeat` |
-| <kbd>Shift</kbd>+<kbd>Esc</kbd> | Unload / reload the `.ctrl` for the current track |
-
-See `examples/ctrl.example` for a commented example.
