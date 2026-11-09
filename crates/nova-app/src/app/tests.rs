@@ -132,7 +132,7 @@ fn the_ctrl_file_governs_its_media_file() {
     // At the first `gut`: jump to the next `jo`.
     assert_eq!(ctrl.advance(60.0), Some(120.0));
     // Inside the second fragment: the cursor runs on to the last `gut`.
-    assert_eq!(ctrl.advance(200.0), Some(120.0));
+    assert_eq!(ctrl.advance(200.0), None);
     // At the last `gut` with no `repeat`: the fragment is over — the
     // target wraps to the first `jo`, and it is `tick_ctrl` that turns
     // that into a stop instead of a loop.

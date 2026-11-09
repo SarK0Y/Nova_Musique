@@ -370,6 +370,90 @@ fn fallback_title(path: &Path) -> String {
         .unwrap_or_else(|| "Unknown Title".to_string())
 }
 
+/// Build a minimal [`Track`] from a path without reading tags from the file.
+/// Used when metadata must not be loaded eagerly (e.g. at startup).
+pub fn track_from_path(path: &Path) -> Track {
+    if crate::video::is_video(path) {
+        return crate::video::read_video_track(path).unwrap_or_else(|_| Track {
+            id: track_id(path),
+            path: path.to_path_buf(),
+            title: fallback_title(path),
+            artist: String::new(),
+            album_artist: String::new(),
+            album: String::new(),
+            genre: None,
+            year: None,
+            track_no: None,
+            disc_no: None,
+            duration: None,
+            sample_rate: None,
+            channels: None,
+            has_cover: false,
+            video: None,
+        });
+    }
+
+    #[cfg(feature = "nofft")]
+    if is_codec(path) {
+        return Track {
+            id: track_id(path),
+            path: path.to_path_buf(),
+            title: fallback_title(path),
+            artist: String::new(),
+            album_artist: String::new(),
+            album: String::new(),
+            genre: None,
+            year: None,
+            track_no: None,
+            disc_no: None,
+            duration: None,
+            sample_rate: None,
+            channels: None,
+            has_cover: false,
+            video: None,
+        };
+    }
+
+    #[cfg(feature = "nofft")]
+    if is_nfm(path) {
+        return Track {
+            id: track_id(path),
+            path: path.to_path_buf(),
+            title: fallback_title(path),
+            artist: String::new(),
+            album_artist: String::new(),
+            album: String::new(),
+            genre: None,
+            year: None,
+            track_no: None,
+            disc_no: None,
+            duration: None,
+            sample_rate: None,
+            channels: None,
+            has_cover: false,
+            video: None,
+        };
+    }
+
+    Track {
+        id: track_id(path),
+        path: path.to_path_buf(),
+        title: fallback_title(path),
+        artist: String::new(),
+        album_artist: String::new(),
+        album: String::new(),
+        genre: None,
+        year: None,
+        track_no: None,
+        disc_no: None,
+        duration: None,
+        sample_rate: None,
+        channels: None,
+        has_cover: false,
+        video: None,
+    }
+}
+
 /// Extract a year from strings like `1999`, `1999-04-01` or `"1999/2000"`.
 fn parse_year(raw: &str) -> Option<u32> {
     let digits: String = raw

@@ -35,7 +35,7 @@ pub mod video;
 
 pub use error::{CoreError, Result};
 pub use library::{Library, ScanProgress, ScanReport};
-pub use metadata::CoverArt;
+pub use metadata::{track_from_path, CoverArt};
 pub use model::{track_id, Album, AlbumKey, Artist, Track, TrackId};
 pub use playback::{AudioBackend, NullBackend, PlaybackEngine, PlaybackState, StereoMode};
 pub use queue::{Queue, RepeatMode};

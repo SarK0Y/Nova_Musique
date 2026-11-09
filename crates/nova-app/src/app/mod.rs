@@ -95,6 +95,12 @@ pub struct NovaApp {
     pending_play: Option<PathBuf>,
     scan_rx: Option<Receiver<ScanMsg>>,
     scan_status: Option<String>,
+    /// The cached library and the current playlist, read on their own thread
+    /// at startup so a big index does not hold up the first frame.
+    init_rx: Option<Receiver<InitMsg>>,
+    /// Async metadata loading results.
+    meta_tx: Option<mpsc::Sender<MetaMsg>>,
+    meta_rx: Option<Receiver<MetaMsg>>,
     config: Config,
     toast: Option<(String, Instant)>,
     /// `Some((start, target))` while a ←/→ hotkey run is in progress: the
@@ -262,9 +268,42 @@ impl NovaApp {
         }
 
         let music_dir = requested_root.clone().or_else(|| config.music_dir.clone());
+        // The hidden list is tiny, so it stays on this thread; the library
+        // cache and the current playlist go to their own thread, because a
+        // big index must not hold up the first frame. `poll_init` applies
+        // them and runs the work that has to wait for them.
         let hidden = load_hidden();
-        let mut library = load_cached_library(music_dir.as_deref()).unwrap_or_default();
-        library.hide(&hidden);
+        let (init_tx, init_rx) = mpsc::channel();
+        let init_music_dir = music_dir.clone();
+        let init_hidden = hidden.clone();
+        let init_playlist = config.current_playlist.clone();
+        std::thread::spawn(move || {
+            let mut library = Library::default();
+            if let Some(root) = init_music_dir.as_deref() {
+                // Discover files without reading metadata
+                let mut tracks = Vec::new();
+                let walker = walkdir::WalkDir::new(root).follow_links(true).into_iter();
+                for entry in walker.flatten() {
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let path = entry.path();
+                    if nova_core357_11::metadata::is_supported(path) {
+                        tracks.push(nova_core357_11::track_from_path(path));
+                    }
+                }
+                library = Library::from_tracks(Some(root.to_path_buf()), tracks);
+            }
+            library.hide(&init_hidden);
+            let playlist = init_playlist.filter(|path| path.exists()).map(|path| {
+                let load = load_playlist_into(&mut library, &path).ok();
+                (path, load)
+            });
+            let _ = init_tx.send(InitMsg::Ready(Box::new(InitResult {
+                library,
+                playlist,
+            })));
+        });
         let mpv = Mpv::new(cc).map(Arc::new);
         let mut engine = PlaybackEngine::with_backend(Box::new(VideoBackend::new(mpv.clone())));
         engine.set_volume(config.volume);
@@ -282,7 +321,7 @@ impl NovaApp {
             .unwrap_or_default();
 
         let mut app = NovaApp {
-            library,
+            library: Library::default(),
             engine,
             covers: CoverCache::default(),
             view: View::Songs,
@@ -294,6 +333,9 @@ impl NovaApp {
             pending_play,
             scan_rx: None,
             scan_status: None,
+            init_rx: Some(init_rx),
+            meta_tx: None,
+            meta_rx: None,
             config,
             toast: None,
             hotkey_seek: None,
@@ -351,38 +393,144 @@ impl NovaApp {
             window_mode: WindowMode::Normal,
         };
 
+        // The current playlist and the requested file are replayed by
+        // `poll_init`, once the startup thread has handed the index over.
+        if requested_root.is_some() {
+            app.config.music_dir = app.music_dir.clone();
+            app.config.save();
+        }
+        app
+    }
+
+    /// Apply what the startup thread finished, then the work that had to
+    /// wait for it: playing a requested file, replaying the current
+    /// playlist and indexing a folder the cache does not know.
+    pub(super) fn poll_init(&mut self) {
+        let Some(rx) = self.init_rx.take() else {
+            return;
+        };
+        let mut ready = None;
+        let mut alive = true;
+        loop {
+            match rx.try_recv() {
+                Ok(InitMsg::Ready(payload)) => ready = Some(*payload),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    alive = false;
+                    break;
+                }
+            }
+        }
+        if ready.is_none() && alive {
+            self.init_rx = Some(rx); // still reading
+            return;
+        }
+        let result = ready.unwrap_or_default();
+
+        // A scan already run or under way owns a fresher index than the
+        // cache, so it wins; a thread that died just leaves the empty list.
+        if self.scan_rx.is_none() && self.library.is_empty() {
+            self.library = result.library;
+        }
+
         // If a file was requested and the cache already knows it, play right away.
-        if let Some(path) = app.pending_play.clone() {
-            if app.play_path(&path) {
-                app.pending_play = None;
-                app.view = View::Songs;
+        if let Some(path) = self.pending_play.clone() {
+            if self.play_path(&path) {
+                self.pending_play = None;
+                self.view = View::Songs;
             }
         }
 
         // The current playlist comes back on screen where last session left
         // it; a file that has since vanished just stays unloaded.
-        if let Some(path) = app.config.current_playlist.clone() {
-            if path.exists() {
-                app.open_playlist(&path);
+        if let Some((path, load)) = result.playlist {
+            match load {
+                Some(load) => self.apply_playlist(&path, load),
+                None => self.toast(format!("Load failed: {}", path.display())),
             }
-        }
-
-        if requested_root.is_some() {
-            app.config.music_dir = app.music_dir.clone();
-            app.config.save();
         }
 
         // Otherwise index the folder (first launch, or to reach the requested file).
-        if app.pending_play.is_some() || (app.library.is_empty() && app.music_dir.is_some()) {
-            if let Some(dir) = app.music_dir.clone() {
-                app.start_scan(dir);
+        if self.scan_rx.is_none()
+            && (self.pending_play.is_some() || (self.library.is_empty() && self.music_dir.is_some()))
+        {
+            if let Some(dir) = self.music_dir.clone() {
+                self.start_scan(dir);
             }
         }
-        app
     }
 
     fn toast(&mut self, message: impl Into<String>) {
         self.toast = Some((message.into(), Instant::now()));
+    }
+
+    /// Request async metadata loading for tracks not yet fully loaded.
+    /// Called when an item is selected/running/activated.
+    pub(super) fn request_metadata_load(&mut self, paths: &[PathBuf]) {
+        if self.meta_rx.is_none() {
+            let (tx, rx) = mpsc::channel();
+            self.meta_tx = Some(tx);
+            self.meta_rx = Some(rx);
+        }
+        let Some(tx) = self.meta_tx.clone() else {
+            return;
+        };
+        for path in paths {
+            let tx = tx.clone();
+            let path = path.clone();
+            std::thread::spawn(move || {
+                match metadata::read_track(&path) {
+                    Ok(track) => {
+                        let _ = tx.send(MetaMsg::Loaded(track));
+                    }
+                    Err(err) => {
+                        let _ = tx.send(MetaMsg::Failed(path, err.to_string()));
+                    }
+                }
+            });
+        }
+    }
+
+    pub(super) fn poll_meta(&mut self) {
+        let mut messages = Vec::new();
+        if let Some(rx) = &self.meta_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => messages.push(msg),
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+        if messages.is_empty() {
+            return;
+        }
+        let mut updated = false;
+        for msg in messages {
+            match msg {
+                MetaMsg::Loaded(track) => {
+                    // Update if track exists or add if missing
+                    let mut tracks = self.library.tracks().to_vec();
+                    let id = track.id;
+                    if let Some(existing) = tracks.iter_mut().find(|t| t.id == id) {
+                        *existing = track;
+                    } else if !tracks.iter().any(|t| t.path == track.path) {
+                        tracks.push(track);
+                    } else {
+                        continue;
+                    }
+                    let root = self.library.root().map(Path::to_path_buf);
+                    self.library = Library::from_tracks(root, tracks);
+                    updated = true;
+                }
+                MetaMsg::Failed(path, err) => {
+                    // Keep minimal track if it exists
+                    log::debug!("metadata load failed for {}: {}", path.display(), err);
+                }
+            }
+        }
+        if updated {
+            self.covers.clear();
+        }
     }
 
     fn tick_engine(&mut self) {
@@ -421,7 +569,9 @@ impl eframe::App for NovaApp {
             }
         }
 
+        self.poll_init();
         self.poll_scan(&ctx);
+        self.poll_meta();
         self.tick_engine();
 
         // SMPlayer writes its whole prefs file once at exit; Nova keeps the
@@ -527,6 +677,12 @@ impl eframe::App for NovaApp {
 
         if self.scan_rx.is_some() {
             ctx.request_repaint_after(Duration::from_millis(150));
+        }
+        if self.init_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+        if self.meta_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
         }
         if self.nfm_rx.is_some() {
             ctx.request_repaint_after(Duration::from_millis(150));

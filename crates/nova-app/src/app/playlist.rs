@@ -80,47 +80,87 @@ impl NovaApp {
             .into_owned();
         self.loaded_playlist = Some((name, Vec::new()));
     }
+}
 
+/// What a playlist file resolved to: the name to show, the track ids in
+/// file order, and how many entries stayed out of the library.
+pub(super) struct PlaylistLoad {
+    pub(super) name: String,
+    pub(super) ids: Vec<TrackId>,
+    pub(super) missing: usize,
+    /// One message per entry whose tags could not be read.
+    pub(super) errors: Vec<String>,
+}
+
+/// Reads `path` and resolves it against `library`: canonicalise the entries
+/// the same way a scan would, index files the library has never seen, and
+/// map each entry to a track id. It never touches the screen, so the
+/// startup load can run it from its own thread. `Err` carries the path when
+/// the file itself could not be read.
+pub(super) fn load_playlist_into(
+    library: &mut Library,
+    path: &Path,
+) -> Result<PlaylistLoad, PathBuf> {
+    let listed = read_playlist(path).map_err(|_| path.to_path_buf())?;
+    // The library hashed canonical paths at scan time, so resolve the
+    // same way a scan would — and read tags for files it never indexed:
+    // a playlist is a list of files, not of library entries.
+    let listed: Vec<PathBuf> = listed
+        .into_iter()
+        .map(|file| std::fs::canonicalize(&file).unwrap_or(file))
+        .collect();
+    let errors = import_missing_into(library, &listed);
+    let mut ids = Vec::with_capacity(listed.len());
+    let mut missing = 0usize;
+    for file in &listed {
+        match library.track(track_id(file)) {
+            Some(track) => ids.push(track.id),
+            None => missing += 1,
+        }
+    }
+    let name = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned();
+    Ok(PlaylistLoad {
+        name,
+        ids,
+        missing,
+        errors,
+    })
+}
+
+impl NovaApp {
     /// Show `path`'s tracks in place of the whole library and make it the
     /// current playlist. Shared by the Load menu and by startup, which
     /// replays the config's current playlist.
     pub(super) fn open_playlist(&mut self, path: &Path) {
-        let Ok(listed) = read_playlist(path) else {
-            self.toast(format!("Load failed: {}", path.display()));
-            return;
-        };
-        // The library hashed canonical paths at scan time, so resolve the
-        // same way a scan would — and read tags for files it never indexed:
-        // a playlist is a list of files, not of library entries.
-        let listed: Vec<PathBuf> = listed
-            .into_iter()
-            .map(|file| std::fs::canonicalize(&file).unwrap_or(file))
-            .collect();
-        self.import_missing(&listed);
-        let mut ids = Vec::with_capacity(listed.len());
-        let mut missing = 0usize;
-        for file in &listed {
-            match self.library.track(track_id(file)) {
-                Some(track) => ids.push(track.id),
-                None => missing += 1,
-            }
+        match load_playlist_into(&mut self.library, path) {
+            Ok(load) => self.apply_playlist(path, load),
+            Err(path) => self.toast(format!("Load failed: {}", path.display())),
         }
-        let name = path
-            .file_name()
-            .unwrap_or(path.as_os_str())
-            .to_string_lossy()
-            .into_owned();
-        let found = ids.len();
-        self.loaded_playlist = Some((name, ids));
-        // The loaded file becomes the one "as is" writes.
-        self.config.current_playlist = Some(path.to_path_buf());
-        self.remember_playlist(path);
-        let skipped = if missing > 0 {
-            format!(", {missing} not in the library")
+    }
+
+    /// Put an already-resolved playlist on screen: it replaces the list,
+    /// becomes the one `Save → as is` writes, and moves to the head of the
+    /// Load menu.
+    pub(super) fn apply_playlist(&mut self, path: &Path, load: PlaylistLoad) {
+        let found = load.ids.len();
+        let skipped = if load.missing > 0 {
+            format!(", {} not in the library", load.missing)
         } else {
             String::new()
         };
-        self.toast(format!("Loaded {found} track(s){skipped}"));
+        let mut message = format!("Loaded {found} track(s){skipped}");
+        if !load.errors.is_empty() {
+            message = format!("{}; {message}", load.errors.join("; "));
+        }
+        self.loaded_playlist = Some((load.name, load.ids));
+        // The loaded file becomes the one "as is" writes.
+        self.config.current_playlist = Some(path.to_path_buf());
+        self.remember_playlist(path);
+        self.toast(message);
     }
 
     /// The Save menu over the list as it is on screen: `as is` overwrites the
@@ -290,6 +330,7 @@ impl NovaApp {
         }
 
         self.import_missing(&files);
+        self.request_metadata_load(&files);
 
         let ids: Vec<TrackId> = files
             .iter()

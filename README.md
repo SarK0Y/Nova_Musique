@@ -785,9 +785,9 @@ Place a JSON file beside the media file, named after its **full filename includi
 }
 ```
 
-- `jo` — start points of fragments.
-- `gut` — end points; when playback reaches a `gut` Nova jumps to the next `jo` and plays up to the nearest `gut` again.
-- `repeat` — if `true`, after the last `gut` it loops back to the first `jo` endlessly; if `false`, it stops at the last `gut`.
+- `jo`(jump over) — start points of fragments.
+- `gut` (go up to) — end points; when playback reaches a `gut` Nova jumps to the next `jo` and plays up to the nearest `gut` again.
+- `repeat` — if `true`, after the last `gut` it loops back to the first `jo` endlessly; otherwise, it stops at the last `gut`.
 
 **Hotkeys (while playing):**
 

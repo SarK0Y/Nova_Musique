@@ -227,17 +227,34 @@ impl NovaApp {
                 Action::SelectPath(path) => self.select_path(PathBuf::from(path)),
                 Action::PlayList(ids, start) => {
                     self.selected = ids.get(start).copied();
+                    let paths: Vec<PathBuf> = ids
+                        .iter()
+                        .filter_map(|id| self.library.track(*id).map(|t| t.path.clone()))
+                        .collect();
+                    if !paths.is_empty() {
+                        self.request_metadata_load(&paths);
+                    }
                     if let Err(err) = self.engine.set_queue(&self.library, ids, start) {
                         self.toast(err.to_string());
                     }
                 }
                 Action::PlayQueueIndex(index) => {
                     self.selected = self.engine.queue().items().get(index).copied();
+                    if let Some(id) = self.engine.queue().items().get(index).copied() {
+                        if let Some(path) = self.library.track(id).map(|t| t.path.clone()) {
+                            self.request_metadata_load(&[path]);
+                        }
+                    }
                     if let Err(err) = self.engine.play_index(&self.library, index) {
                         self.toast(err.to_string());
                     }
                 }
-                Action::Enqueue(id) => self.engine.enqueue(id),
+                Action::Enqueue(id) => {
+                    if let Some(path) = self.library.track(id).map(|t| t.path.clone()) {
+                        self.request_metadata_load(&[path]);
+                    }
+                    self.engine.enqueue(id);
+                }
                 Action::RemoveFromQueue(id) => self.engine.queue_mut().remove(id),
                 Action::ClearQueue => {
                     self.engine.stop();

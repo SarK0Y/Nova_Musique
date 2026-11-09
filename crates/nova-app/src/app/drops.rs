@@ -165,6 +165,7 @@ impl NovaApp {
         }
 
         self.import_missing(&files);
+        self.request_metadata_load(&files);
 
         let ids: Vec<TrackId> = files
             .iter()
@@ -201,22 +202,19 @@ impl NovaApp {
         if !missing.is_empty() {
             let mut tracks = self.library.tracks().to_vec();
             for path in &missing {
-                match metadata::read_track(path) {
-                    Ok(track) => {
-                        if !tracks.iter().any(|known| known.path == track.path) {
-                            tracks.push(track);
-                            added += 1;
-                        }
-                    }
-                    Err(err) => {
-                        self.toast(format!("Could not read {}: {err}", path.display()));
-                    }
+                let track = nova_core357_11::track_from_path(path);
+                if !tracks.iter().any(|known| known.path == track.path) {
+                    tracks.push(track);
+                    added += 1;
                 }
             }
             if added > 0 {
                 let root = self.library.root().map(Path::to_path_buf);
                 self.library = Library::from_tracks(root, tracks);
             }
+            self.request_metadata_load(&missing);
+        } else {
+            self.request_metadata_load(&paths);
         }
 
         // Resolve in drop order, now that everything is indexed.
@@ -245,6 +243,7 @@ impl NovaApp {
         let Some(id) = self.find_track_by_path(path) else {
             return false;
         };
+        self.request_metadata_load(&[path.to_path_buf()]);
 
         let album_key = self.library.track(id).map(|track| track.album_key());
         let mut ids: Vec<TrackId> = album_key
