@@ -84,6 +84,7 @@ impl NovaApp {
 
 /// What a playlist file resolved to: the name to show, the track ids in
 /// file order, and how many entries stayed out of the library.
+#[derive(Clone)]
 pub(super) struct PlaylistLoad {
     pub(super) name: String,
     pub(super) ids: Vec<TrackId>,

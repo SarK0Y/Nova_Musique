@@ -280,28 +280,68 @@ impl NovaApp {
         std::thread::spawn(move || {
             let mut library = Library::default();
             if let Some(root) = init_music_dir.as_deref() {
-                // Discover files without reading metadata
-                let mut tracks = Vec::new();
+                library = Library::from_tracks(Some(root.to_path_buf()), Vec::new());
+            }
+            library.hide(&init_hidden);
+
+            // 1stly, load active playlist
+            if let Some(ref playlist_path) = init_playlist {
+                if playlist_path.exists() {
+                    let load = load_playlist_into(&mut library, &playlist_path).clone();
+                    // Send newly added tracks from playlist
+                    if let Ok(ref load_res) = load {
+                        let mut new_tracks = Vec::new();
+                        for &id in &load_res.ids {
+                            if let Some(t) = library.track(id) {
+                                new_tracks.push(t.clone());
+                            }
+                        }
+                        if !new_tracks.is_empty() {
+                            let _ = init_tx.send(InitMsg::Tracks(new_tracks));
+                        }
+                    }
+                    let _ = init_tx.send(InitMsg::Playlist(
+                        playlist_path.clone(),
+                        load.ok(),
+                    ));
+                }
+            }
+
+            // Then discover other files incrementally
+            if let Some(root) = init_music_dir.as_deref() {
                 let walker = walkdir::WalkDir::new(root).follow_links(true).into_iter();
+                let mut batch = Vec::new();
                 for entry in walker.flatten() {
                     if !entry.file_type().is_file() {
                         continue;
                     }
                     let path = entry.path();
-                    if nova_core357_11::metadata::is_supported(path) {
-                        tracks.push(nova_core357_11::track_from_path(path));
+                    if !nova_core357_11::metadata::is_supported(path) {
+                        continue;
+                    }
+                    // Skip if already in library (e.g. from playlist)
+                    if find_track_in(&library, path).is_some() {
+                        continue;
+                    }
+                    let track = nova_core357_11::track_from_path(path);
+                    // Add to library
+                    let mut tracks = library.tracks().to_vec();
+                    tracks.push(track.clone());
+                    library = Library::from_tracks(Some(root.to_path_buf()), tracks);
+                    batch.push(track);
+                    if batch.len() >= 32 {
+                        let _ = init_tx.send(InitMsg::Tracks(batch.drain(..).collect()));
                     }
                 }
-                library = Library::from_tracks(Some(root.to_path_buf()), tracks);
+                if !batch.is_empty() {
+                    let _ = init_tx.send(InitMsg::Tracks(batch));
+                }
             }
-            library.hide(&init_hidden);
-            let playlist = init_playlist.filter(|path| path.exists()).map(|path| {
-                let load = load_playlist_into(&mut library, &path).ok();
-                (path, load)
-            });
+            let _ = init_tx.send(InitMsg::Done);
+            // Also send Ready for compatibility
             let _ = init_tx.send(InitMsg::Ready(Box::new(InitResult {
                 library,
-                playlist,
+                playlist: None,
             })));
         });
         let mpv = Mpv::new(cc).map(Arc::new);
@@ -411,9 +451,38 @@ impl NovaApp {
         };
         let mut ready = None;
         let mut alive = true;
+        let mut done = false;
         loop {
             match rx.try_recv() {
-                Ok(InitMsg::Ready(payload)) => ready = Some(*payload),
+                Ok(InitMsg::Tracks(tracks)) => {
+                    if self.scan_rx.is_none() {
+                        let mut current = self.library.tracks().to_vec();
+                        for t in tracks {
+                            if !current.iter().any(|existing| existing.id == t.id || existing.path == t.path) {
+                                current.push(t);
+                            }
+                        }
+                        let root = self
+                            .library
+                            .root()
+                            .map(|p| p.to_path_buf())
+                            .or_else(|| self.music_dir.clone());
+                        self.library = Library::from_tracks(root, current);
+                    }
+                }
+                Ok(InitMsg::Playlist(path, load)) => {
+                    match load {
+                        Some(load) => self.apply_playlist(&path, load),
+                        None => self.toast(format!("Load failed: {}", path.display())),
+                    }
+                }
+                Ok(InitMsg::Done) => {
+                    done = true;
+                }
+                Ok(InitMsg::Ready(payload)) => {
+                    ready = Some(*payload);
+                    done = true;
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     alive = false;
@@ -421,16 +490,22 @@ impl NovaApp {
                 }
             }
         }
-        if ready.is_none() && alive {
+        if !done && alive {
             self.init_rx = Some(rx); // still reading
             return;
         }
-        let result = ready.unwrap_or_default();
-
-        // A scan already run or under way owns a fresher index than the
-        // cache, so it wins; a thread that died just leaves the empty list.
-        if self.scan_rx.is_none() && self.library.is_empty() {
-            self.library = result.library;
+        if let Some(result) = ready {
+            // A scan already run or under way owns a fresher index than the
+            // cache, so it wins; a thread that died just leaves the empty list.
+            if self.scan_rx.is_none() && self.library.is_empty() {
+                self.library = result.library;
+            }
+            if let Some((path, load)) = result.playlist {
+                match load {
+                    Some(load) => self.apply_playlist(&path, load),
+                    None => self.toast(format!("Load failed: {}", path.display())),
+                }
+            }
         }
 
         // If a file was requested and the cache already knows it, play right away.
@@ -438,15 +513,6 @@ impl NovaApp {
             if self.play_path(&path) {
                 self.pending_play = None;
                 self.view = View::Songs;
-            }
-        }
-
-        // The current playlist comes back on screen where last session left
-        // it; a file that has since vanished just stays unloaded.
-        if let Some((path, load)) = result.playlist {
-            match load {
-                Some(load) => self.apply_playlist(&path, load),
-                None => self.toast(format!("Load failed: {}", path.display())),
             }
         }
 

@@ -61,6 +61,12 @@ pub(super) enum ScanMsg {
 /// What the startup thread finished: the library cache and the current
 /// playlist, both read off the UI thread so the window comes up at once.
 pub(super) enum InitMsg {
+    /// Add tracks incrementally as they're discovered
+    Tracks(Vec<Track>),
+    /// Set/update the playlist (path, resolved load or None if failed)
+    Playlist(PathBuf, Option<PlaylistLoad>),
+    /// Done discovering
+    Done,
     Ready(Box<InitResult>),
 }
 
