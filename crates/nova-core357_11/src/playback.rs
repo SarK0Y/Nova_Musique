@@ -964,7 +964,10 @@ impl PlaybackEngine {
     pub fn is_paused(&self) -> bool {
         self.backend.is_paused()
     }
-
+    /// Whether the current track has finished.
+    pub fn is_finished(&self) -> bool {
+        self.backend.is_finished()
+    }
     /// Drives the state machine. Call once per UI frame (or per poll interval).
     ///
     /// Returns the id of the track playback moved on to, if any.

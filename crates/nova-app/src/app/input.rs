@@ -136,7 +136,13 @@ impl NovaApp {
         // plain switch to fix, and this reloads the track just switched to.
         if pgup || pgdn {
             self.switch_presses = self.switch_presses.saturating_add(1);
-            if self.switch_presses >= 8 {
+            log::warn!("{}", format!(
+            	"switch_presses: {}, stream ended {}, stream paused: {}", self.switch_presses, self.engine.is_finished (), self.engine.is_paused ()
+            	));
+            if self.switch_presses >= 8 || (self.engine.is_finished () &&
+               self.engine.duration (&self.library).unwrap_or(Duration::ZERO) > self.engine.position () ) || 
+               (self.engine.is_paused () &&
+               self.engine.duration (&self.library).unwrap_or(Duration::ZERO) == self.engine.position () ){
                 self.switch_presses = 0;
                 self.reload_playback();
             }
@@ -164,7 +170,11 @@ impl NovaApp {
         if escape && !(shift && m_key) {
             if self.window_mode == WindowMode::Fullscreen {
                 self.set_window_mode(ctx, WindowMode::Normal);
+             }
+		else if self.switch_presses >= 8 {
+      		self.reload_playback();
             } else if self.video_showing() {
+            	self.engine.pause();
                 self.engine.stop();
             }
         } else if escape && shift && m_key {
