@@ -30,8 +30,10 @@ impl NovaApp {
                     i.key_pressed(egui::Key::Delete),
                     i.key_pressed(egui::Key::Escape),
                     i.key_pressed(egui::Key::F) && !i.modifiers.command && !i.modifiers.alt,
-                    i.key_pressed(egui::Key::PageUp),
-                    i.key_pressed(egui::Key::PageDown),
+                    // Fired on release so holding the key (OS key repeat)
+                    // steps one track per press, not one per repeat tick.
+                    i.key_released(egui::Key::PageUp),
+                    i.key_released(egui::Key::PageDown),
                     i.key_pressed(egui::Key::C),
                     i.modifiers.shift,
                     i.modifiers.command,
@@ -129,6 +131,16 @@ impl NovaApp {
         if prev || pgup {
             self.engine.previous(&self.library);
         }
+        // Every 8th PgUp/PgDn press (shared counter) rebuilds the playback
+        // machinery outright: a file wedged at its end leaves nothing for a
+        // plain switch to fix, and this reloads the track just switched to.
+        if pgup || pgdn {
+            self.switch_presses = self.switch_presses.saturating_add(1);
+            if self.switch_presses >= 8 {
+                self.switch_presses = 0;
+                self.reload_playback();
+            }
+        }
         // Shift-C puts the window away with playback carrying on; C pauses
         // first, so the music stops right there too.
         //let (shift, c) = Self::c_key(c, shift, command, alt);
@@ -167,6 +179,29 @@ impl NovaApp {
             } else if self.window_mode == WindowMode::Fullscreen {
                 self.set_window_mode(ctx, WindowMode::Normal);
             }
+        }
+    }
+
+    /// The 8-press sledgehammer for a track wedged at its end: stop, rebuild
+    /// the engine and both of its backends (a fresh rodio sink; the same
+    /// libmpv core, reset by `stop` plus a fresh `loadfile`), and replay the
+    /// current queue entry from the start.
+    ///
+    /// shortcut: libmpv itself is not recreated — that needs eframe's
+    /// creation context — so a core wedged inside itself would need an app
+    /// restart, when to upgrade.
+    pub(super) fn reload_playback(&mut self) {
+        let Some(index) = self.engine.queue().current_item_index() else {
+            return;
+        };
+        // The fresh engine starts with an empty queue: carry the old one
+        // over, entry index included, or the switch just made is lost.
+        let items = self.engine.queue().items().to_vec();
+        self.engine.stop();
+        self.engine = PlaybackEngine::with_backend(Box::new(VideoBackend::new(self.mpv.clone())));
+        self.engine.set_volume(self.config.volume);
+        if let Err(err) = self.engine.set_queue(&self.library, items, index) {
+            self.toast(err.to_string());
         }
     }
 

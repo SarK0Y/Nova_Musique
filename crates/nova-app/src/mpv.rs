@@ -193,6 +193,7 @@ extern "C" {
         format: c_int,
         data: *mut c_void,
     ) -> c_int;
+    fn mpv_free(data: *mut c_void);
     fn mpv_free_node_contents(node: *mut MpvNode);
     fn mpv_error_string(code: c_int) -> *const c_char;
     fn mpv_render_context_create(
@@ -1160,6 +1161,20 @@ fn control_loop(handle: &SharedHandle, state: &Mutex<State>) {
                 FORMAT_FLAG,
                 &mut finished as *mut c_int as *mut c_void,
             );
+            // Which file mpv has actually reached. `path` flips to a pending
+            // `loadfile` target as soon as the core starts opening it, while
+            // the scalars above can still answer with the previous file.
+            let mut path: *mut c_char = std::ptr::null_mut();
+            let playing = if read("path", FORMAT_STRING, &mut path as *mut _ as *mut c_void) >= 0
+                && !path.is_null()
+            {
+                // Safe: mpv hands out a NUL-terminated string, ours to free.
+                let owned = unsafe { CStr::from_ptr(path) }.to_string_lossy().into_owned();
+                unsafe { mpv_free(path as *mut c_void) };
+                Some(owned)
+            } else {
+                None
+            };
 
             // Track list is a node tree and mpv rebuilds the whole thing on
             // every read, so only ask when the file or the picked stream may have
@@ -1205,11 +1220,15 @@ fn control_loop(handle: &SharedHandle, state: &Mutex<State>) {
             state.volume = (volume / 100.0).clamp(0.0, 1.0) as f32;
             state.paused = paused != 0;
             // `eof-reached` alone is not enough: right after a `loadfile` mpv
-            // can still report the previous file's end for a poll or two, which
-            // made the engine skip past the track it had just started. Requiring
-            // the clock to be at the end too means a stale flag is ignored, and
-            // a real end is caught even while `keep-open` holds the file.
-            state.finished = (finished != 0 || position >= duration) && position > 0.0;
+            // can still report the previous file's end for a poll or two,
+            // which made the engine skip past the track it had just started.
+            state.finished = finished_now(
+                state.current_path.as_deref(),
+                playing.as_deref(),
+                finished != 0,
+                position,
+                duration,
+            );
             if refresh_tracks {
                 // Outside the lock: these walk mpv-owned trees.
                 state.video_tracks = read_video_tracks(handle.0);
@@ -1230,6 +1249,33 @@ fn control_loop(handle: &SharedHandle, state: &Mutex<State>) {
         next += Duration::from_millis(50);
         std::thread::sleep(next.saturating_duration_since(Instant::now()));
     }
+}
+
+/// Whether this poll's answer should count as "the file ended" for the
+/// engine's auto-advance.
+///
+/// `wanted` is the file the app last asked mpv to load, `playing` the one mpv
+/// reports playing. They differ while a `loadfile` is still in flight — mpv's
+/// `path` flips to the new file before it opens, but the end-of-file flags can
+/// keep describing the *previous* file through the whole load. Trusting those
+/// made the engine advance and re-load on every poll (each `loadfile replace`
+/// aborting the open in flight), walking the queue at the poll rate. A
+/// `duration` that failed to read (0.0) must not count as the end either: any
+/// position would then look past it.
+fn finished_now(
+    wanted: Option<&std::path::Path>,
+    playing: Option<&str>,
+    eof: bool,
+    position: f64,
+    duration: f64,
+) -> bool {
+    match (wanted, playing) {
+        (Some(w), Some(p)) if w == std::path::Path::new(p) => {}
+        // A load was asked for that mpv has not reached yet.
+        (Some(_), _) => return false,
+        (None, _) => {}
+    }
+    (eof || (duration > 0.0 && position >= duration)) && position > 0.0
 }
 
 /// `None` when the libmpv status code is not an error, otherwise a message.
@@ -1398,6 +1444,21 @@ impl AudioBackend for VideoBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finished_waits_for_the_requested_file() {
+        let wanted = std::path::Path::new("/queue/b.mkv");
+        // Stale poll while b.mkv is still opening: mpv answers with the
+        // previous file, ended, at its end.
+        assert!(!finished_now(Some(wanted), Some("/queue/a.mkv"), true, 120.0, 120.0));
+        // Nothing playing yet while the load is in flight.
+        assert!(!finished_now(Some(wanted), None, true, 120.0, 120.0));
+        // The wanted file really ended.
+        assert!(finished_now(Some(wanted), Some("/queue/b.mkv"), true, 120.0, 120.0));
+        // Position-based end needs a duration that actually read.
+        assert!(finished_now(Some(wanted), Some("/queue/b.mkv"), false, 120.0, 120.0));
+        assert!(!finished_now(Some(wanted), Some("/queue/b.mkv"), false, 120.0, 0.0));
+    }
 
     #[test]
     fn fit_fills_the_width_when_the_window_is_wide() {

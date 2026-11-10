@@ -890,6 +890,7 @@ impl PlaybackEngine {
 
     /// Stops playback and clears the transport state, keeping the queue.
     pub fn stop(&mut self) {
+    	self.backend.pause();
         self.backend.stop();
         self.state = PlaybackState::Stopped;
     }

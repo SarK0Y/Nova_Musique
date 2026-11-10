@@ -117,6 +117,10 @@ pub struct NovaApp {
     /// 200 ms drag timer), so a rapid run of presses settles instead of
     /// firing one step per key.
     volume_step: Option<Instant>,
+    /// PgUp/PgDn presses since the last playback-machinery reload. Both
+    /// keys share this counter: every 8th press rebuilds the engine, which
+    /// is the way out of a file wedged at its end.
+    switch_presses: u32,
     /// When the in-memory volume reaches config.json; `None` when nothing
     /// is pending. A drag writes once it settles, not on every frame.
     volume_save: Option<Instant>,
@@ -381,6 +385,7 @@ impl NovaApp {
             hotkey_seek: None,
             seek_drag: None,
             volume_step: None,
+            switch_presses: 0,
             volume_save: None,
             active_ctrl: None,
             active_ctrl_for: None,

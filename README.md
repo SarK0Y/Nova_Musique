@@ -582,7 +582,7 @@ on disk and nothing stays hidden.
 | <kbd>Space</kbd> | Play / pause |
 | <kbd>←</kbd> / <kbd>→</kbd> | Seek 5 s backward / forward (SMPlayer-style press/release) |
 | <kbd>9</kbd> / <kbd>0</kbd> | Volume down / up by 1 % |
-| <kbd>PgUp</kbd> / <kbd>PgDn</kbd> | Previous / next track |
+| <kbd>PgUp</kbd> / <kbd>PgDn</kbd> | Previous / next track (on release; every 8th press rebuilds the playback machinery) |
 | <kbd>C</kbd> | Minimise the video window |
 | <kbd>Shift</kbd>+<kbd>C</kbd> | Pause / swap (toggle pause) |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> | Previous track |
