@@ -48,7 +48,7 @@ mod browse;
 mod chrome;
 mod config;
 mod covers;
-mod drops;
+pub(crate) mod drops;
 mod input;
 mod library;
 mod nfm;
@@ -254,10 +254,12 @@ impl NovaApp {
 
         // An optional command-line target: a file, a folder, or a `file://` URL.
         // A folder is indexed and becomes the library folder; a file only
-        // plays, leaving the Folder setting as configured.
+        // plays, leaving the Folder setting as configured. `-proxy-run` and
+        // the player it names are not targets, so `parse_args` skips them.
         let mut pending_play = None;
         let mut requested_root = None;
-        if let Some(arg) = std::env::args_os().nth(1) {
+        let args: Vec<_> = std::env::args_os().skip(1).collect();
+        if let Some(arg) = crate::parse_args(&args).target {
             let target = parse_target(&arg.to_string_lossy());
             if target.is_file() {
                 pending_play = Some(target);

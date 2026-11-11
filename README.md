@@ -158,6 +158,9 @@ cargo run -p nova-app -- /path/to/music
 cargo run -p nova-app -- "/path/to/music/Album/10. What's It Gonna Be.mp3"
 cargo run -p nova-app -- "file:///path/to/music/Album/10. What's It Gonna Be.mp3"
 
+# Hand a file nova cannot play itself to an external player of your choice
+cargo run -p nova-app -- -proxy-run mpv /path/to/video/clip.xyz
+
 # Headless CLI
 cargo run -p nova-cli -- scan   /path/to/music
 cargo run -p nova-cli -- search /path/to/music "album name"

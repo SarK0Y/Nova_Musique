@@ -73,7 +73,7 @@ pub(super) fn expand_to_audio(paths: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
 /// Accepts either a plain filesystem path or a `file://` URL and turns it into
 /// a path. For URLs the authority component (`file://host/path`) is dropped and
 /// `%XX` escapes are decoded; plain paths are used verbatim.
-pub(super) fn parse_target(argument: &str) -> PathBuf {
+pub(crate) fn parse_target(argument: &str) -> PathBuf {
     let Some(rest) = argument.strip_prefix("file://") else {
         return PathBuf::from(argument);
     };
