@@ -220,7 +220,7 @@ impl NovaApp {
                         if self.play_path(&path) {
                             self.view = View::Songs;
                         } else {
-                            self.toast(format!("Not found in the library: {}", path.display()));
+                            self.play_files(vec![path]);
                         }
                     }
                 }

@@ -90,8 +90,8 @@ pub struct NovaApp {
     search: String,
     folder_input: String,
     music_dir: Option<PathBuf>,
-    /// Set when the app was launched pointing at a specific file, to be played
-    /// as soon as its folder has been indexed.
+    /// Set when the app was launched pointing at a specific file, played as
+    /// soon as startup indexing settles. Never touches the Folder setting.
     pending_play: Option<PathBuf>,
     scan_rx: Option<Receiver<ScanMsg>>,
     scan_status: Option<String>,
@@ -253,14 +253,14 @@ impl NovaApp {
         set_allow_video_movement(config.allow_video_movement);
 
         // An optional command-line target: a file, a folder, or a `file://` URL.
-        // Pointing at a file scans its folder and starts playing that track.
+        // A folder is indexed and becomes the library folder; a file only
+        // plays, leaving the Folder setting as configured.
         let mut pending_play = None;
         let mut requested_root = None;
         if let Some(arg) = std::env::args_os().nth(1) {
             let target = parse_target(&arg.to_string_lossy());
             if target.is_file() {
-                pending_play = Some(target.clone());
-                requested_root = target.parent().map(Path::to_path_buf);
+                pending_play = Some(target);
             } else if target.is_dir() {
                 requested_root = Some(target);
             } else {
@@ -513,18 +513,19 @@ impl NovaApp {
             }
         }
 
-        // If a file was requested and the cache already knows it, play right away.
-        if let Some(path) = self.pending_play.clone() {
+        // A file was requested on the command line: its album when the
+        // library knows it, the file alone — imported like a drop — when not.
+        // Either way the Folder setting is left as configured.
+        if let Some(path) = self.pending_play.take() {
             if self.play_path(&path) {
-                self.pending_play = None;
                 self.view = View::Songs;
+            } else {
+                self.play_files(vec![path]);
             }
         }
 
-        // Otherwise index the folder (first launch, or to reach the requested file).
-        if self.scan_rx.is_none()
-            && (self.pending_play.is_some() || (self.library.is_empty() && self.music_dir.is_some()))
-        {
+        // Index the folder on first launch.
+        if self.scan_rx.is_none() && self.library.is_empty() && self.music_dir.is_some() {
             if let Some(dir) = self.music_dir.clone() {
                 self.start_scan(dir);
             }

@@ -827,7 +827,7 @@ impl Mpv {
     pub fn stop(&self) {
         self.mutate(|state| {
             state.position = Duration::ZERO;
-            state.finished = true;
+            state.finished = false;
         });
         self.command(&["stop"]);
     }
