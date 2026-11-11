@@ -160,6 +160,8 @@ cargo run -p nova-app -- "file:///path/to/music/Album/10. What's It Gonna Be.mp3
 
 # Hand a file nova cannot play itself to an external player of your choice
 cargo run -p nova-app -- -proxy-run mpv /path/to/video/clip.xyz
+# The player may be several words, with the file last
+cargo run -p nova-app -- -proxy-run flatpak run info.smplayer.SMPlayer /path/to/video/clip.xyz
 
 # Headless CLI
 cargo run -p nova-cli -- scan   /path/to/music

@@ -11,28 +11,39 @@ use std::process::Stdio;
 /// `-proxy-run <player>`: `player` is run on files nova itself cannot play.
 const PROXY_RUN: &str = "-proxy-run";
 
-/// The command line, split for its two consumers: the player `-proxy-run`
-/// names, and the first target argument (a file or a folder) that is left
-/// once that flag and its player are skipped.
+/// The command line, split for its two consumers: the player command
+/// `-proxy-run` names (one word or several, like `flatpak run org.app`),
+/// and the target argument (a file or a folder) that is left once that
+/// flag and its command are skipped.
 pub(crate) struct CommandLine {
-    pub(crate) proxy_player: Option<OsString>,
+    pub(crate) proxy_player: Vec<OsString>,
     pub(crate) target: Option<OsString>,
 }
 
-/// Position-independent: `-proxy-run` and the argument after it never count
-/// as the target, whichever order they come in.
+/// The player command is every word after `-proxy-run`. The target is the
+/// first argument before the flag — or, when none is given, a final word
+/// after the flag that names an existing file:
+/// `nova -proxy-run flatpak run info.smplayer.SMPlayer clip.mkv`.
 pub(crate) fn parse_args(args: &[OsString]) -> CommandLine {
-    let mut proxy_player = None;
+    let mut proxy_player = Vec::new();
     let mut target = None;
     let mut player_next = false;
     for arg in args {
         if player_next {
-            proxy_player = Some(arg.clone());
-            player_next = false;
+            proxy_player.push(arg.clone());
         } else if *arg == PROXY_RUN {
             player_next = true;
         } else if target.is_none() {
             target = Some(arg.clone());
+        }
+    }
+    // shortcut: a player word that merely looks like a file would be eaten
+    // here — put the target before the flag when that matters.
+    if target.is_none() {
+        if let Some(last) = proxy_player.last() {
+            if std::path::Path::new(last).is_file() {
+                target = proxy_player.pop();
+            }
         }
     }
     CommandLine { proxy_player, target }
@@ -50,14 +61,20 @@ fn main() -> eframe::Result<()> {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let command_line = parse_args(&args);
 
-    // A file nova cannot play itself goes to the player `-proxy-run` named.
-    if let (Some(player), Some(target)) = (&command_line.proxy_player, &command_line.target) {
+    // A file nova cannot play itself goes to the player command `-proxy-run`
+    // named; the file is appended to its words.
+    if let Some(target) = &command_line.target {
         let path = app::drops::parse_target(&target.to_string_lossy());
-        if path.is_file() && !nova_core357_11::metadata::is_supported(&path) {
+        if !command_line.proxy_player.is_empty()
+            && path.is_file()
+            && !nova_core357_11::metadata::is_supported(&path)
+        {
+            let player = &command_line.proxy_player;
             // The player's stdio is closed off, so it cannot eat the stdin
             // pipe a script may be driving nova through. The dropped child
             // keeps running once this process exits.
-            match std::process::Command::new(player)
+            match std::process::Command::new(&player[0])
+                .args(&player[1..])
                 .arg(&path)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -66,11 +83,12 @@ fn main() -> eframe::Result<()> {
             {
                 Ok(_child) => return Ok(()),
                 Err(err) => {
-                    eprintln!(
-                        "nova: could not start {} for {}: {err}",
-                        player.to_string_lossy(),
-                        path.display()
-                    );
+                    let name = player
+                        .iter()
+                        .map(|word| word.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    eprintln!("nova: could not start {name} for {}: {err}", path.display());
                     std::process::exit(1);
                 }
             }
@@ -110,27 +128,57 @@ mod tests {
     }
 
     #[test]
-    fn the_flag_names_a_player_and_leaves_the_target_alone() {
+    fn the_flag_names_a_player_command_and_leaves_the_target_alone() {
         let odd = temp("clip.xyz").to_string_lossy().into_owned();
         let song = temp("song.mp3").to_string_lossy().into_owned();
+        let say = |list: Vec<String>| list.iter().map(OsString::from).collect::<Vec<_>>();
 
-        // The flag before or after the target makes no difference.
-        for list in [
-            vec!["-proxy-run", "mpv", odd.as_str()],
-            vec![odd.as_str(), "-proxy-run", "mpv"],
-        ] {
-            let parsed = parse_args(&args(&list));
-            assert_eq!(parsed.proxy_player, Some(OsString::from("mpv")));
-            assert_eq!(parsed.target, Some(OsString::from(odd.clone())));
-        }
+        // One word or several: the whole command after the flag is the
+        // player, and a trailing existing file is the target.
+        let parsed = parse_args(&args(&[
+            "-proxy-run",
+            "mpv",
+            odd.as_str(),
+        ]));
+        assert_eq!(parsed.proxy_player, vec![OsString::from("mpv")]);
+        assert_eq!(parsed.target, Some(OsString::from(odd.clone())));
 
-        // Without the flag every argument is a target, and a flag that names
-        // nobody leaves nothing special behind.
+        let parsed = parse_args(&args(&[
+            "-proxy-run",
+            "flatpak",
+            "run",
+            "info.smplayer.SMPlayer",
+            odd.as_str(),
+        ]));
+        assert_eq!(
+            parsed.proxy_player,
+            say(vec!["flatpak".into(), "run".into(), "info.smplayer.SMPlayer".into()])
+        );
+        assert_eq!(parsed.target, Some(OsString::from(odd.clone())));
+
+        // A target in front of the flag wins, whatever follows the flag.
+        let parsed = parse_args(&args(&[
+            odd.as_str(),
+            "-proxy-run",
+            "flatpak",
+            "run",
+            "info.smplayer.SMPlayer",
+        ]));
+        assert_eq!(parsed.target, Some(OsString::from(odd.clone())));
+        assert_eq!(parsed.proxy_player.len(), 3);
+
+        // A trailing word that is not a file stays part of the command.
+        let parsed = parse_args(&args(&["-proxy-run", "flatpak", "run", "info.smplayer.SMPlayer"]));
+        assert_eq!(parsed.proxy_player.len(), 3);
+        assert_eq!(parsed.target, None);
+
+        // Without the flag every argument is a target, and a flag that
+        // names nobody leaves nothing special behind.
         let parsed = parse_args(&args(&[song.as_str()]));
-        assert_eq!(parsed.proxy_player, None);
+        assert!(parsed.proxy_player.is_empty());
         assert_eq!(parsed.target, Some(OsString::from(song.clone())));
         let parsed = parse_args(&args(&["-proxy-run"]));
-        assert_eq!(parsed.proxy_player, None);
+        assert!(parsed.proxy_player.is_empty());
         assert_eq!(parsed.target, None);
     }
 }
