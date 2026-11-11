@@ -47,6 +47,11 @@ impl NovaApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
             }
         }
+        ctx.set_cursor_icon(if mode == WindowMode::Fullscreen {
+            egui::CursorIcon::None
+        } else {
+            egui::CursorIcon::Default
+        });
         self.window_mode = mode;
     }
 
