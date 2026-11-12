@@ -227,13 +227,15 @@ impl NovaApp {
 
         for (index, track) in tracks.iter().enumerate() {
             let playing = current == Some(track.id);
-            let response = ui.add_sized(
-                [ui.available_width(), ROW_HEIGHT],
-                egui::Button::selectable(
-                    index == cursor,
-                    RichText::new(track_row_text(track, playing)).size(14.0),
-                ),
-            );
+            let response = ui
+                .add_sized(
+                    [ui.available_width(), ROW_HEIGHT],
+                    egui::Button::selectable(
+                        index == cursor,
+                        RichText::new(track_row_text(track, playing)).size(14.0),
+                    ),
+                )
+                .on_hover_text(track.path.display().to_string());
 
             // Same rule as queue_view: follow the cursor only on the frames
             // the arrow keys move it, or the wheel scroll gets yanked back.
@@ -430,14 +432,16 @@ impl NovaApp {
                 let Some(track) = self.library.track(*id) else {
                     continue;
                 };
-                let response = ui.add_sized(
-                    [ui.available_width(), ROW_HEIGHT],
-                    egui::Button::selectable(
-                        index == cursor,
-                        RichText::new(track_row_text(track, current_index == Some(index)))
-                            .size(14.0),
-                    ),
-                );
+                let response = ui
+                    .add_sized(
+                        [ui.available_width(), ROW_HEIGHT],
+                        egui::Button::selectable(
+                            index == cursor,
+                            RichText::new(track_row_text(track, current_index == Some(index)))
+                                .size(14.0),
+                        ),
+                    )
+                    .on_hover_text(track.path.display().to_string());
                 // Follow the cursor only on the frames the arrow keys move
                 // it. Doing this whenever the row merely sits partly outside
                 // the view yanks the list back over any wheel or scrollbar
