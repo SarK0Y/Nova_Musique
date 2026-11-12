@@ -56,11 +56,21 @@ pub fn is_nfm(path: &Path) -> bool {
         .is_some_and(|ext| nova_codec::NFM_EXTENSIONS.contains(&ext.as_str()))
 }
 
+/// Whether `-chk-magic` is active.
+pub(crate) fn check_magic() -> bool {
+    CHECK_MAGIC.load(Ordering::Relaxed)
+}
+
 /// Whether a path looks like an audio file we can index.
 ///
 /// With `-chk-magic` the first bytes decide, so a renamed file still counts;
-/// `-allow-ext` extensions are always accepted.
+/// `-allow-ext` extensions are always accepted. Without the flag only the
+/// extension counts.
 pub fn is_supported(path: &Path) -> bool {
+    is_supported_with(path, check_magic())
+}
+
+fn is_supported_with(path: &Path, check_magic: bool) -> bool {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let ext = ext.to_ascii_lowercase();
         if EXTRA_EXTENSIONS
@@ -69,11 +79,11 @@ pub fn is_supported(path: &Path) -> bool {
         {
             return true;
         }
-        if !CHECK_MAGIC.load(Ordering::Relaxed) {
+        if !check_magic {
             return is_known_extension(&ext);
         }
     }
-    CHECK_MAGIC.load(Ordering::Relaxed) && magic_supported(path)
+    check_magic && magic_supported(path)
 }
 
 fn is_known_extension(ext: &str) -> bool {
@@ -90,25 +100,48 @@ fn is_known_extension(ext: &str) -> bool {
     false
 }
 
+/// Audio or NFM/codec extension, i.e. not a video container name.
+pub(crate) fn is_known_audio_extension(ext: &str) -> bool {
+    if AUDIO_EXTENSIONS.contains(&ext) {
+        return true;
+    }
+    #[cfg(feature = "nofft")]
+    if nova_codec::CODEC_EXTENSIONS.contains(&ext) || nova_codec::NFM_EXTENSIONS.contains(&ext) {
+        return true;
+    }
+    false
+}
+
 /// Sniffs the containers Nova and its decoders can read.
 fn magic_supported(path: &Path) -> bool {
+    magic_matches(path, magic_is_supported)
+}
+
+/// Whether a path's bytes are a video container, whatever its name says.
+pub(crate) fn magic_is_video(path: &Path) -> bool {
+    magic_matches(path, is_video_magic)
+}
+
+fn magic_matches(path: &Path, test: impl Fn(&[u8]) -> bool) -> bool {
     let mut head = [0u8; 512];
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
     let read = file.read(&mut head).unwrap_or(0);
-    magic_is_supported(&head[..read])
+    test(&head[..read])
 }
 
 fn magic_is_supported(head: &[u8]) -> bool {
+    is_audio_magic(head) || is_video_magic(head) || magic_is_codec(head)
+}
+
+fn is_audio_magic(head: &[u8]) -> bool {
     let matches = |magic: &[u8]| head.starts_with(magic);
     let bytes = |at: usize, magic: &[u8]| head.get(at..at + magic.len()) == Some(magic);
 
     matches(b"fLaC")
         || matches(b"OggS")
-        || bytes(4, b"ftyp")
-        || matches(b"\x1a\x45\xdf\xa3") // Matroska/WebM
-        || (matches(b"RIFF") && (bytes(8, b"WAVE") || bytes(8, b"AVI ")))
+        || (matches(b"RIFF") && bytes(8, b"WAVE"))
         || (matches(b"FORM") && (bytes(8, b"AIFF") || bytes(8, b"AIFC")))
         || matches(b"MAC ") // APE
         || matches(b"wvpk") // WavPack
@@ -117,13 +150,21 @@ fn magic_is_supported(head: &[u8]) -> bool {
         || matches(b"caff") // CAF
         || matches(b"ID3")
         || (head.len() >= 2 && head[0] == 0xff && head[1] & 0xe0 == 0xe0) // MP3/AAC
+}
+
+pub(crate) fn is_video_magic(head: &[u8]) -> bool {
+    let matches = |magic: &[u8]| head.starts_with(magic);
+    let bytes = |at: usize, magic: &[u8]| head.get(at..at + magic.len()) == Some(magic);
+
+    bytes(4, b"ftyp")
+        || matches(b"\x1a\x45\xdf\xa3") // Matroska/WebM
+        || (matches(b"RIFF") && bytes(8, b"AVI "))
         || matches(b"FLV\x01")
         || matches(b"\x30\x26\xb2\x75\x8e\x66\xcf\x11") // ASF/WMV
         || matches(b"\x00\x00\x01\xba") // MPEG-PS
         || matches(b"\x06\x0e\x2b\x34\x02\x05\x01\x01\x0d\x01\x02") // MXF
         || matches(b".RMF")
         || (head.len() >= 377 && head[0] == 0x47 && head[188] == 0x47 && head[376] == 0x47) // MPEG-TS
-        || magic_is_codec(head)
 }
 
 #[cfg(feature = "nofft")]
@@ -643,6 +684,24 @@ mod tests {
         assert!(magic_is_supported(b"ID3\x04\x00\x00"));
         assert!(magic_is_supported(b"\xff\xfb\x90\x64"));
         assert!(!magic_is_supported(b"hello world"));
+    }
+
+    #[test]
+    fn magic_is_only_used_with_the_check_magic_flag() {
+        let dir = std::env::temp_dir().join(format!("nova-magic-ext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let clip = dir.join("clip.mp44");
+        std::fs::write(&clip, b"\x1a\x45\xdf\xa3\x01\x00").expect("write clip");
+        assert!(is_supported_with(&clip, true));
+        assert!(!is_supported_with(&clip, false));
+
+        let notes = dir.join("notes.mp44");
+        std::fs::write(&notes, b"not media").expect("write notes");
+        assert!(!is_supported_with(&notes, true));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(feature = "nofft")]

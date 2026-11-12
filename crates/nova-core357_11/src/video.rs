@@ -21,11 +21,27 @@ pub const VIDEO_EXTENSIONS: &[&str] = &[
 ];
 
 /// Whether a path looks like a video file.
+///
+/// A known video extension wins; a known audio extension stays audio. With
+/// `-chk-magic` anything else is sniffed, so a renamed container still plays
+/// and indexes as video.
 pub fn is_video(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .is_some_and(|ext| VIDEO_EXTENSIONS.contains(&ext.as_str()))
+    is_video_with(path, crate::metadata::check_magic())
+}
+
+fn is_video_with(path: &Path, check_magic: bool) -> bool {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext = ext.to_ascii_lowercase();
+        if VIDEO_EXTENSIONS.contains(&ext.as_str()) {
+            return true;
+        }
+        if !check_magic || crate::metadata::is_known_audio_extension(&ext) {
+            return false;
+        }
+    } else if !check_magic {
+        return false;
+    }
+    crate::metadata::magic_is_video(path)
 }
 
 /// Run a tool with `args` and return stdout, or `None` if it could not run.
@@ -168,6 +184,24 @@ mod tests {
         assert!(is_video(Path::new("/a/clip.webm")));
         assert!(!is_video(Path::new("/a/song.flac")));
         assert!(!is_video(Path::new("/a/noextension")));
+    }
+
+    #[test]
+    fn a_renamed_container_is_a_video_only_with_check_magic() {
+        let dir = std::env::temp_dir().join(format!("nova-video-magic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let clip = dir.join("clip.mp44");
+        std::fs::write(&clip, b"\x1a\x45\xdf\xa3\x01\x00").expect("write clip");
+        assert!(is_video_with(&clip, true));
+        assert!(!is_video_with(&clip, false));
+
+        let song = dir.join("song.mp44");
+        std::fs::write(&song, b"fLaC\x00\x00\x00\x22").expect("write song");
+        assert!(!is_video_with(&song, true));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Generates a clip with ffmpeg; `None` when ffmpeg is not installed.
