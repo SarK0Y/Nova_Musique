@@ -1,6 +1,9 @@
 //! Reading audio metadata with [`lofty`].
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use lofty::file::{AudioFile, TaggedFileExt};
@@ -14,6 +17,23 @@ pub const AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "flac", "ogg", "oga", "opus", "wav", "wave", "m4a", "m4b", "mp4", "aac", "aiff", "aif",
     "aifc", "wv", "ape", "mpc", "mka", "mkv", "alac", "caf",
 ];
+
+/// `-chk-magic`: identify files by their first bytes instead of the extension.
+static CHECK_MAGIC: AtomicBool = AtomicBool::new(false);
+/// `-allow-ext`: extra extensions accepted on top of the built-in lists.
+static EXTRA_EXTENSIONS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Applies the command-line file-filter flags. Call once at startup.
+pub fn configure(check_magic: bool, extra_extensions: &[String]) {
+    CHECK_MAGIC.store(check_magic, Ordering::Relaxed);
+    let _ = EXTRA_EXTENSIONS.set(
+        extra_extensions
+            .iter()
+            .map(|ext| ext.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|ext| !ext.is_empty())
+            .collect(),
+    );
+}
 
 /// Whether a path looks like a file the vendored No_FFT codecs can decode.
 ///
@@ -37,23 +57,84 @@ pub fn is_nfm(path: &Path) -> bool {
 }
 
 /// Whether a path looks like an audio file we can index.
+///
+/// With `-chk-magic` the first bytes decide, so a renamed file still counts;
+/// `-allow-ext` extensions are always accepted.
 pub fn is_supported(path: &Path) -> bool {
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-        return false;
-    };
-    let ext = ext.to_ascii_lowercase();
-    if AUDIO_EXTENSIONS.contains(&ext.as_str()) {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext = ext.to_ascii_lowercase();
+        if EXTRA_EXTENSIONS
+            .get()
+            .is_some_and(|list| list.contains(&ext))
+        {
+            return true;
+        }
+        if !CHECK_MAGIC.load(Ordering::Relaxed) {
+            return is_known_extension(&ext);
+        }
+    }
+    CHECK_MAGIC.load(Ordering::Relaxed) && magic_supported(path)
+}
+
+fn is_known_extension(ext: &str) -> bool {
+    if AUDIO_EXTENSIONS.contains(&ext) {
         return true;
     }
-    if crate::video::VIDEO_EXTENSIONS.contains(&ext.as_str()) {
+    if crate::video::VIDEO_EXTENSIONS.contains(&ext) {
         return true;
     }
     #[cfg(feature = "nofft")]
-    if nova_codec::CODEC_EXTENSIONS.contains(&ext.as_str())
-        || nova_codec::NFM_EXTENSIONS.contains(&ext.as_str())
-    {
+    if nova_codec::CODEC_EXTENSIONS.contains(&ext) || nova_codec::NFM_EXTENSIONS.contains(&ext) {
         return true;
     }
+    false
+}
+
+/// Sniffs the containers Nova and its decoders can read.
+fn magic_supported(path: &Path) -> bool {
+    let mut head = [0u8; 512];
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let read = file.read(&mut head).unwrap_or(0);
+    magic_is_supported(&head[..read])
+}
+
+fn magic_is_supported(head: &[u8]) -> bool {
+    let matches = |magic: &[u8]| head.starts_with(magic);
+    let bytes = |at: usize, magic: &[u8]| head.get(at..at + magic.len()) == Some(magic);
+
+    matches(b"fLaC")
+        || matches(b"OggS")
+        || bytes(4, b"ftyp")
+        || matches(b"\x1a\x45\xdf\xa3") // Matroska/WebM
+        || (matches(b"RIFF") && (bytes(8, b"WAVE") || bytes(8, b"AVI ")))
+        || (matches(b"FORM") && (bytes(8, b"AIFF") || bytes(8, b"AIFC")))
+        || matches(b"MAC ") // APE
+        || matches(b"wvpk") // WavPack
+        || matches(b"MPCK")
+        || matches(b"MP+") // Musepack
+        || matches(b"caff") // CAF
+        || matches(b"ID3")
+        || (head.len() >= 2 && head[0] == 0xff && head[1] & 0xe0 == 0xe0) // MP3/AAC
+        || matches(b"FLV\x01")
+        || matches(b"\x30\x26\xb2\x75\x8e\x66\xcf\x11") // ASF/WMV
+        || matches(b"\x00\x00\x01\xba") // MPEG-PS
+        || matches(b"\x06\x0e\x2b\x34\x02\x05\x01\x01\x0d\x01\x02") // MXF
+        || matches(b".RMF")
+        || (head.len() >= 377 && head[0] == 0x47 && head[188] == 0x47 && head[376] == 0x47) // MPEG-TS
+        || magic_is_codec(head)
+}
+
+#[cfg(feature = "nofft")]
+fn magic_is_codec(head: &[u8]) -> bool {
+    head.starts_with(b"NOFF")
+        || (head.len() >= 4 && &head[..3] == b"NFA" && (b'1'..=b'6').contains(&head[3]))
+        || head.starts_with(b"nfm")
+}
+
+#[cfg(not(feature = "nofft"))]
+fn magic_is_codec(_head: &[u8]) -> bool {
     false
 }
 
@@ -550,6 +631,18 @@ mod tests {
         assert!(is_supported(Path::new("/a/b/track.flac")));
         assert!(!is_supported(Path::new("/a/b/cover.jpg")));
         assert!(!is_supported(Path::new("/a/b/README")));
+    }
+
+    #[test]
+    fn magic_detection_recognizes_the_indexed_containers() {
+        assert!(magic_is_supported(b"fLaC\x00\x00\x00\x22"));
+        assert!(magic_is_supported(b"OggS\x00\x02"));
+        assert!(magic_is_supported(b"\x00\x00\x00\x20ftypM4A "));
+        assert!(magic_is_supported(b"\x1a\x45\xdf\xa3\x01"));
+        assert!(magic_is_supported(b"RIFF\x10\x00\x00\x00WAVEfmt "));
+        assert!(magic_is_supported(b"ID3\x04\x00\x00"));
+        assert!(magic_is_supported(b"\xff\xfb\x90\x64"));
+        assert!(!magic_is_supported(b"hello world"));
     }
 
     #[cfg(feature = "nofft")]

@@ -10,28 +10,49 @@ use std::process::Stdio;
 
 /// `-proxy-run <player>`: `player` is run on files nova itself cannot play.
 const PROXY_RUN: &str = "-proxy-run";
+/// `-chk-magic`: accept files by content instead of extension.
+const CHECK_MAGIC: &str = "-chk-magic";
+/// `-allow-ext "a,b"`: extra extensions to accept.
+const ALLOW_EXT: &str = "-allow-ext";
 
 /// The command line, split for its two consumers: the player command
 /// `-proxy-run` names (one word or several, like `flatpak run org.app`),
-/// and the target argument (a file or a folder) that is left once that
-/// flag and its command are skipped.
+/// and the target argument (a file or a folder) that is left once the
+/// flags are skipped.
 pub(crate) struct CommandLine {
     pub(crate) proxy_player: Vec<OsString>,
     pub(crate) target: Option<OsString>,
+    pub(crate) check_magic: bool,
+    pub(crate) allow_ext: Vec<String>,
 }
 
 /// The player command is every word after `-proxy-run`. The target is the
-/// first argument before the flag — or, when none is given, a final word
-/// after the flag that names an existing file:
+/// first argument that is not a flag or `-allow-ext` value — or, when none
+/// is given, a final word after the flag that names an existing file:
 /// `nova -proxy-run flatpak run info.smplayer.SMPlayer clip.mkv`.
 pub(crate) fn parse_args(args: &[OsString]) -> CommandLine {
     let mut proxy_player = Vec::new();
     let mut target = None;
+    let mut check_magic = false;
+    let mut allow_ext = Vec::new();
     let mut player_next = false;
+    let mut ext_next = false;
     for arg in args {
-        if player_next {
+        if ext_next {
+            ext_next = false;
+            for ext in arg.to_string_lossy().split(',') {
+                let ext = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+                if !ext.is_empty() {
+                    allow_ext.push(ext);
+                }
+            }
+        } else if arg == CHECK_MAGIC {
+            check_magic = true;
+        } else if arg == ALLOW_EXT {
+            ext_next = true;
+        } else if player_next {
             proxy_player.push(arg.clone());
-        } else if *arg == PROXY_RUN {
+        } else if arg == PROXY_RUN {
             player_next = true;
         } else if target.is_none() {
             target = Some(arg.clone());
@@ -46,7 +67,12 @@ pub(crate) fn parse_args(args: &[OsString]) -> CommandLine {
             }
         }
     }
-    CommandLine { proxy_player, target }
+    CommandLine {
+        proxy_player,
+        target,
+        check_magic,
+        allow_ext,
+    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -60,6 +86,7 @@ fn main() -> eframe::Result<()> {
 
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let command_line = parse_args(&args);
+    nova_core357_11::metadata::configure(command_line.check_magic, &command_line.allow_ext);
 
     // A file nova cannot play itself goes to the player command `-proxy-run`
     // named; the file is appended to its words.
@@ -180,5 +207,19 @@ mod tests {
         let parsed = parse_args(&args(&["-proxy-run"]));
         assert!(parsed.proxy_player.is_empty());
         assert_eq!(parsed.target, None);
+    }
+
+    #[test]
+    fn filter_flags_are_not_mistaken_for_the_target() {
+        let song = temp("song.mp3").to_string_lossy().into_owned();
+        let parsed = parse_args(&args(&[
+            "-chk-magic",
+            "-allow-ext",
+            " .MP44, avi0 ,,",
+            song.as_str(),
+        ]));
+        assert!(parsed.check_magic);
+        assert_eq!(parsed.allow_ext, vec!["mp44", "avi0"]);
+        assert_eq!(parsed.target, Some(OsString::from(song)));
     }
 }

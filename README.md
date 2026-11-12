@@ -163,6 +163,11 @@ cargo run -p nova-app -- -proxy-run mpv /path/to/video/clip.xyz
 # The player may be several words, with the file last
 cargo run -p nova-app -- -proxy-run flatpak run info.smplayer.SMPlayer /path/to/video/clip.xyz
 
+# Accept files by their magic bytes instead of the extension, and/or add
+# extensions to the allow list (comma-separated, case-insensitive)
+cargo run -p nova-app -- -chk-magic /path/to/music
+cargo run -p nova-app -- -allow-ext "mp44,avi0" /path/to/music
+
 # Headless CLI
 cargo run -p nova-cli -- scan   /path/to/music
 cargo run -p nova-cli -- search /path/to/music "album name"
