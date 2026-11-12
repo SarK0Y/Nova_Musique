@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// The pointer stays visible until it has been still this long during full screen.
+const CURSOR_HIDE_DELAY: Duration = Duration::from_secs(3);
+
+/// Timestamp of the last pointer movement while the full-screen video was up.
+/// The application has one main viewport, so this UI-thread state is shared by
+/// its frames rather than persisted as a user setting.
+static FULLSCREEN_CURSOR_LAST_MOVED: std::sync::Mutex<Option<Instant>> =
+    std::sync::Mutex::new(None);
+
 /// How the main window is shown while a video plays: the three states that
 /// <kbd>F</kbd> cycles through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +56,12 @@ impl NovaApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
             }
         }
+        // Start a fresh three-second interval on entry, and never leave a
+        // hidden pointer behind when the user exits full screen.
+        *FULLSCREEN_CURSOR_LAST_MOVED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        ctx.set_cursor_icon(egui::CursorIcon::Default);
         self.window_mode = mode;
     }
 
@@ -60,6 +75,46 @@ impl NovaApp {
     /// window is in full screen, so every bar is hidden.
     pub(super) fn fullscreen_video(&self) -> bool {
         self.window_mode == WindowMode::Fullscreen && self.video_showing()
+    }
+
+    /// Keep the pointer visible while it moves, then hide it after three idle
+    /// seconds. Schedule a repaint for the deadline so this also works when a
+    /// full-screen video is paused and the UI would otherwise be idle.
+    fn update_fullscreen_cursor(&self, ctx: &egui::Context) {
+        let active = self.fullscreen_video();
+        let moved = ctx.input(|input| {
+            input
+                .raw
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::PointerMoved(_)))
+        });
+        let now = Instant::now();
+        let mut last_moved = FULLSCREEN_CURSOR_LAST_MOVED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let hidden = if !active {
+            *last_moved = None;
+            false
+        } else if moved {
+            *last_moved = Some(now);
+            false
+        } else {
+            let last = *last_moved.get_or_insert(now);
+            now.duration_since(last) >= CURSOR_HIDE_DELAY
+        };
+
+        ctx.set_cursor_icon(if hidden {
+            egui::CursorIcon::None
+        } else {
+            egui::CursorIcon::Default
+        });
+
+        if active && !hidden {
+            let last = last_moved.unwrap_or(now);
+            ctx.request_repaint_after(CURSOR_HIDE_DELAY.saturating_sub(now.duration_since(last)));
+        }
     }
 
     /// Whether the video surface should take over the content area.
@@ -144,6 +199,10 @@ impl NovaApp {
                 ui.colored_label(Color32::RED, "video could not be started");
             }
         }
+
+        // Do this last in the video UI so egui widgets cannot replace the
+        // pointer icon selected for full-screen playback.
+        self.update_fullscreen_cursor(ui.ctx());
     }
 
     /// Keeps the external video-stream picker in step with mpv.
