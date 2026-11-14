@@ -29,7 +29,10 @@ impl NovaApp {
                     i.key_pressed(egui::Key::I),
                     i.key_pressed(egui::Key::Delete),
                     i.key_pressed(egui::Key::Escape),
-                    i.key_pressed(egui::Key::F) && !i.modifiers.command && !i.modifiers.alt,
+                    i.key_pressed(egui::Key::F)
+                        && !i.modifiers.command
+                        && !i.modifiers.alt
+                        && !i.modifiers.shift,
                     // Fired on release so holding the key (OS key repeat)
                     // steps one track per press, not one per repeat tick.
                     i.key_released(egui::Key::PageUp),
@@ -56,6 +59,16 @@ impl NovaApp {
         }
         if r_key && shift {
             self.ctrl_toggle_repeat();
+        }
+        // Shift+F opens/closes the "Jump focus" window.
+        let jump = ctx.input(|i| {
+            i.modifiers.shift
+                && !i.modifiers.command
+                && !i.modifiers.alt
+                && i.key_pressed(egui::Key::F)
+        });
+        if jump {
+            self.jump_open = !self.jump_open;
         }
         if escape && shift && !m_key {
             self.ctrl_reload();

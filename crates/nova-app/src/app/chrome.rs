@@ -140,6 +140,10 @@ impl NovaApp {
                     .desired_width(300.0)
                     .hint_text("/home/you/Music"),
             );
+            if self.jump_focus == Some(JumpTarget::Folder) {
+                folder_field.request_focus();
+                self.jump_focus = None;
+            }
             let entered =
                 folder_field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             if entered || ui.button("Scan").clicked() {
@@ -163,6 +167,10 @@ impl NovaApp {
                     .desired_width(220.0)
                     .hint_text("title, artist, album"),
             );
+            if self.jump_focus == Some(JumpTarget::Search) {
+                search_field.request_focus();
+                self.jump_focus = None;
+            }
             let searched =
                 search_field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             if searched && !self.search.trim().is_empty() {

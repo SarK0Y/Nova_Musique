@@ -208,13 +208,17 @@ impl NovaApp {
         // Arrow keys walk the list, Enter plays whatever the cursor is on.
         // Enter stays with a focused text field so typing is not hijacked.
         let typing = ui.ctx().egui_wants_keyboard_input();
-        let (down, up, enter) = ui.ctx().input(|i| {
-            (
-                i.key_pressed(egui::Key::ArrowDown),
-                i.key_pressed(egui::Key::ArrowUp),
-                i.key_pressed(egui::Key::Enter) && !typing,
-            )
-        });
+        let (down, up, enter) = if self.jump_open {
+            (false, false, false)
+        } else {
+            ui.ctx().input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowDown),
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.key_pressed(egui::Key::Enter) && !typing,
+                )
+            })
+        };
         let last = tracks.len() - 1;
         let cursor = if down {
             (self.cursor.get() + 1).min(last)
@@ -406,13 +410,17 @@ impl NovaApp {
         let items: Vec<TrackId> = self.engine.queue().items().to_vec();
 
         let typing = ui.ctx().egui_wants_keyboard_input();
-        let (down, up, enter) = ui.ctx().input(|i| {
-            (
-                i.key_pressed(egui::Key::ArrowDown),
-                i.key_pressed(egui::Key::ArrowUp),
-                i.key_pressed(egui::Key::Enter) && !typing,
-            )
-        });
+        let (down, up, enter) = if self.jump_open {
+            (false, false, false)
+        } else {
+            ui.ctx().input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowDown),
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.key_pressed(egui::Key::Enter) && !typing,
+                )
+            })
+        };
         let last = items.len().saturating_sub(1);
         let cursor = if down {
             (self.cursor.get() + 1).min(last)

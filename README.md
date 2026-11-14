@@ -6,9 +6,8 @@ audio files, reads their tags and cover art, and plays them through a small
 queue with shuffle and repeat — in the spirit of [Apollo](https://github.com/ClassicOldSong/Apollo)
 but for music you already own on disk.
 
-> Status: **first pass**. The playback core and the GUI are working end to end
-> (scan → browse → play), on a deliberately small feature set. See
-> [Roadmap](#roadmap) for what is intentionally not there yet.
+> Made just for You, Dear User 🌞 <br>
+> Very good for integration w/ TAM (https://crates.io/crates/sark0y_tam_rst)
 
 ---
 
@@ -114,6 +113,7 @@ The app's code lives in `crates/nova-app/src/app/`, one module per concern:
 | `nfm`      | Songs → To NFM: the conversion window and its worker threads. |
 | `video`    | In-window video, the stream picker's commands, and `WindowMode` (<kbd>F</kbd>). |
 | `audio`    | The Audio window. |
+| `jump`     | The <kbd>Shift</kbd>+<kbd>F</kbd> "Jump focus" window. |
 | `covers`   | Cover-art texture cache. |
 | `remote`   | Commands read from stdin. |
 | `text`     | Clock / duration / format-label helpers. |
@@ -602,6 +602,7 @@ on disk and nothing stays hidden.
 | <kbd>Enter</kbd> | Play the track under the cursor |
 | <kbd>Del</kbd> | Queue view: remove from queue · Songs view: hide from library |
 | <kbd>F</kbd> | While a video is on screen: normal window → full screen → maximised window → normal window |
+| <kbd>Shift</kbd>+<kbd>F</kbd> | Open / close **Jump focus**: <kbd>↑</kbd>/<kbd>↓</kbd> or the wheel chooses a main-window element, <kbd>Enter</kbd> jumps to it |
 | <kbd>Esc</kbd> | Leave full screen; otherwise stop and return to the library while a video is on screen |
 
 #### Video window modes

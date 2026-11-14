@@ -15,6 +15,7 @@
 //! - [`chrome`] — The top bar and the bottom transport bar.
 //! - [`video`] — In-window video: showing it, sizing it, and the commands from the video-stream picker.
 //! - [`audio`] — The Audio window (SMPlayer's audio controls).
+//! - [`jump`] — The Shift+F "Jump focus" window for moving to a main-window element.
 //! - [`input`] — Keyboard shortcuts and applying the `Action`s collected during a frame.
 //! - `tests` — unit tests (compiled for `cargo test` only).
 
@@ -50,6 +51,7 @@ mod config;
 mod covers;
 pub(crate) mod drops;
 mod input;
+mod jump;
 mod library;
 mod nfm;
 mod playlist;
@@ -66,6 +68,7 @@ use self::config::*;
 use self::covers::*;
 use self::drops::*;
 use self::input::*;
+use self::jump::*;
 use self::library::*;
 use self::nfm::*;
 use self::playlist::*;
@@ -184,6 +187,11 @@ pub struct NovaApp {
     dbg_menu: std::cell::Cell<&'static str>,
     /// Floating playlist window, opened from the Nova menu in the top bar.
     playlist_open: bool,
+    /// "Jump focus" (Shift+F): whether the picker is up, the highlighted
+    /// entry, and the field that should take keyboard focus next frame.
+    jump_open: bool,
+    jump_selected: usize,
+    jump_focus: Option<JumpTarget>,
     /// External video window: picks which video stream mpv should show.
     video_open: bool,
     /// External Audio control window, opened from Nova → Audio.
@@ -413,6 +421,9 @@ impl NovaApp {
             nfm_rx: None,
             dbg_menu: std::cell::Cell::new(""),
             playlist_open: false,
+            jump_open: false,
+            jump_selected: 0,
+            jump_focus: None,
             video_open: std::env::var_os("NOVA_TEST_VIDEO").is_some(),
             audio_open: false,
             audio_mode: "Stereo".to_string(),
@@ -725,6 +736,9 @@ impl eframe::App for NovaApp {
 
         if self.search_report.is_some() {
             self.search_report_window(&ctx);
+        }
+        if self.jump_open {
+            self.jump_window(&ctx);
         }
         if self.nfm_open {
             self.nfm_window(&ctx);
