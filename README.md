@@ -114,7 +114,7 @@ The app's code lives in `crates/nova-app/src/app/`, one module per concern:
 | `video`    | In-window video, the stream picker's commands, and `WindowMode` (<kbd>F</kbd>). |
 | `audio`    | The Audio window. |
 | `jump`     | The <kbd>Shift</kbd>+<kbd>F</kbd> "Jump focus" window. |
-| `group`    | `-group-mark`: pause+minimise and close shared through `/dev/shm/nova`. |
+| `group`    | `-group-mark`: shared pause+minimise commands and the group's pid list. |
 | `covers`   | Cover-art texture cache. |
 | `remote`   | Commands read from stdin. |
 | `text`     | Clock / duration / format-label helpers. |
@@ -170,7 +170,7 @@ cargo run -p nova-app -- -chk-magic /path/to/music
 cargo run -p nova-app -- -allow-ext "mp44,avi0" /path/to/music
 
 # Run several windows as one group: C pauses + minimises all of them, Shift+K
-# closes all of them. The shared mark is /dev/shm/nova/<group name>.
+# force-kills every member. Pids live in /dev/shm/nova/pid.<group name>.
 cargo run -p nova-app -- -group-mark living-room /path/to/music
 
 # Headless CLI
@@ -192,11 +192,12 @@ Passing an argument to the GUI is optional:
 
 Without an argument, Nova reopens the last folder (instantly, from cache).
 
-With `-group-mark <name>`, every Nova started under the same name listens to
-the same command file, `/dev/shm/nova/<name>`: <kbd>C</kbd> pauses and
-minimises them all, <kbd>Shift</kbd>+<kbd>K</kbd> closes them all. Each
-instance starts reading at the end of the file, so an old session's commands
-are not replayed.
+With `-group-mark <name>`, every Nova started under the same name appends its
+pid to `/dev/shm/nova/pid.<name>` and shares pause+minimise through
+`/dev/shm/nova/<name>`. <kbd>C</kbd> pauses and minimises them all;
+<kbd>Shift</kbd>+<kbd>K</kbd> force-kills every pid in the list, leaving the
+signalling instance last. A fresh instance starts reading at the end of the
+command file, so an old session's commands are not replayed.
 
 
 ### CLI usage
@@ -606,7 +607,7 @@ on disk and nothing stays hidden.
 | <kbd>PgUp</kbd> / <kbd>PgDn</kbd> | Previous / next track (on release; every 8th press rebuilds the playback machinery) |
 | <kbd>C</kbd> | Pause and minimise; with `-group-mark`, every instance in the group does the same |
 | <kbd>Shift</kbd>+<kbd>C</kbd> | Minimise, leaving playback running |
-| <kbd>Shift</kbd>+<kbd>K</kbd> | Close this window; with `-group-mark`, close every instance in the group |
+| <kbd>Shift</kbd>+<kbd>K</kbd> | Force-kill every pid in the group (this instance last); without a group, close this window |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> | Previous track |
 | <kbd>Ctrl</kbd>+<kbd>→</kbd> | Next track |
 | <kbd>I</kbd> | Toggle the track info panel |

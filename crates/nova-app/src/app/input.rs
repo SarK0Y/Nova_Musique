@@ -70,7 +70,7 @@ impl NovaApp {
         if jump {
             self.jump_open = !self.jump_open;
         }
-        // Shift+K closes the group; with no group it just closes this window.
+        // Shift+K force-kills every pid in the group; with no group, close here.
         let close_group = ctx.input(|i| {
             i.modifiers.shift
                 && !i.modifiers.command
@@ -78,7 +78,7 @@ impl NovaApp {
                 && i.key_pressed(egui::Key::K)
         });
         if close_group {
-            self.group_command(ctx, GroupCommand::Close);
+            self.close_group(ctx);
         }
         if escape && shift && !m_key {
             self.ctrl_reload();
@@ -174,7 +174,7 @@ impl NovaApp {
         // first, so the music stops right there too. In a group, C asks every
         // member to do the same.
         if c && !shift && !command && !alt {
-            self.group_command(ctx, GroupCommand::PauseMinimize);
+            self.group_pause_minimize(ctx);
         }
         if c && shift {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
