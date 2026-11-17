@@ -5,7 +5,6 @@ mod mpv;
 mod videowin;
 
 use std::ffi::OsString;
-use std::path::PathBuf;
 use std::process::Stdio;
 
 /// `-proxy-run <player>`: `player` is run on files nova itself cannot play.
@@ -14,6 +13,9 @@ const PROXY_RUN: &str = "-proxy-run";
 const CHECK_MAGIC: &str = "-chk-magic";
 /// `-allow-ext "a,b"`: extra extensions to accept.
 const ALLOW_EXT: &str = "-allow-ext";
+/// `-group-mark <name>`: share pause+minimise and close commands with the
+/// other instances that carry the same name.
+const GROUP_MARK: &str = "-group-mark";
 
 /// The command line, split for its two consumers: the player command
 /// `-proxy-run` names (one word or several, like `flatpak run org.app`),
@@ -24,6 +26,7 @@ pub(crate) struct CommandLine {
     pub(crate) target: Option<OsString>,
     pub(crate) check_magic: bool,
     pub(crate) allow_ext: Vec<String>,
+    pub(crate) group_mark: Option<String>,
 }
 
 /// The player command is every word after `-proxy-run`. The target is the
@@ -35,8 +38,10 @@ pub(crate) fn parse_args(args: &[OsString]) -> CommandLine {
     let mut target = None;
     let mut check_magic = false;
     let mut allow_ext = Vec::new();
+    let mut group_mark = None;
     let mut player_next = false;
     let mut ext_next = false;
+    let mut group_next = false;
     for arg in args {
         if ext_next {
             ext_next = false;
@@ -46,6 +51,14 @@ pub(crate) fn parse_args(args: &[OsString]) -> CommandLine {
                     allow_ext.push(ext);
                 }
             }
+        } else if group_next {
+            group_next = false;
+            let name = arg.to_string_lossy().trim().to_string();
+            if !name.is_empty() {
+                group_mark = Some(name);
+            }
+        } else if arg == GROUP_MARK {
+            group_next = true;
         } else if arg == CHECK_MAGIC {
             check_magic = true;
         } else if arg == ALLOW_EXT {
@@ -72,6 +85,7 @@ pub(crate) fn parse_args(args: &[OsString]) -> CommandLine {
         target,
         check_magic,
         allow_ext,
+        group_mark,
     }
 }
 
@@ -141,6 +155,7 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp(name: &str) -> PathBuf {
         let dir = PathBuf::from("/tmp/opencode/nova-proxy-run-tests");
@@ -221,5 +236,22 @@ mod tests {
         assert!(parsed.check_magic);
         assert_eq!(parsed.allow_ext, vec!["mp44", "avi0"]);
         assert_eq!(parsed.target, Some(OsString::from(song)));
+    }
+
+    #[test]
+    fn the_group_mark_names_a_group_and_leaves_the_target_alone() {
+        let song = temp("song.mp3").to_string_lossy().into_owned();
+        let parsed = parse_args(&args(&[
+            "-group-mark",
+            " living-room ",
+            song.as_str(),
+        ]));
+        assert_eq!(parsed.group_mark.as_deref(), Some("living-room"));
+        assert_eq!(parsed.target, Some(OsString::from(song)));
+
+        // Without a name there is no group, and the flag is not the target.
+        let parsed = parse_args(&args(&["-group-mark"]));
+        assert_eq!(parsed.group_mark, None);
+        assert_eq!(parsed.target, None);
     }
 }

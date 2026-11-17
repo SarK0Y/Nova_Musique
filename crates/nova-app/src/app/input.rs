@@ -70,6 +70,16 @@ impl NovaApp {
         if jump {
             self.jump_open = !self.jump_open;
         }
+        // Shift+K closes the group; with no group it just closes this window.
+        let close_group = ctx.input(|i| {
+            i.modifiers.shift
+                && !i.modifiers.command
+                && !i.modifiers.alt
+                && i.key_pressed(egui::Key::K)
+        });
+        if close_group {
+            self.group_command(ctx, GroupCommand::Close);
+        }
         if escape && shift && !m_key {
             self.ctrl_reload();
             return;
@@ -161,11 +171,10 @@ impl NovaApp {
             }
         }
         // Shift-C puts the window away with playback carrying on; C pauses
-        // first, so the music stops right there too.
-        //let (shift, c) = Self::c_key(c, shift, command, alt);
+        // first, so the music stops right there too. In a group, C asks every
+        // member to do the same.
         if c && !shift && !command && !alt {
-            self.engine.pause();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            self.group_command(ctx, GroupCommand::PauseMinimize);
         }
         if c && shift {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));

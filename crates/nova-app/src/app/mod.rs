@@ -16,6 +16,7 @@
 //! - [`video`] — In-window video: showing it, sizing it, and the commands from the video-stream picker.
 //! - [`audio`] — The Audio window (SMPlayer's audio controls).
 //! - [`jump`] — The Shift+F "Jump focus" window for moving to a main-window element.
+//! - [`group`] — `-group-mark`: pause+minimise and close shared with the group.
 //! - [`input`] — Keyboard shortcuts and applying the `Action`s collected during a frame.
 //! - `tests` — unit tests (compiled for `cargo test` only).
 
@@ -50,6 +51,7 @@ mod chrome;
 mod config;
 mod covers;
 pub(crate) mod drops;
+mod group;
 mod input;
 mod jump;
 mod library;
@@ -67,6 +69,7 @@ use self::browse::*;
 use self::config::*;
 use self::covers::*;
 use self::drops::*;
+use self::group::*;
 use self::input::*;
 use self::jump::*;
 use self::library::*;
@@ -232,6 +235,9 @@ pub struct NovaApp {
     video_window: Option<videowin::VideoWindow>,
     /// Lines read from stdin, drained once per frame.
     remote: Option<Receiver<String>>,
+    /// `-group-mark <name>`: the shared command file, when this instance is
+    /// in a group. See [`GroupMark`].
+    group: Option<GroupMark>,
     /// The engine state this frame, so a change is detected and timestamped
     /// for the `running` dump.
     last_engine_state: PlaybackState,
@@ -267,7 +273,12 @@ impl NovaApp {
         let mut pending_play = None;
         let mut requested_root = None;
         let args: Vec<_> = std::env::args_os().skip(1).collect();
-        if let Some(arg) = crate::parse_args(&args).target {
+        let command_line = crate::parse_args(&args);
+        let group = command_line.group_mark.as_deref().and_then(GroupMark::new);
+        if let Some(group) = &group {
+            group.watch(cc.egui_ctx.clone());
+        }
+        if let Some(arg) = command_line.target {
             let target = parse_target(&arg.to_string_lossy());
             if target.is_file() {
                 pending_play = Some(target);
@@ -446,6 +457,7 @@ impl NovaApp {
             deinterlace: 0,
             video_window: None,
             remote: remote_reader(cc.egui_ctx.clone()),
+            group,
             last_engine_state: PlaybackState::Stopped,
             state_started_at: Instant::now(),
             window_mode: WindowMode::Normal,
@@ -672,6 +684,7 @@ impl eframe::App for NovaApp {
         self.handle_drops(&ctx);
 
         self.remote_commands(&mut actions);
+        self.poll_group(&ctx);
 
         // While a video plays, the sidebar gives up its width to the picture;
         // in full screen every bar does, and the picture gets the whole display.
