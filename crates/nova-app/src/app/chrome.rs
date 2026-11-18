@@ -131,6 +131,10 @@ impl NovaApp {
                     self.audio_open = true;
                     ui.close();
                 }
+                if ui.button("Subtitles").clicked() {
+                    self.subtitles_open = true;
+                    ui.close();
+                }
             });
             ui.separator();
 

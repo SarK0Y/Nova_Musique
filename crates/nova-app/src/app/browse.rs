@@ -208,7 +208,7 @@ impl NovaApp {
         // Arrow keys walk the list, Enter plays whatever the cursor is on.
         // Enter stays with a focused text field so typing is not hijacked.
         let typing = ui.ctx().egui_wants_keyboard_input();
-        let (down, up, enter) = if self.jump_open {
+        let (down, up, enter) = if self.jump_open || self.subtitles_open {
             (false, false, false)
         } else {
             ui.ctx().input(|i| {
@@ -410,7 +410,7 @@ impl NovaApp {
         let items: Vec<TrackId> = self.engine.queue().items().to_vec();
 
         let typing = ui.ctx().egui_wants_keyboard_input();
-        let (down, up, enter) = if self.jump_open {
+        let (down, up, enter) = if self.jump_open || self.subtitles_open {
             (false, false, false)
         } else {
             ui.ctx().input(|i| {

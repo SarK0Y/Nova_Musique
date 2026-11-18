@@ -276,8 +276,14 @@ impl NovaApp {
                     .filter_map(|file| file.path.clone())
                     .collect()
             });
-            if !external_drops.is_empty() {
-                self.enqueue_dropped_files(external_drops);
+            let (subs, files): (Vec<PathBuf>, Vec<PathBuf>) = external_drops
+                .into_iter()
+                .partition(|path| is_subtitle_file(path));
+            if !subs.is_empty() {
+                self.drop_subtitles(subs);
+            }
+            if !files.is_empty() {
+                self.enqueue_dropped_files(files);
             }
 
             let mut actions = Vec::new();

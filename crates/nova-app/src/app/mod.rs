@@ -16,6 +16,7 @@
 //! - [`video`] — In-window video: showing it, sizing it, and the commands from the video-stream picker.
 //! - [`audio`] — The Audio window (SMPlayer's audio controls).
 //! - [`jump`] — The Shift+F "Jump focus" window for moving to a main-window element.
+//! - [`subtitles`] — The *Nova → Subtitles* window for tracks, files and timing.
 //! - [`group`] — `-group-mark`: pause+minimise and close shared with the group.
 //! - [`input`] — Keyboard shortcuts and applying the `Action`s collected during a frame.
 //! - `tests` — unit tests (compiled for `cargo test` only).
@@ -59,6 +60,7 @@ mod nfm;
 mod playlist;
 mod remote;
 mod sub_timeline;
+mod subtitles;
 #[cfg(test)]
 mod tests;
 mod text;
@@ -77,6 +79,7 @@ use self::nfm::*;
 use self::playlist::*;
 use self::remote::*;
 use self::sub_timeline::*;
+use self::subtitles::*;
 use self::text::*;
 use self::types::*;
 use self::video::*;
@@ -199,6 +202,16 @@ pub struct NovaApp {
     video_open: bool,
     /// External Audio control window, opened from Nova → Audio.
     audio_open: bool,
+    /// In-app Subtitles window, opened from Nova → Subtitles.
+    subtitles_open: bool,
+    /// Selected subtitle ids in that window; `"no"` means off.
+    subtitle_primary: String,
+    subtitle_secondary: String,
+    /// Text fields and SMPlayer's FPS choice edited by the Subtitles window.
+    subtitle_delay_text: String,
+    subtitle_fps_index: usize,
+    subtitle_font_size_text: String,
+    subtitle_path_input: String,
     audio_mode: String,
     audio_channels: String,
     audio_delay_ms: i32,
@@ -437,6 +450,13 @@ impl NovaApp {
             jump_focus: None,
             video_open: std::env::var_os("NOVA_TEST_VIDEO").is_some(),
             audio_open: false,
+            subtitles_open: false,
+            subtitle_primary: "no".to_string(),
+            subtitle_secondary: "no".to_string(),
+            subtitle_delay_text: "0".to_string(),
+            subtitle_fps_index: 0,
+            subtitle_font_size_text: "55".to_string(),
+            subtitle_path_input: String::new(),
             audio_mode: "Stereo".to_string(),
             audio_channels: "auto".to_string(),
             audio_delay_ms: 0,
@@ -752,6 +772,9 @@ impl eframe::App for NovaApp {
         }
         if self.jump_open {
             self.jump_window(&ctx);
+        }
+        if self.subtitles_open {
+            self.subtitles_window(&ctx);
         }
         if self.nfm_open {
             self.nfm_window(&ctx);

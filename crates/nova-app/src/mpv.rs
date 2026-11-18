@@ -272,6 +272,7 @@ struct State {
     /// Video streams of the loaded file; empty when nothing video-ish is open.
     video_tracks: Vec<VideoTrack>,
     audio_tracks: Vec<AudioTrack>,
+    subtitle_tracks: Vec<SubtitleTrack>,
     /// Output devices exposed by mpv's active audio backends.
     audio_devices: Vec<AudioDevice>,
 }
@@ -287,6 +288,7 @@ impl Default for State {
             volume: 1.0,
             video_tracks: Vec::new(),
             audio_tracks: Vec::new(),
+            subtitle_tracks: Vec::new(),
             audio_devices: Vec::new(),
         }
     }
@@ -406,6 +408,14 @@ pub struct AudioTrack {
     pub selected: bool,
 }
 
+/// One subtitle stream reported by mpv, for *Nova → Subtitles*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleTrack {
+    pub id: String,
+    pub title: String,
+    pub selected: bool,
+}
+
 fn read_audio_tracks(handle: *mut MpvHandle) -> Vec<AudioTrack> {
     let mut root = MpvNode {
         u: MpvNodeValue {
@@ -447,6 +457,59 @@ fn read_audio_tracks(handle: *mut MpvHandle) -> Vec<AudioTrack> {
                 .or_else(|| map_get(entry, "codec").and_then(node_string))
                 .unwrap_or_else(|| format!("Audio track {id}"));
             tracks.push(AudioTrack {
+                id,
+                title,
+                selected: map_get(entry, "selected").is_some_and(node_flag),
+            });
+        }
+    }
+    unsafe { mpv_free_node_contents(&mut root as *mut MpvNode) };
+    tracks
+}
+
+/// Reads mpv's `track-list` and keeps the subtitle streams. Same wire form as
+/// [`read_audio_tracks`]: `sid` and `secondary-sid` take the decimal ids.
+fn read_subtitle_tracks(handle: *mut MpvHandle) -> Vec<SubtitleTrack> {
+    let mut root = MpvNode {
+        u: MpvNodeValue {
+            string: std::ptr::null_mut(),
+        },
+        format: 0,
+    };
+    let rc = unsafe {
+        mpv_get_property(
+            handle,
+            cstr("track-list").as_ptr(),
+            FORMAT_NODE,
+            &mut root as *mut MpvNode as *mut c_void,
+        )
+    };
+    if rc < 0 {
+        return Vec::new();
+    }
+    let mut tracks = Vec::new();
+    if root.format == FORMAT_NODE_ARRAY {
+        let list = unsafe { &*root.u.list };
+        for index in 0..list.num.max(0) as usize {
+            let Some(entry) = (unsafe { list.values.add(index).as_ref() }) else {
+                continue;
+            };
+            if map_get(entry, "type").and_then(node_string).as_deref() != Some("sub") {
+                continue;
+            }
+            let Some(id) = map_get(entry, "id")
+                .and_then(node_int)
+                .map(|id| id.to_string())
+            else {
+                continue;
+            };
+            let title = map_get(entry, "title")
+                .and_then(node_string)
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| map_get(entry, "lang").and_then(node_string))
+                .or_else(|| map_get(entry, "codec").and_then(node_string))
+                .unwrap_or_else(|| format!("Subtitle track {id}"));
+            tracks.push(SubtitleTrack {
                 id,
                 title,
                 selected: map_get(entry, "selected").is_some_and(node_flag),
@@ -945,6 +1008,44 @@ impl Mpv {
         self.reload_current_preserving_position();
     }
 
+    pub fn subtitle_tracks(&self) -> Vec<SubtitleTrack> {
+        self.read(|state| state.subtitle_tracks.clone())
+    }
+
+    /// Selects the primary subtitle stream; `"no"` is mpv's way to turn it off.
+    pub fn select_subtitle_track(&self, id: &str) {
+        self.set_string("sid", id);
+    }
+
+    /// Selects the secondary stream shown alongside the primary one.
+    pub fn select_secondary_subtitle_track(&self, id: &str) {
+        self.set_string("secondary-sid", id);
+    }
+
+    /// Adds an external subtitle file and selects it, like SMPlayer's Load.
+    pub fn load_external_subtitle(&self, path: &Path) {
+        let path = path.to_string_lossy().into_owned();
+        self.command(&["sub-add", &path, "select"]);
+    }
+
+    /// Removes the current subtitle stream, like SMPlayer's Unload.
+    pub fn unload_subtitle(&self) {
+        self.command(&["sub-remove"]);
+    }
+
+    pub fn set_subtitle_delay_ms(&self, delay_ms: i32) {
+        self.set_number("sub-delay", delay_ms as f64 / 1000.0);
+    }
+
+    /// `None` is SMPlayer's *Default*: mpv uses `0` for no override.
+    pub fn set_subtitle_fps(&self, fps: Option<f32>) {
+        self.set_number("sub-fps", fps.unwrap_or(0.0) as f64);
+    }
+
+    pub fn set_subtitle_font_size(&self, size: f32) {
+        self.set_number("sub-font-size", size as f64);
+    }
+
     /// Reloads the current media after an audio stream/output change while
     /// preserving the playhead and paused/playing state. mpv accepts `start`
     /// as a per-file option on `loadfile`, avoiding a race from seeking before
@@ -1233,12 +1334,14 @@ fn control_loop(handle: &SharedHandle, state: &Mutex<State>) {
                 // Outside the lock: these walk mpv-owned trees.
                 state.video_tracks = read_video_tracks(handle.0);
                 state.audio_tracks = read_audio_tracks(handle.0);
+                state.subtitle_tracks = read_subtitle_tracks(handle.0);
                 refresh_tracks = false;
             } else if state.video_tracks.is_empty() {
                 // Keep asking until something shows up, so opening the file
                 // while it is already playing is still noticed.
                 state.video_tracks = read_video_tracks(handle.0);
                 state.audio_tracks = read_audio_tracks(handle.0);
+                state.subtitle_tracks = read_subtitle_tracks(handle.0);
             }
             if refresh_devices {
                 state.audio_devices = read_audio_devices(handle.0);

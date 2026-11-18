@@ -4,10 +4,24 @@ use super::*;
 
 /// Overlay shown while files are being dragged over the window.
 pub(super) fn drop_overlay(ctx: &egui::Context) {
-    let hovering = ctx.input(|i| i.raw.hovered_files.len());
-    if hovering == 0 {
+    let (count, paths): (usize, Vec<PathBuf>) = ctx.input(|i| {
+        (
+            i.raw.hovered_files.len(),
+            i.raw.hovered_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect(),
+        )
+    });
+    if count == 0 {
         return;
     }
+    let subtitles = paths.iter().any(|path| is_subtitle_file(path));
+    let (title, detail) = if subtitles {
+        ("Drop to load subtitles", "Added to the current video")
+    } else {
+        ("Drop to play", "Audio files start playing · folders are scanned")
+    };
     egui::Area::new(egui::Id::new("drop-overlay"))
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .order(egui::Order::Foreground)
@@ -17,13 +31,11 @@ pub(super) fn drop_overlay(ctx: &egui::Context) {
                 .inner_margin(egui::Margin::same(24))
                 .show(ui, |ui| {
                     ui.label(
-                        RichText::new(format!("Drop to play · {hovering} item(s)"))
+                        RichText::new(format!("{title} · {count} item(s)"))
                             .size(20.0)
                             .strong(),
                     );
-                    ui.label(
-                        RichText::new("Audio files start playing · folders are scanned").weak(),
-                    );
+                    ui.label(RichText::new(detail).weak());
                 });
         });
 }
@@ -119,8 +131,17 @@ impl NovaApp {
                 .filter_map(|file| file.path.clone())
                 .collect()
         });
-        if !dropped.is_empty() {
-            self.accept_drop(dropped);
+        if dropped.is_empty() {
+            return;
+        }
+        let (subs, rest): (Vec<PathBuf>, Vec<PathBuf>) = dropped
+            .into_iter()
+            .partition(|path| is_subtitle_file(path));
+        if !subs.is_empty() {
+            self.drop_subtitles(subs);
+        }
+        if !rest.is_empty() {
+            self.accept_drop(rest);
         }
     }
 

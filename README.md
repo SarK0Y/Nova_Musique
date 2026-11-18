@@ -113,6 +113,7 @@ The app's code lives in `crates/nova-app/src/app/`, one module per concern:
 | `nfm`      | Songs → To NFM: the conversion window and its worker threads. |
 | `video`    | In-window video, the stream picker's commands, and `WindowMode` (<kbd>F</kbd>). |
 | `audio`    | The Audio window. |
+| `subtitles`| The in-app Subtitles window: tracks, loading, delay, FPS and font size. |
 | `jump`     | The <kbd>Shift</kbd>+<kbd>F</kbd> "Jump focus" window. |
 | `group`    | `-group-mark`: shared pause+minimise commands and the group's pid list. |
 | `covers`   | Cover-art texture cache. |
@@ -383,6 +384,8 @@ reach that port controls playback — keep it on localhost or a trusted
 interface.
 
 **Audio** opens the Audio window: SMPlayer's audio controls (device, channels, delay, stereo mode, filters, external audio). The stereo modes apply to both mpv (video) and rodio (music) playback.
+
+**Subtitles** opens an in-app window floating over the player, following SMPlayer's *Subtitles* menu: primary and secondary track lists, load/unload, a delay box (ms), a frames-per-second dropdown (Default, 23.976, 24, 25, 29.970, 30) and a font-size box. All of it is sent straight to mpv (`sid`, `secondary-sid`, `sub-delay`, `sub-fps`, `sub-font-size`). Drag `.srt`, `.ass`, `.ssa`, `.sub` or `.vtt` files onto the window (or anywhere in Nova) to load them into the current video; the Subtitles window opens to show the new track.
 
 ### Video
 
