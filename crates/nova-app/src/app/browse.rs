@@ -116,6 +116,17 @@ pub(super) fn track_row_text(track: &Track, playing: bool) -> String {
     )
 }
 
+/// The queue's search box matches the same fields as the top-bar search.
+pub(super) fn track_matches(track: &Track, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    [&track.title, &track.artist, &track.album]
+        .iter()
+        .any(|field| field.to_lowercase().contains(&query))
+}
+
 /// One `label → value` row of the track-info grid.
 pub(super) fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.label(RichText::new(label).weak().size(12.0));
@@ -154,7 +165,9 @@ impl NovaApp {
                 Some(name) => self.artist_detail(ui, &name, actions),
                 None => self.artist_list(ui, actions),
             },
-            View::Queue => self.queue_view(ui, actions),
+            View::Queue => {
+                let _ = self.queue_view(ui, actions, None);
+            }
         }
     }
 
@@ -397,7 +410,15 @@ impl NovaApp {
         });
     }
 
-    pub(super) fn queue_view(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    /// Draws the current queue. `filter` narrows the rows to a search query;
+    /// the returned id is whatever sits under the cursor, for window shortcuts.
+    /// Rows keep their real queue index so play/remove never hit a filtered row.
+    pub(super) fn queue_view(
+        &self,
+        ui: &mut egui::Ui,
+        actions: &mut Vec<Action>,
+        filter: Option<&str>,
+    ) -> Option<TrackId> {
         ui.horizontal(|ui| {
             ui.heading("Queue");
             if ui.button("Clear all").clicked() {
@@ -407,7 +428,21 @@ impl NovaApp {
         ui.add_space(4.0);
 
         let current_index = self.engine.queue().current_item_index();
-        let items: Vec<TrackId> = self.engine.queue().items().to_vec();
+        let query = filter.unwrap_or("").trim().to_lowercase();
+        // (real queue index, track id) for every row on screen.
+        let visible: Vec<(usize, TrackId)> = self
+            .engine
+            .queue()
+            .items()
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, id)| {
+                self.library
+                    .track(*id)
+                    .is_some_and(|track| track_matches(track, &query))
+            })
+            .collect();
 
         let typing = ui.ctx().egui_wants_keyboard_input();
         let (down, up, enter) = if self.jump_open || self.subtitles_open {
@@ -421,7 +456,7 @@ impl NovaApp {
                 )
             })
         };
-        let last = items.len().saturating_sub(1);
+        let last = visible.len().saturating_sub(1);
         let cursor = if down {
             (self.cursor.get() + 1).min(last)
         } else if up {
@@ -432,11 +467,15 @@ impl NovaApp {
         self.cursor.set(cursor);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            if items.is_empty() {
-                ui.label(RichText::new("The queue is empty.").weak());
+            if visible.is_empty() {
+                ui.label(if query.is_empty() {
+                    "The queue is empty.".to_string()
+                } else {
+                    "No queue items match the search.".to_string()
+                });
                 return;
             }
-            for (index, id) in items.iter().enumerate() {
+            for (index, (real_index, id)) in visible.iter().enumerate() {
                 let Some(track) = self.library.track(*id) else {
                     continue;
                 };
@@ -445,7 +484,7 @@ impl NovaApp {
                         [ui.available_width(), ROW_HEIGHT],
                         egui::Button::selectable(
                             index == cursor,
-                            RichText::new(track_row_text(track, current_index == Some(index)))
+                            RichText::new(track_row_text(track, current_index == Some(*real_index)))
                                 .size(14.0),
                         ),
                     )
@@ -459,7 +498,7 @@ impl NovaApp {
                 }
                 if response.clicked() {
                     self.cursor.set(index);
-                    actions.push(Action::PlayQueueIndex(index));
+                    actions.push(Action::PlayQueueIndex(*real_index));
                 }
                 response.context_menu(|ui| {
                     if ui.button("Remove from queue").clicked() {
@@ -470,9 +509,10 @@ impl NovaApp {
             }
         });
 
-        if enter && !items.is_empty() {
-            actions.push(Action::PlayQueueIndex(cursor));
+        if enter && !visible.is_empty() {
+            actions.push(Action::PlayQueueIndex(visible[cursor].0));
         }
+        visible.get(cursor).map(|(_, id)| *id)
     }
 
     pub(super) fn side_bar(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {

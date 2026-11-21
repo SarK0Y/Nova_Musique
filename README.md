@@ -263,6 +263,12 @@ the three window controls:
 The window's position and size are pinned, so these states are exact rather than
 approximate.
 
+Its **Search** box narrows the queue to matching title, artist or album; the
+`✕` button clears it. While this window has focus, <kbd>Space</kbd> pauses or
+resumes playback and <kbd>Delete</kbd> removes the selected queue item — the
+same as right-click → *Remove from queue*. Typing in the search box never
+triggers either shortcut.
+
 **Video** opens the video-stream picker in its own OS window — the same thing
 SMPlayer calls *Video → Track*. A container carrying more than one video stream
 (multi-angle discs, dual-cam footage) lists them all, the one being shown is

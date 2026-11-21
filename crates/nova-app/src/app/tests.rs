@@ -446,6 +446,16 @@ fn sample_track(path: &str) -> Track {
     }
 }
 
+#[test]
+fn queue_search_matches_title_artist_and_album() {
+    let track = sample_track("/music/a.flac");
+    assert!(track_matches(&track, ""));
+    assert!(track_matches(&track, "nfm track"));
+    assert!(track_matches(&track, "ARTIST"));
+    assert!(track_matches(&track, "album"));
+    assert!(!track_matches(&track, "movie"));
+}
+
 /// A saved playlist names every track and stays playable elsewhere.
 #[test]
 fn playlists_are_written_as_m3u8() {

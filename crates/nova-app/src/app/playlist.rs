@@ -300,9 +300,24 @@ impl NovaApp {
                         .weak()
                         .size(12.0),
                     );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.playlist_search)
+                                .desired_width(180.0)
+                                .hint_text("Search title, artist, album"),
+                        );
+                        if ui.button("✕").on_hover_text("Clear search").clicked() {
+                            self.playlist_search.clear();
+                        }
+                    });
+                    ui.label(
+                        RichText::new("Space play/pause · Del removes the selected queue item")
+                            .weak()
+                            .size(12.0),
+                    );
                     ui.separator();
-                    self.queue_view(ui, &mut actions);
-                });
+                    self.queue_view(ui, &mut actions, Some(&self.playlist_search))
+                })
             });
 
             // egui's drag payload is shared by the viewports. Consume it only when
@@ -313,6 +328,24 @@ impl NovaApp {
             if released && pointer_pos.is_some_and(|pos| panel.response.rect.contains(pos)) {
                 if let Some(track_id) = egui::DragAndDrop::take_payload::<TrackId>(viewport_ctx) {
                     actions.push(Action::Enqueue(*track_id));
+                }
+            }
+
+            // These belong to this viewport only: the main window keeps its own
+            // Space/Delete handling, and typing in the search box must not pause.
+            let typing = viewport_ctx.egui_wants_keyboard_input();
+            let (toggle, delete) = viewport_ctx.input(|input| {
+                (
+                    input.key_pressed(egui::Key::Space) && !typing,
+                    input.key_pressed(egui::Key::Delete) && !typing,
+                )
+            });
+            if toggle {
+                actions.push(Action::Toggle);
+            }
+            if delete {
+                if let Some(id) = panel.inner.inner {
+                    actions.push(Action::RemoveFromQueue(id));
                 }
             }
             self.apply(actions);

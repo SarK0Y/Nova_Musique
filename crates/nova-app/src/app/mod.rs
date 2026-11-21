@@ -193,6 +193,8 @@ pub struct NovaApp {
     dbg_menu: std::cell::Cell<&'static str>,
     /// Floating playlist window, opened from the Nova menu in the top bar.
     playlist_open: bool,
+    /// Search query typed into that window; filters the queue shown there.
+    playlist_search: String,
     /// "Jump focus" (Shift+F): whether the picker is up, the highlighted
     /// entry, and the field that should take keyboard focus next frame.
     jump_open: bool,
@@ -445,6 +447,7 @@ impl NovaApp {
             nfm_rx: None,
             dbg_menu: std::cell::Cell::new(""),
             playlist_open: false,
+            playlist_search: String::new(),
             jump_open: false,
             jump_selected: 0,
             jump_focus: None,
