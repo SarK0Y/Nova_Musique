@@ -408,6 +408,7 @@ fn format_labels_name_known_containers() {
     assert_eq!(format_label(Path::new("/a/b.no_fft")), "NoFFT");
     assert_eq!(format_label(Path::new("/a/b.nadc")), "NADC adaptive");
     assert_eq!(format_label(Path::new("/a/b.flac")), "FLAC");
+    assert_eq!(format_label(Path::new("/a/b.opus")), "Opus");
     assert_eq!(format_label(Path::new("/a/b.MP3")), "MP3");
     // Unknown extensions are upper-cased; missing ones are Unknown.
     assert_eq!(format_label(Path::new("/a/b.xyz")), "XYZ");

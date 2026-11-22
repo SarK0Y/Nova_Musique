@@ -648,7 +648,9 @@ screen. <kbd>F</kbd> is ignored while a text field has focus, and with
 ## Codecs
 
 Nova plays the [No_FFT](https://github.com/SarK0Y/No_FFT_v0) family natively,
-alongside the usual MP3/FLAC/etc.:
+alongside the usual MP3/FLAC/etc. `.opus` files are indexed like any other audio
+and played through mpv (rodio's decoder has no Opus support), by extension or by
+their `OpusHead` packet when `-chk-magic` is on:
 
 | Extension | Family | Magic |
 | --- | --- | --- |

@@ -670,6 +670,8 @@ mod tests {
     fn extension_filter_is_case_insensitive() {
         assert!(is_supported(Path::new("/a/b/Track.MP3")));
         assert!(is_supported(Path::new("/a/b/track.flac")));
+        assert!(is_supported(Path::new("/a/b/track.opus")));
+        assert!(is_supported(Path::new("/a/b/track.OPUS")));
         assert!(!is_supported(Path::new("/a/b/cover.jpg")));
         assert!(!is_supported(Path::new("/a/b/README")));
     }

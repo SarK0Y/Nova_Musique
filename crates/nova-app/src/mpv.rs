@@ -16,6 +16,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -1401,6 +1402,28 @@ fn error_text(code: c_int) -> String {
 // Backend
 // ---------------------------------------------------------------------------
 
+/// Whether a track must go to mpv instead of rodio.
+///
+/// symphonia (rodio's decoder) has no Opus decoder, but mpv has. Opus lives in
+/// an Ogg page like Vorbis, so the identification packet is checked as well as
+/// the extension — that also covers files accepted by `-chk-magic` under a
+/// different name.
+fn needs_mpv(path: &Path) -> bool {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("opus"))
+    {
+        return true;
+    }
+    let mut head = [0u8; 512];
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let read = file.read(&mut head).unwrap_or(0);
+    head[..read].windows(8).any(|window| window == b"OpusHead")
+}
+
 /// Sends video tracks to libmpv and everything else to rodio.
 ///
 /// The engine only ever sees one backend, so it keeps its queue and clock logic
@@ -1443,7 +1466,8 @@ impl AudioBackend for VideoBackend {
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
-        self.video = nova_core357_11::video::is_video(path) && self.mpv.is_some();
+        self.video = self.mpv.is_some()
+            && (nova_core357_11::video::is_video(path) || needs_mpv(path));
         if self.video {
             self.audio.stop();
             let mpv = self.mpv.as_ref().expect("checked above");
@@ -1547,6 +1571,26 @@ impl AudioBackend for VideoBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opus_is_routed_to_mpv_by_name_or_by_its_identification_packet() {
+        assert!(needs_mpv(Path::new("/queue/song.OPUS")));
+        assert!(!needs_mpv(Path::new("/queue/song.mp3")));
+
+        let dir = std::env::temp_dir().join(format!("nova-opus-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let opus = dir.join("renamed.bin");
+        let mut bytes = b"OggS\x00\x02".to_vec();
+        bytes.extend_from_slice(b"OpusHead\x01");
+        std::fs::write(&opus, bytes).expect("opus bytes");
+        assert!(needs_mpv(&opus));
+
+        let vorbis = dir.join("vorbis.bin");
+        std::fs::write(&vorbis, b"OggS\x00\x02\x01vorbis").expect("vorbis bytes");
+        assert!(!needs_mpv(&vorbis));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn finished_waits_for_the_requested_file() {

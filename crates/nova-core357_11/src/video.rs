@@ -183,6 +183,7 @@ mod tests {
         assert!(is_video(Path::new("/a/clip.mkv")));
         assert!(is_video(Path::new("/a/clip.webm")));
         assert!(!is_video(Path::new("/a/song.flac")));
+        assert!(!is_video(Path::new("/a/song.opus")));
         assert!(!is_video(Path::new("/a/noextension")));
     }
 
